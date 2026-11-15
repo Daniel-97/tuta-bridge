@@ -11,8 +11,8 @@ use tutasdk::entities::Entity;
 use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk};
 
 use super::content::{
-    address_from_encrypted, address_from_mail_address, parse_headers, select_body,
-    threading_headers,
+    address_from_encrypted, address_from_mail_address, details_are_intact,
+    draft_details_are_intact, parse_headers, select_body, threading_headers,
 };
 use crate::domain::{Error, Folder, FolderKind, MessageContent, MessageSummary, Result};
 use crate::ports::mail_source::MailSource;
@@ -141,7 +141,7 @@ impl TutaMailSource {
     }
 
     /// Load the [`MailDetails`] for a mail, preferring the draft details and
-    /// falling back to the crypto entity client when key resolution fails.
+    /// verifying that every loaded blob is intact (no decryption errors).
     async fn load_details(&self, mail: &Mail) -> Result<MailDetails> {
         let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
 
@@ -150,6 +150,9 @@ impl TutaMailSource {
                 .load(draft_id)
                 .await
                 .map_err(|_| Error::Message("mail details unavailable".into()))?;
+            if !draft_details_are_intact(&draft) {
+                return Err(Error::Message("mail details unavailable".into()));
+            }
             return Ok(draft.details);
         }
 
@@ -157,17 +160,31 @@ impl TutaMailSource {
             return Err(Error::Message("message has no details".into()));
         };
 
-        if let Ok(key) = self.resolve_mail_session_key(mail).await {
-            if let Ok(blob) = self.load_blob_with_key(details_id, key).await {
+        // Try the blob's own session key first. `CryptoEntityClient::load`
+        // decrypts with the blob's owner session key in a single request, so it
+        // is the cheapest correct path. It is only trusted when
+        // `details_are_intact` confirms no decryption error was recorded: the
+        // SDK reports per-field decryption failures in `_errors` and still
+        // returns `Ok`, so a successful load alone is not proof of intactness.
+        if let Ok(blob) = crypto_client.load::<MailDetailsBlob, _>(details_id).await {
+            if details_are_intact(&blob) {
                 return Ok(blob.details);
             }
         }
 
-        let blob: MailDetailsBlob = crypto_client
-            .load(details_id)
-            .await
-            .map_err(|_| Error::Message("mail details unavailable".into()))?;
-        Ok(blob.details)
+        // Fall back to resolving the mail's session key and decrypting the raw
+        // blob manually. This covers mails whose details blob is not readable
+        // with the current user's own key (e.g. shared mails decrypted with the
+        // mail's session key instead of the blob's owner key).
+        if let Ok(key) = self.resolve_mail_session_key(mail).await {
+            if let Ok(blob) = self.load_blob_with_key(details_id, key).await {
+                if details_are_intact(&blob) {
+                    return Ok(blob.details);
+                }
+            }
+        }
+
+        Err(Error::Message("mail details unavailable".into()))
     }
 }
 
