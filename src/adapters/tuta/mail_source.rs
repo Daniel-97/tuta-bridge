@@ -1,9 +1,19 @@
 use std::sync::Arc;
 
+use crypto_primitives::randomizer_facade::RandomizerFacade;
 use tutasdk::bindings::rest_client::RestClient;
-use tutasdk::entities::generated::tutanota::{Mail, MailSet};
-use tutasdk::{CustomId, GeneratedId, ListLoadDirection, LoggedInSdk};
+use tutasdk::crypto::crypto_facade::ResolvedSessionKey;
+use tutasdk::entities::entity_facade::{EntityFacade, EntityFacadeImpl};
+use tutasdk::entities::generated::tutanota::{
+    Mail, MailDetails, MailDetailsBlob, MailDetailsDraft, MailSet,
+};
+use tutasdk::entities::Entity;
+use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk};
 
+use super::content::{
+    address_from_encrypted, address_from_mail_address, parse_headers, select_body,
+    threading_headers,
+};
 use crate::domain::{Error, Folder, FolderKind, MessageContent, MessageSummary, Result};
 use crate::ports::mail_source::MailSource;
 
@@ -77,6 +87,88 @@ impl TutaMailSource {
     pub fn new(logged: Arc<LoggedInSdk>, rest: Arc<dyn RestClient>) -> Self {
         Self { logged, rest }
     }
+
+    /// Resolve the session key for a mail's owner-group encryption.
+    async fn resolve_mail_session_key(&self, mail: &Mail) -> Result<ResolvedSessionKey> {
+        let parsed = self
+            .logged
+            .instance_mapper
+            .serialize_entity(mail.clone())
+            .map_err(|_| Error::Message("mail details unavailable".into()))?;
+        let model = self
+            .logged
+            .type_model_provider
+            .resolve_server_type_ref(&Mail::type_ref())
+            .ok_or_else(|| Error::Message("mail details unavailable".into()))?;
+        self.logged
+            .mail_facade()
+            .get_crypto_entity_client()
+            .get_crypto_facade()
+            .resolve_session_key(&parsed, &model)
+            .await
+            .map_err(|_| Error::Message("mail details unavailable".into()))?
+            .ok_or_else(|| Error::Message("mail details unavailable".into()))
+    }
+
+    /// Load and decrypt a [`MailDetailsBlob`] using an already-resolved session key.
+    async fn load_blob_with_key(
+        &self,
+        details_id: &IdTupleGenerated,
+        key: ResolvedSessionKey,
+    ) -> Result<MailDetailsBlob> {
+        let raw = self
+            .logged
+            .get_entity_client()
+            .load(&MailDetailsBlob::type_ref(), details_id)
+            .await
+            .map_err(|_| Error::Message("mail details unavailable".into()))?;
+        let blob_model = self
+            .logged
+            .type_model_provider
+            .resolve_server_type_ref(&MailDetailsBlob::type_ref())
+            .ok_or_else(|| Error::Message("mail details unavailable".into()))?;
+        let facade = EntityFacadeImpl::new(
+            self.logged.type_model_provider.clone(),
+            RandomizerFacade::from_core(rand_core::OsRng),
+        );
+        let decrypted = facade
+            .decrypt_and_map(&blob_model, raw, key)
+            .map_err(|_| Error::Message("mail details unavailable".into()))?;
+        self.logged
+            .instance_mapper
+            .parse_entity::<MailDetailsBlob>(decrypted)
+            .map_err(|_| Error::Message("mail details unavailable".into()))
+    }
+
+    /// Load the [`MailDetails`] for a mail, preferring the draft details and
+    /// falling back to the crypto entity client when key resolution fails.
+    async fn load_details(&self, mail: &Mail) -> Result<MailDetails> {
+        let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+
+        if let Some(draft_id) = &mail.mailDetailsDraft {
+            let draft: MailDetailsDraft = crypto_client
+                .load(draft_id)
+                .await
+                .map_err(|_| Error::Message("mail details unavailable".into()))?;
+            return Ok(draft.details);
+        }
+
+        let Some(details_id) = &mail.mailDetails else {
+            return Err(Error::Message("message has no details".into()));
+        };
+
+        if let Ok(key) = self.resolve_mail_session_key(mail).await {
+            if let Ok(blob) = self.load_blob_with_key(details_id, key).await {
+                return Ok(blob.details);
+            }
+        }
+
+        let blob: MailDetailsBlob = crypto_client
+            .load(details_id)
+            .await
+            .map_err(|_| Error::Message("mail details unavailable".into()))?;
+        Ok(blob.details)
+    }
 }
 
 #[async_trait::async_trait]
@@ -133,7 +225,78 @@ impl MailSource for TutaMailSource {
             .collect())
     }
 
-    async fn content(&self, _message: &MessageSummary) -> Result<MessageContent> {
-        Err(Error::Unsupported("message content not implemented".into()))
+    async fn content(&self, message: &MessageSummary) -> Result<MessageContent> {
+        let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+        let mail_id = IdTupleGenerated::new(
+            GeneratedId(message.list_id.clone()),
+            GeneratedId(message.element_id.clone()),
+        );
+        let mail: Mail = crypto_client
+            .load(&mail_id)
+            .await
+            .map_err(|_| Error::Message("mail details unavailable".into()))?;
+
+        let details = self.load_details(&mail).await?;
+
+        let (body_html, body_text) = select_body(&details.body);
+
+        let headers = details
+            .headers
+            .as_ref()
+            .and_then(|header| {
+                header
+                    .compressedHeaders
+                    .as_deref()
+                    .filter(|raw| !raw.is_empty())
+                    .or_else(|| header.headers.as_deref().filter(|raw| !raw.is_empty()))
+            })
+            .map(parse_headers)
+            .unwrap_or_default();
+        let (message_id, in_reply_to, references) = threading_headers(&headers);
+
+        let mut from = address_from_mail_address(&mail.sender);
+        if let Some(envelope) = mail
+            .differentEnvelopeSender
+            .as_deref()
+            .filter(|a| !a.is_empty())
+        {
+            from.address = envelope.to_string();
+        }
+
+        Ok(MessageContent {
+            summary: message.clone(),
+            from,
+            to: details
+                .recipients
+                .toRecipients
+                .iter()
+                .map(address_from_mail_address)
+                .collect(),
+            cc: details
+                .recipients
+                .ccRecipients
+                .iter()
+                .map(address_from_mail_address)
+                .collect(),
+            bcc: details
+                .recipients
+                .bccRecipients
+                .iter()
+                .map(address_from_mail_address)
+                .collect(),
+            reply_to: details
+                .replyTos
+                .iter()
+                .map(address_from_encrypted)
+                .collect(),
+            sent_at_ms: details.sentDate.as_millis() as i64,
+            subject: mail.subject,
+            message_id,
+            in_reply_to,
+            references,
+            body_html,
+            body_text,
+            attachments: Vec::new(),
+        })
     }
 }
