@@ -16,6 +16,13 @@
 
 - The server type model is fetched at runtime from `ApplicationTypesService`. It is not vendored or hardcoded.
 
+## Credential store
+
+- `keyring` 3.x has no default features. Without a platform feature it falls back to the in-memory `mock` store, which does not persist.
+- The crate enables `async-secret-service`, `async-io` and `crypto-rust` so that on Linux it uses the Secret Service via zbus, with an encrypted DH session and without a system libdbus dependency.
+- Service `tuta-bridge` in production, username = mail address. Credentials are stored as JSON in the password field.
+- Ignored test `keyring_store::tests::keyring_roundtrip`: run manually with `cargo test --lib adapters::keyring_store -- --ignored`. Result on 2026-11-15 (GNOME keyring, login collection unlocked): passed.
+
 ## Pagination
 
 - Mail listing uses `load_range` with `CustomId(GeneratedId::max_id().to_string())` as the start id and `DESC` ordering.
