@@ -47,7 +47,10 @@ impl Config {
 }
 
 pub fn resolve_base_url(cli: Option<&str>, env: Option<&str>, config: &Config) -> String {
-    cli.or(env).unwrap_or(&config.base_url).to_owned()
+    cli.filter(|s| !s.is_empty())
+        .or(env.filter(|s| !s.is_empty()))
+        .unwrap_or(&config.base_url)
+        .to_owned()
 }
 
 pub fn config_path() -> anyhow::Result<PathBuf> {
@@ -117,6 +120,22 @@ mod tests {
             PathBuf::from("/home/u/.local/share")
         );
         assert!(xdg_base(None, None, ".config").is_err());
+    }
+
+    #[test]
+    fn empty_cli_and_env_fall_back_to_config() {
+        let cfg = Config {
+            active_account: None,
+            base_url: "https://cfg.example".into(),
+        };
+        assert_eq!(
+            resolve_base_url(Some(""), Some(""), &cfg),
+            "https://cfg.example"
+        );
+        assert_eq!(
+            resolve_base_url(Some(""), Some("https://env.example"), &cfg),
+            "https://env.example"
+        );
     }
 
     #[test]
