@@ -41,32 +41,13 @@ async fn status_reads_stored_account_without_network() {
         encrypted_passphrase_key: vec![7],
     });
 
-    // Factory exists in the test scope but StatusUseCase must not call it.
-    let factory = Arc::new(support::FakeFactory::new(
-        Ok(NewSession {
-            user_id: "u".into(),
-            access_token: "t".into(),
-            encrypted_passphrase_key: vec![7],
-        }),
-        AccountInfo {
-            mail_address: "a@b.c".into(),
-            user_id: "u".into(),
-        },
-    ));
-
     let uc = StatusUseCase { store, config_path };
 
     let result = uc.execute().await.unwrap();
     let info = result.expect("expected Some(AccountInfo)");
     assert_eq!(info.mail_address, "a@b.c");
     assert_eq!(info.user_id, "u");
-
-    // FakeFactory must record zero calls — status is offline.
-    let calls = factory.calls.lock().unwrap();
-    assert!(
-        calls.is_empty(),
-        "expected no factory calls, got: {calls:?}"
-    );
+    // StatusUseCase has no factory — no network call is structurally possible.
 }
 
 #[tokio::test]
@@ -114,8 +95,12 @@ async fn logout_deletes_even_when_close_fails() {
     let result = uc.execute().await;
     assert!(result.is_ok(), "expected Ok(()), got {result:?}");
 
-    // Store must be empty (delete was called, nothing was ever saved).
-    assert!(store.is_empty());
+    // Store must have had delete called.
+    let calls = store.calls.lock().unwrap();
+    assert!(
+        calls.contains(&"delete".to_string()),
+        "expected delete to be called on the store, got: {calls:?}"
+    );
 
     // Config active_account must be cleared.
     let cfg = Config::load(&config_path).unwrap();

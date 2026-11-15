@@ -22,10 +22,10 @@ impl StatusUseCase {
         };
 
         // 3. Load credentials from the store.
-        let account_id = AccountId(account.clone());
+        let account_id = AccountId(account);
         let credentials = match self.store.load(&account_id)? {
             Some(c) => c,
-            None => return Err(Error::MissingCredentials(account)),
+            None => return Err(Error::MissingCredentials),
         };
 
         // 4. Return AccountInfo derived from the stored credentials.

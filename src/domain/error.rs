@@ -4,8 +4,8 @@ use thiserror::Error as ThisError;
 pub enum Error {
     #[error("no active account configured")]
     NoActiveAccount,
-    #[error("missing credentials: {0}")]
-    MissingCredentials(String),
+    #[error("no stored credentials for the active account")]
+    MissingCredentials,
     #[error("login failed: {0}")]
     Login(String),
     #[error("second factor required: {0}")]
@@ -32,7 +32,7 @@ impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::NoActiveAccount => 3,
-            Self::MissingCredentials(_) => 3,
+            Self::MissingCredentials => 3,
             Self::Login(_) => 4,
             Self::SecondFactor(_) => 4,
             Self::BcryptUnsupported => 4,
@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn exit_codes_are_distinct() {
         assert_eq!(Error::NoActiveAccount.exit_code(), 3);
-        assert_eq!(Error::MissingCredentials("x".into()).exit_code(), 3);
+        assert_eq!(Error::MissingCredentials.exit_code(), 3);
         assert_eq!(Error::Login("x".into()).exit_code(), 4);
         assert_eq!(Error::SecondFactor("x".into()).exit_code(), 4);
         assert_eq!(Error::BcryptUnsupported.exit_code(), 4);

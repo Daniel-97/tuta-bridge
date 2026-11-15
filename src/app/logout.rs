@@ -27,16 +27,16 @@ impl LogoutUseCase {
         let account_id = AccountId(account);
 
         // 3. Best-effort session close: resume and close, logging on failure.
-        if let Ok(Some(credentials)) = self.store.load(&account_id) {
+        //    Storage errors from load propagate; only resume/close are best-effort.
+        if let Some(credentials) = self.store.load(&account_id)? {
             match self.factory.resume(&credentials).await {
-                Ok(session) => {
-                    if let Err(_e) = session.close().await {
-                        tracing::warn!("server session close failed");
-                    }
-                }
-                Err(_e) => {
+                Ok(session) if session.close().await.is_err() => {
                     tracing::warn!("server session close failed");
                 }
+                Err(_) => {
+                    tracing::warn!("server session close failed");
+                }
+                _ => {}
             }
         }
 
