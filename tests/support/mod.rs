@@ -104,6 +104,7 @@ impl CredentialStore for FakeStore {
 pub struct FakeFactory {
     pub create_result: Mutex<Option<Result<NewSession>>>,
     pub resume_account: AccountInfo,
+    pub close_should_fail: bool,
     pub calls: Mutex<Vec<String>>,
 }
 
@@ -112,6 +113,7 @@ impl FakeFactory {
         Self {
             create_result: Mutex::new(Some(create_result)),
             resume_account,
+            close_should_fail: false,
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -133,6 +135,7 @@ impl SessionFactory for FakeFactory {
         Ok(Box::new(FakeSession {
             account: self.resume_account.clone(),
             mail: FakeMailSource::new(),
+            close_should_fail: self.close_should_fail,
         }))
     }
 }
@@ -144,6 +147,7 @@ impl SessionFactory for FakeFactory {
 pub struct FakeSession {
     pub account: AccountInfo,
     pub mail: FakeMailSource,
+    pub close_should_fail: bool,
 }
 
 #[async_trait::async_trait]
@@ -157,7 +161,11 @@ impl Session for FakeSession {
     }
 
     async fn close(&self) -> Result<()> {
-        Ok(())
+        if self.close_should_fail {
+            Err(Error::Network("close failed".into()))
+        } else {
+            Ok(())
+        }
     }
 }
 
