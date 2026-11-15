@@ -5,13 +5,16 @@ use tracing_subscriber::EnvFilter;
 
 use tuta_bridge::adapters::cli::Command;
 use tuta_bridge::adapters::keyring_store::KeyringCredentialStore;
+use tuta_bridge::adapters::mime::MimeRenderer;
 use tuta_bridge::adapters::terminal_prompt::TerminalPrompt;
 use tuta_bridge::adapters::tuta::session::TutaSessionFactory;
+use tuta_bridge::app::dump::{DumpArgs, DumpUseCase};
 use tuta_bridge::app::login::LoginUseCase;
 use tuta_bridge::app::logout::LogoutUseCase;
 use tuta_bridge::app::status::StatusUseCase;
 use tuta_bridge::config::{config_path, data_dir, resolve_base_url, validate_base_url, Config};
 use tuta_bridge::domain::Error;
+use tuta_bridge::ports::renderer::MessageRenderer;
 
 use tutasdk::bindings::native_file_client::NativeFileClient;
 use tutasdk::bindings::rest_client::RestClient;
@@ -129,7 +132,23 @@ fn main() {
                 println!("logged out");
                 Ok(())
             }
-            Command::Dump { .. } => Err(Error::Unsupported("dump not implemented".into())),
+            Command::Dump { folder, limit, out } => {
+                let uc = DumpUseCase::new(
+                    Arc::clone(&factory) as Arc<dyn tuta_bridge::ports::session::SessionFactory>,
+                    Arc::clone(&store) as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
+                    Arc::new(MimeRenderer) as Arc<dyn MessageRenderer>,
+                    config_path,
+                );
+                let report = uc
+                    .execute(DumpArgs {
+                        folder,
+                        limit,
+                        out: out.clone(),
+                    })
+                    .await?;
+                println!("wrote {} messages to {}", report.written, out.display());
+                Ok(())
+            }
         }
     });
 

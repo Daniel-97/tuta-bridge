@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use secrecy::SecretString;
 use tuta_bridge::domain::{
@@ -105,6 +105,7 @@ pub struct FakeFactory {
     pub create_result: Mutex<Option<Result<NewSession>>>,
     pub resume_account: AccountInfo,
     pub close_should_fail: bool,
+    pub mail: Arc<FakeMailSource>,
     pub calls: Mutex<Vec<String>>,
 }
 
@@ -114,6 +115,7 @@ impl FakeFactory {
             create_result: Mutex::new(Some(create_result)),
             resume_account,
             close_should_fail: false,
+            mail: Arc::new(FakeMailSource::new()),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -134,7 +136,7 @@ impl SessionFactory for FakeFactory {
         self.calls.lock().unwrap().push("resume".to_string());
         Ok(Box::new(FakeSession {
             account: self.resume_account.clone(),
-            mail: FakeMailSource::new(),
+            mail: Arc::clone(&self.mail),
             close_should_fail: self.close_should_fail,
         }))
     }
@@ -146,7 +148,7 @@ impl SessionFactory for FakeFactory {
 
 pub struct FakeSession {
     pub account: AccountInfo,
-    pub mail: FakeMailSource,
+    pub mail: Arc<FakeMailSource>,
     pub close_should_fail: bool,
 }
 
@@ -157,7 +159,7 @@ impl Session for FakeSession {
     }
 
     fn mail(&self) -> &dyn MailSource {
-        &self.mail
+        self.mail.as_ref()
     }
 
     async fn close(&self) -> Result<()> {
@@ -177,6 +179,9 @@ pub struct FakeMailSource {
     pub folders: Vec<Folder>,
     pub messages: Vec<MessageSummary>,
     pub content: Option<MessageContent>,
+    pub failing_elements: Vec<String>,
+    pub message_limits: Mutex<Vec<usize>>,
+    pub message_folders: Mutex<Vec<Folder>>,
     pub calls: Mutex<Vec<String>>,
 }
 
@@ -186,6 +191,9 @@ impl FakeMailSource {
             folders: Vec::new(),
             messages: Vec::new(),
             content: None,
+            failing_elements: Vec::new(),
+            message_limits: Mutex::new(Vec::new()),
+            message_folders: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -198,13 +206,18 @@ impl MailSource for FakeMailSource {
         Ok(self.folders.clone())
     }
 
-    async fn messages(&self, _folder: &Folder, _limit: usize) -> Result<Vec<MessageSummary>> {
+    async fn messages(&self, folder: &Folder, limit: usize) -> Result<Vec<MessageSummary>> {
         self.calls.lock().unwrap().push("messages".to_string());
+        self.message_limits.lock().unwrap().push(limit);
+        self.message_folders.lock().unwrap().push(folder.clone());
         Ok(self.messages.clone())
     }
 
-    async fn content(&self, _message: &MessageSummary) -> Result<MessageContent> {
+    async fn content(&self, message: &MessageSummary) -> Result<MessageContent> {
         self.calls.lock().unwrap().push("content".to_string());
+        if self.failing_elements.contains(&message.element_id) {
+            return Err(Error::Message("content failed".into()));
+        }
         self.content
             .clone()
             .ok_or_else(|| Error::Message("no content configured".into()))
