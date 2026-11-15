@@ -104,8 +104,10 @@ La ricognizione è stata fatta sul clone sparse di `tutao/tutanota` al commit
    sessione della mail, non con quella del blob. Gli allegati sono entità
    `tutanota::TutanotaFile` con `blobs: Vec<Blob>`; il download richiede un
    read token (`BlobAccessTokenService`), una GET binaria su `BlobService` e la
-   decifratura dei chunk con la chiave della `TutanotaFile`. L'SDK non espone
-   il download: va portato in `tuta-client`.
+   decifratura dei chunk con la chiave della `TutanotaFile`. La GET usa il
+   campo singolo `blobId` (`"110"`), non la lista `blobIds` (`"193"`):
+   quest'ultima restituisce un involucro multi-blob, non il ciphertext grezzo.
+   L'SDK non espone il download: va portato in `tuta-client`.
 
 ## 7. Architettura
 
@@ -192,9 +194,11 @@ parlano con la rete.
    Gli header originali in `MailDetails.headers` vengono riusati quando
    presenti; altrimenti il `Message-ID` è
    `<tuta-{list_id}-{element_id}@tuta-bridge.invalid>`.
-4. **Secondo fattore.** TOTP è il percorso principale. Se la challenge non è
-   TOTP, il bridge chiede di approvare da un altro dispositivo e fa polling;
-   U2F/WebAuthn producono un errore esplicito di funzione non supportata.
+4. **Secondo fattore.** In questo blocco è supportato solo TOTP. Se la
+   challenge non è TOTP, il bridge restituisce un errore esplicito di funzione
+   non supportata. L'approvazione da un altro dispositivo e U2F/WebAuthn sono
+   rimandate: il tipo 0 delle challenge Tuta è U2F, non un flusso di
+   approvazione.
 5. **Nomi dei file.** `dump` scrive
    `{received_at:%Y%m%d-%H%M%S}-{element_id}.eml`, con `element_id`
    sanificato. Lo stesso messaggio produce sempre lo stesso nome; una seconda
@@ -223,7 +227,6 @@ pub struct SessionRequest {
     pub mail_address: String,
     pub password: SecretString,
     pub totp: Arc<dyn Fn() -> Result<String> + Send + Sync>,
-    pub on_device_approval: Arc<dyn Fn() + Send + Sync>,
 }
 
 pub struct NewSession {
@@ -262,6 +265,7 @@ L'adapter `TutaSessionFactory` compone `TutaPreSession` (che parla con
 7. `SessionService` con `clientIdentifier = "tuta-bridge"`.
 8. Se ci sono challenge TOTP: prompt del codice e `SecondFactorAuthService`
    POST con `type = 1`, poi polling GET finché `secondFactorPending` è falso.
+   Qualsiasi altro tipo di challenge produce un errore esplicito.
 9. `Credentials` con `encryptedPassphraseKey` cifrata con la `accessKey`.
 10. `Sdk::login(credentials)` e salvataggio nel Secret Service.
 11. Le credenziali in memoria vengono azzerate con `zeroize` appena possibile.
@@ -278,8 +282,11 @@ Nessun dato sensibile viene loggato; gli errori riportano solo la fase fallita.
    dell'SDK; viene preferito a `text` quando presente. Il tipo (HTML o testo)
    si deduce dal contenuto.
 6. Carica le `TutanotaFile`, scarica e decifra i blob.
-7. Sintetizza il MIME e scrive `<uid>-<slug>.eml` nella directory indicata.
-8. Il rendering è deterministico: stessi input, stessi byte.
+7. Sintetizza il MIME e scrive
+   `{received_at:%Y%m%d-%H%M%S}-{element_id}.eml` nella directory indicata,
+   con permessi `0600`; la directory è `0700`.
+8. Il rendering è deterministico: stessi input, stessi byte. `--limit` deve
+   essere positivo.
 
 ## 8. Interfaccia CLI
 
