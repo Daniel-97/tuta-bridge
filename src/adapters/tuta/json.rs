@@ -234,8 +234,8 @@ mod tests {
     fn session_id_is_derived_like_the_clients() {
         let token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let id = session_id_from_access_token(token).unwrap();
-        assert!(!id.list_id.is_empty());
-        assert!(!id.element_id.is_empty());
+        assert_eq!(id.list_id, "------------");
+        assert_eq!(id.element_id, "AVJ15h-g0HUcHZ9FVBx4BMiVQERVRwcQreN4bygvLaA");
     }
 
     #[test]
