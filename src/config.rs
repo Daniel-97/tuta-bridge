@@ -46,6 +46,41 @@ impl Config {
     }
 }
 
+pub fn validate_base_url(url: &str) -> std::result::Result<(), String> {
+    let rest = if let Some(rest) = url.strip_prefix("https://") {
+        if rest.is_empty()
+            || rest.starts_with('/')
+            || rest.starts_with('?')
+            || rest.starts_with('#')
+        {
+            return Err("base URL must have a non-empty host".to_string());
+        }
+        return Ok(());
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        rest
+    } else {
+        return Err("base URL must be https (http is allowed only for loopback)".to_string());
+    };
+
+    // http: only allowed for loopback hosts
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = if authority.starts_with('[') {
+        // IPv6: take up to the closing bracket
+        authority
+            .find(']')
+            .map(|i| &authority[..=i])
+            .unwrap_or(authority)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+
+    if host == "127.0.0.1" || host == "localhost" || host == "[::1]" {
+        Ok(())
+    } else {
+        Err("base URL must be https (http is allowed only for loopback)".to_string())
+    }
+}
+
 pub fn resolve_base_url(cli: Option<&str>, env: Option<&str>, config: &Config) -> String {
     cli.filter(|s| !s.is_empty())
         .or(env.filter(|s| !s.is_empty()))
@@ -179,5 +214,41 @@ mod tests {
             "https://env.example"
         );
         assert_eq!(resolve_base_url(None, None, &cfg), "https://cfg.example");
+    }
+
+    #[test]
+    fn validate_base_url_accepts_https_with_host() {
+        assert!(validate_base_url("https://app.tuta.com").is_ok());
+        assert!(validate_base_url("https://example.com:443/path").is_ok());
+        assert!(validate_base_url("https://sub.domain.example").is_ok());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_https_without_host() {
+        assert!(validate_base_url("https://").is_err());
+        assert!(validate_base_url("https:///path").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_accepts_http_loopback() {
+        assert!(validate_base_url("http://127.0.0.1").is_ok());
+        assert!(validate_base_url("http://127.0.0.1:8080").is_ok());
+        assert!(validate_base_url("http://localhost").is_ok());
+        assert!(validate_base_url("http://localhost:3000").is_ok());
+        assert!(validate_base_url("http://[::1]").is_ok());
+        assert!(validate_base_url("http://[::1]:9000").is_ok());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_http_non_loopback() {
+        assert!(validate_base_url("http://example.com").is_err());
+        assert!(validate_base_url("http://192.168.1.1").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_other_schemes() {
+        assert!(validate_base_url("ftp://example.com").is_err());
+        assert!(validate_base_url("file:///etc/passwd").is_err());
+        assert!(validate_base_url("not-a-url").is_err());
     }
 }

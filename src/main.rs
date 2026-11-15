@@ -1,6 +1,152 @@
-fn main() -> anyhow::Result<()> {
-    match tuta_bridge::adapters::cli::parse_from(std::env::args_os()) {
-        Ok(_) => Ok(()),
+use std::process;
+use std::sync::Arc;
+
+use tracing_subscriber::EnvFilter;
+
+use tuta_bridge::adapters::cli::Command;
+use tuta_bridge::adapters::keyring_store::KeyringCredentialStore;
+use tuta_bridge::adapters::terminal_prompt::TerminalPrompt;
+use tuta_bridge::adapters::tuta::session::TutaSessionFactory;
+use tuta_bridge::app::login::LoginUseCase;
+use tuta_bridge::app::logout::LogoutUseCase;
+use tuta_bridge::app::status::StatusUseCase;
+use tuta_bridge::config::{config_path, data_dir, resolve_base_url, validate_base_url, Config};
+use tuta_bridge::domain::Error;
+
+use tutasdk::bindings::native_file_client::NativeFileClient;
+use tutasdk::bindings::rest_client::RestClient;
+use tutasdk::bindings::suspendable_rest_client::SuspendableRestClient;
+use tutasdk::date::{DateProvider, DateTime};
+use tutasdk::net::native_rest_client::NativeRestClient;
+use tutasdk::Sdk;
+
+/// A local [`DateProvider`] that returns the current system time.
+struct SystemClock;
+
+impl DateProvider for SystemClock {
+    fn now(&self) -> DateTime {
+        DateTime::from_system_time(std::time::SystemTime::now())
+    }
+}
+
+fn main() {
+    // 1. Initialise tracing (writes to stderr).
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+
+    // 2. Parse CLI arguments.
+    let cli = match tuta_bridge::adapters::cli::parse_from(std::env::args_os()) {
+        Ok(cli) => cli,
         Err(e) => e.exit(),
+    };
+
+    // 3. Load configuration and resolve the base URL.
+    let config_path = match config_path() {
+        Ok(p) => p,
+        Err(e) => exit_with_error(Error::Config(e.to_string())),
+    };
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => exit_with_error(Error::Config(e.to_string())),
+    };
+    let base_url = resolve_base_url(
+        cli.base_url.as_deref(),
+        std::env::var("TUTA_BRIDGE_BASE_URL").ok().as_deref(),
+        &config,
+    );
+
+    // 4. Validate the base URL.
+    if let Err(msg) = validate_base_url(&base_url) {
+        exit_with_error(Error::Config(msg));
+    }
+
+    // 5. Build the SDK components.
+    let raw: Arc<dyn RestClient> = match NativeRestClient::try_new() {
+        Ok(c) => Arc::new(c),
+        Err(e) => exit_with_error(Error::Network(e.to_string())),
+    };
+    let data_dir = match data_dir() {
+        Ok(d) => d,
+        Err(e) => exit_with_error(Error::Config(e.to_string())),
+    };
+    let file_client = match NativeFileClient::try_new(data_dir) {
+        Ok(fc) => Arc::new(fc),
+        Err(e) => exit_with_error(Error::Config(e.to_string())),
+    };
+    let sdk = Sdk::new(base_url.clone(), Arc::clone(&raw), file_client);
+    let suspendable: Arc<dyn RestClient> = Arc::new(SuspendableRestClient::new(
+        Arc::clone(&raw),
+        Arc::new(SystemClock),
+    ));
+
+    let store = Arc::new(KeyringCredentialStore::new("tuta-bridge"));
+    let prompt = Arc::new(TerminalPrompt);
+    let factory = Arc::new(TutaSessionFactory::new(sdk, suspendable, base_url));
+
+    // 6. Dispatch.
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => exit_with_error(Error::Network(e.to_string())),
+    };
+
+    let result = rt.block_on(async {
+        match cli.command {
+            Command::Login { email } => {
+                let uc = LoginUseCase::new(
+                    Arc::clone(&factory) as Arc<dyn tuta_bridge::ports::session::SessionFactory>,
+                    Arc::clone(&store) as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
+                    Arc::clone(&prompt) as Arc<dyn tuta_bridge::ports::prompt::LoginPrompt>,
+                    config_path,
+                );
+                let info = uc.execute(email).await?;
+                println!("logged in as {}", info.mail_address);
+                Ok(())
+            }
+            Command::Status => {
+                let uc = StatusUseCase {
+                    store: Arc::clone(&store)
+                        as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
+                    config_path,
+                };
+                match uc.execute().await? {
+                    Some(info) => println!("{} ({})", info.mail_address, info.user_id),
+                    None => println!("not logged in"),
+                }
+                Ok(())
+            }
+            Command::Logout => {
+                let uc = LogoutUseCase {
+                    factory: Arc::clone(&factory)
+                        as Arc<dyn tuta_bridge::ports::session::SessionFactory>,
+                    store: Arc::clone(&store)
+                        as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
+                    config_path,
+                };
+                uc.execute().await?;
+                println!("logged out");
+                Ok(())
+            }
+            Command::Dump { .. } => Err(Error::Unsupported("dump not implemented".into())),
+        }
+    });
+
+    if let Err(e) = result {
+        exit_with_error(e);
+    }
+}
+
+fn exit_with_error(e: Error) -> ! {
+    eprintln!("error: {e}");
+    process::exit(e.exit_code() as i32);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn error_exit_codes_are_used() {
+        assert_eq!(tuta_bridge::domain::Error::NoActiveAccount.exit_code(), 3);
     }
 }
