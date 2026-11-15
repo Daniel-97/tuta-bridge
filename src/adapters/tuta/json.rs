@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::json;
 use tutasdk::{crypto::sha256, util::BASE64_EXT};
+use zeroize::Zeroize;
 
 use crate::domain::Error;
 
@@ -12,11 +13,17 @@ pub struct SaltResponse {
 }
 
 /// Decoded create-session response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionResponse {
     pub access_token: String,
     pub user_id: String,
     pub challenges: Vec<ChallengeType>,
+}
+
+impl Drop for SessionResponse {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+    }
 }
 
 /// Type of second-factor challenge presented by the server.

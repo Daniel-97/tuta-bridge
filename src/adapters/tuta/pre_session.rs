@@ -29,6 +29,13 @@ pub struct TutaPreSession {
     base_url: String,
 }
 
+/// Which error a 401/403 response should map to, depending on the auth phase.
+#[derive(Clone, Copy)]
+enum AuthFailure {
+    Login,
+    SecondFactor,
+}
+
 impl TutaPreSession {
     pub fn new(rest: Arc<dyn RestClient>, base_url: String) -> Self {
         Self { rest, base_url }
@@ -36,8 +43,14 @@ impl TutaPreSession {
 
     /// Execute the full pre-session login flow and return a `NewSession`.
     pub async fn create(&self, request: SessionRequest) -> crate::domain::Result<NewSession> {
+        let SessionRequest {
+            mail_address,
+            password,
+            totp,
+        } = request;
+
         // Step 1: Fetch salt
-        let salt_query_json = salt_query(&request.mail_address);
+        let salt_query_json = salt_query(&mail_address);
         let salt_query_encoded =
             encode_query_params([("_body".as_bytes(), salt_query_json.as_slice())]);
         let salt_url = format!(
@@ -46,7 +59,13 @@ impl TutaPreSession {
         );
         let salt_headers = self.common_headers(false);
         let salt_data = self
-            .request_json(HttpMethod::GET, &salt_url, None, salt_headers)
+            .request_json(
+                HttpMethod::GET,
+                &salt_url,
+                None,
+                salt_headers,
+                AuthFailure::Login,
+            )
             .await?;
         let salt_resp = parse_salt_response(&salt_data)?;
 
@@ -55,8 +74,10 @@ impl TutaPreSession {
             return Err(Error::BcryptUnsupported);
         }
 
-        // Step 3: Derive key from passphrase
-        let key = generate_key_from_passphrase(request.password.expose_secret(), salt_resp.salt);
+        // Step 3: Derive key from passphrase, then zeroize the passphrase as
+        // soon as the KDF no longer needs it.
+        let key = generate_key_from_passphrase(password.expose_secret(), salt_resp.salt);
+        drop(password);
 
         // Step 4: Create auth verifier
         let verifier = create_auth_verifier(key.clone());
@@ -67,12 +88,8 @@ impl TutaPreSession {
         let access_key_b64 = BASE64_STANDARD.encode(access_key_bytes);
 
         // Step 6: Create session
-        let session_body = create_session_body(
-            &request.mail_address,
-            &verifier,
-            &access_key_b64,
-            "tuta-bridge",
-        );
+        let session_body =
+            create_session_body(&mail_address, &verifier, &access_key_b64, "tuta-bridge");
         let session_url = format!("{}/rest/sys/sessionservice", self.base_url);
         let mut session_headers = self.common_headers(true);
         session_headers.insert("v".to_string(), "158".to_string());
@@ -82,29 +99,38 @@ impl TutaPreSession {
                 &session_url,
                 Some(session_body),
                 session_headers,
+                AuthFailure::Login,
             )
             .await?;
-        let session_resp = parse_session_response(&session_data)?;
+        let mut session_resp = parse_session_response(&session_data)?;
 
-        // Step 7: Handle challenges
+        // Step 7: Handle challenges. Only TOTP (type 1) is supported; any other
+        // challenge type is rejected immediately.
         let session_id = super::json::session_id_from_access_token(&session_resp.access_token)?;
         let mut need_poll = false;
 
         for challenge in &session_resp.challenges {
             match challenge {
                 ChallengeType::Totp => {
-                    let code = (request.totp)()?;
+                    let code = (totp)()?;
                     let totp_body = second_factor_body(&session_id, &code);
                     let totp_url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
                     let mut totp_headers = self.common_headers(true);
                     totp_headers.insert("v".to_string(), "158".to_string());
-                    self.request_json(HttpMethod::POST, &totp_url, Some(totp_body), totp_headers)
-                        .await?;
+                    self.request_json(
+                        HttpMethod::POST,
+                        &totp_url,
+                        Some(totp_body),
+                        totp_headers,
+                        AuthFailure::SecondFactor,
+                    )
+                    .await?;
                     need_poll = true;
                 }
                 ChallengeType::Other(_) => {
-                    (request.on_device_approval)();
-                    need_poll = true;
+                    return Err(Error::Unsupported(
+                        "second factor type not supported".into(),
+                    ));
                 }
             }
         }
@@ -125,8 +151,8 @@ impl TutaPreSession {
 
         // Step 10: Return NewSession
         Ok(NewSession {
-            user_id: session_resp.user_id,
-            access_token: session_resp.access_token,
+            user_id: std::mem::take(&mut session_resp.user_id),
+            access_token: std::mem::take(&mut session_resp.access_token),
             encrypted_passphrase_key,
         })
     }
@@ -143,7 +169,13 @@ impl TutaPreSession {
             );
             let headers = self.common_headers(false);
             let data = self
-                .request_json(HttpMethod::GET, &url, None, headers)
+                .request_json(
+                    HttpMethod::GET,
+                    &url,
+                    None,
+                    headers,
+                    AuthFailure::SecondFactor,
+                )
                 .await?;
             if !parse_pending(&data)? {
                 return Ok(());
@@ -165,13 +197,16 @@ impl TutaPreSession {
     }
 
     /// Execute an HTTP request and return the response body as bytes.
-    /// Non-2xx responses are mapped to `Error::Network` with the status code.
+    ///
+    /// A 401/403 maps to the phase-specific auth error; other non-2xx statuses
+    /// map to `Error::Network` with the status code.
     async fn request_json(
         &self,
         method: HttpMethod,
         url: &str,
         body: Option<Vec<u8>>,
         headers: HashMap<String, String>,
+        failure: AuthFailure,
     ) -> crate::domain::Result<Vec<u8>> {
         let options = RestClientOptions {
             headers,
@@ -183,6 +218,13 @@ impl TutaPreSession {
             .request_binary(url.to_string(), method, options)
             .await
             .map_err(|_| Error::Network("request failed".into()))?;
+
+        if response.status == 401 || response.status == 403 {
+            return Err(match failure {
+                AuthFailure::Login => Error::Login("authentication failed".into()),
+                AuthFailure::SecondFactor => Error::SecondFactor("second factor rejected".into()),
+            });
+        }
 
         if response.status < 200 || response.status >= 300 {
             return Err(Error::Network(format!("status {}", response.status)));

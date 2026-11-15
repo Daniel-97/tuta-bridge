@@ -15,7 +15,7 @@ use mail_builder::MessageBuilder;
 use time::format_description::well_known::Rfc2822;
 use time::OffsetDateTime;
 
-use crate::domain::{Address, Error, MessageContent, Result};
+use crate::domain::{Address, Attachment, Error, MessageContent, Result};
 use crate::ports::renderer::MessageRenderer;
 
 /// Renders [`MessageContent`] into RFC 5322 MIME bytes deterministically.
@@ -34,6 +34,81 @@ pub fn deterministic_boundary(seed: &str, label: &str) -> String {
 /// Replace CR/LF so a value can never inject a header line.
 fn sanitize(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
+}
+
+/// Return true when `s` is a valid RFC 2045 token: non-empty and made only of
+/// characters that are not separators, whitespace, or control bytes.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Validate a MIME media type as `type/subtype` built from RFC tokens.
+///
+/// Anything else — including values that carry a CR/LF or a separator and could
+/// inject a header line — falls back to `application/octet-stream`.
+fn sanitize_media_type(mime: &str) -> String {
+    let (ty, sub) = match mime.split_once('/') {
+        Some((t, s)) if !t.is_empty() && !s.is_empty() && !s.contains('/') => (t, s),
+        _ => return "application/octet-stream".to_string(),
+    };
+    if is_token(ty) && is_token(sub) {
+        mime.to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+/// Validate a Content-ID, stripping a single pair of surrounding angle brackets.
+///
+/// Returns `None` when the value contains CR/LF, whitespace, or `<`/`>` and so
+/// could inject a header line; the caller then treats it as a normal attachment.
+fn sanitize_cid(cid: &str) -> Option<String> {
+    let trimmed = cid.trim();
+    let inner = if trimmed.len() >= 2 && trimmed.starts_with('<') && trimmed.ends_with('>') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    if inner.is_empty() {
+        return None;
+    }
+    if inner
+        .chars()
+        .any(|c| c == '\r' || c == '\n' || c == '<' || c == '>' || c.is_whitespace())
+    {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
+/// Build an inline (`Content-Disposition: inline` + `Content-ID`) MIME part.
+fn inline_part(attachment: &Attachment, cid: &str) -> MimePart<'static> {
+    MimePart::new(
+        ContentType::new(sanitize_media_type(&attachment.mime_type)),
+        BodyPart::Binary(attachment.data.clone().into()),
+    )
+    .inline()
+    .cid(cid.to_string())
 }
 
 fn convert_address(addr: &Address) -> MbAddress<'static> {
@@ -65,6 +140,17 @@ fn build_message(content: &MessageContent) -> Result<Vec<u8>> {
         })
         .unwrap_or_default();
 
+    // Partition attachments: those with a valid Content-ID become inline parts,
+    // everything else (no cid, or an invalid cid) is a regular attachment.
+    let mut inline_attachments: Vec<(String, &Attachment)> = Vec::new();
+    let mut regular_attachments: Vec<&Attachment> = Vec::new();
+    for attachment in &content.attachments {
+        match attachment.cid.as_deref().and_then(sanitize_cid) {
+            Some(cid) => inline_attachments.push((cid, attachment)),
+            None => regular_attachments.push(attachment),
+        }
+    }
+
     let mut alternative = MimePart::new(
         ContentType::new("multipart/alternative").attribute("boundary", alt_boundary),
         BodyPart::Multipart(Vec::new()),
@@ -83,15 +169,8 @@ fn build_message(content: &MessageContent) -> Result<Vec<u8>> {
             "text/html",
             BodyPart::Text(html.clone().into()),
         ));
-        for attachment in content.attachments.iter().filter(|a| a.cid.is_some()) {
-            related.add_part(
-                MimePart::new(
-                    ContentType::new(attachment.mime_type.clone()),
-                    BodyPart::Binary(attachment.data.clone().into()),
-                )
-                .inline()
-                .cid(attachment.cid.clone().expect("filtered to a cid")),
-            );
+        for (cid, attachment) in &inline_attachments {
+            related.add_part(inline_part(attachment, cid));
         }
         alternative.add_part(related);
     }
@@ -101,13 +180,22 @@ fn build_message(content: &MessageContent) -> Result<Vec<u8>> {
         BodyPart::Multipart(Vec::new()),
     );
     root.add_part(alternative);
-    for attachment in content.attachments.iter().filter(|a| a.cid.is_none()) {
+
+    // Without an HTML body there is no multipart/related to host them, so inline
+    // attachments are emitted at the root as inline parts instead of dropped.
+    if content.body_html.is_none() {
+        for (cid, attachment) in &inline_attachments {
+            root.add_part(inline_part(attachment, cid));
+        }
+    }
+
+    for attachment in &regular_attachments {
         root.add_part(
             MimePart::new(
-                ContentType::new(attachment.mime_type.clone()),
+                ContentType::new(sanitize_media_type(&attachment.mime_type)),
                 BodyPart::Binary(attachment.data.clone().into()),
             )
-            .attachment(attachment.name.clone()),
+            .attachment(sanitize(&attachment.name)),
         );
     }
 

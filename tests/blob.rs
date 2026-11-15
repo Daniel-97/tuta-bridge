@@ -7,11 +7,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
 fn builds_blob_get_json_and_url() {
-    let body = blob_get_body("arch", &["b1".into(), "b2".into()]).unwrap();
+    let body = blob_get_body("arch", "b1").unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["52"], "arch");
-    assert_eq!(v["193"][0]["146"], "b1");
-    assert!(v["110"].is_null());
+    assert_eq!(v["110"], "b1");
+    assert_eq!(v["193"], serde_json::json!([]));
     let url = blob_url("https://blob.example", "tok", b"{\"a\":1}");
     assert!(url.starts_with("https://blob.example/rest/storage/blobservice?"));
     assert!(url.contains("blobAccessToken=tok"));
@@ -19,6 +19,16 @@ fn builds_blob_get_json_and_url() {
     let trimmed = blob_url("https://blob.example/", "tok", b"{\"a\":1}");
     assert!(trimmed.starts_with("https://blob.example/rest/storage/blobservice?"));
     assert!(!trimmed.contains("//rest"));
+}
+
+#[test]
+fn single_blob_json_is_protocol_shaped() {
+    let body = blob_get_body("arch", "b1").unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // Singular request: "110" carries the blob id, "193" is empty.
+    assert_eq!(v["110"], "b1");
+    assert_eq!(v["193"], serde_json::json!([]));
+    assert!(v["193"].as_array().is_some_and(|a| a.is_empty()));
 }
 
 #[test]

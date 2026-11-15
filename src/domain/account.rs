@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use zeroize::Zeroize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AccountId(pub String);
 
 impl fmt::Display for AccountId {
@@ -16,6 +17,13 @@ pub struct StoredCredentials {
     pub user_id: String,
     pub access_token: String,
     pub encrypted_passphrase_key: Vec<u8>,
+}
+
+impl Drop for StoredCredentials {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.encrypted_passphrase_key.zeroize();
+    }
 }
 
 #[derive(Clone)]

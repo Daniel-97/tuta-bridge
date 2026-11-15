@@ -40,15 +40,12 @@ impl LoginUseCase {
         // 2. Get password (moved into the request, never cloned).
         let password = self.prompt.password()?;
 
-        // 3. Build session request with TOTP and device-approval callbacks.
+        // 3. Build session request with a TOTP callback.
         let prompt_for_totp = Arc::clone(&self.prompt);
         let request = crate::ports::session::SessionRequest {
             mail_address: mail.clone(),
             password,
             totp: Arc::new(move || prompt_for_totp.totp_code()),
-            on_device_approval: Arc::new(|| {
-                eprintln!("Approve the login from another Tuta client.");
-            }),
         };
 
         // 4. Create a new session through the factory.
@@ -66,16 +63,34 @@ impl LoginUseCase {
         let session = self.factory.resume(&credentials).await?;
         let info = session.account();
 
-        // 7. Persist credentials in the secret store.
-        self.store.save(&AccountId(mail.clone()), &credentials)?;
+        // 7. Persist credentials in the secret store. On failure, close the
+        //    session best-effort (warn only) and return the storage error.
+        let account_id = AccountId(mail.clone());
+        if let Err(e) = self.store.save(&account_id, &credentials) {
+            if session.close().await.is_err() {
+                tracing::warn!("server session close failed");
+            }
+            return Err(e);
+        }
 
-        // 8. Update config with the active account.
+        // 8. Update config with the active account. On failure, clean up the
+        //    stored credentials, close the session best-effort, then return the
+        //    config error.
         let mut config = Config::load(&self.config_path)
             .map_err(|e| crate::domain::Error::Config(e.to_string()))?;
         config.active_account = Some(mail);
-        config
+        if let Err(e) = config
             .save(&self.config_path)
-            .map_err(|e| crate::domain::Error::Config(e.to_string()))?;
+            .map_err(|e| crate::domain::Error::Config(e.to_string()))
+        {
+            if self.store.delete(&account_id).is_err() {
+                tracing::warn!("credential cleanup failed");
+            }
+            if session.close().await.is_err() {
+                tracing::warn!("server session close failed");
+            }
+            return Err(e);
+        }
 
         // 9. Return account info.
         Ok(info)

@@ -13,7 +13,7 @@ use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, Logged
 use super::blob::load_attachment;
 use super::content::{
     address_from_encrypted, address_from_mail_address, details_are_intact,
-    draft_details_are_intact, parse_headers, select_body, threading_headers,
+    draft_details_are_intact, mail_is_intact, parse_headers, select_body, threading_headers,
 };
 use crate::domain::{Error, Folder, FolderKind, MessageContent, MessageSummary, Result};
 use crate::ports::mail_source::MailSource;
@@ -256,6 +256,10 @@ impl MailSource for TutaMailSource {
             .load(&mail_id)
             .await
             .map_err(|_| Error::Message("mail details unavailable".into()))?;
+
+        if !mail_is_intact(&mail) {
+            return Err(Error::Message("mail content unavailable".into()));
+        }
 
         let details = self.load_details(&mail).await?;
 

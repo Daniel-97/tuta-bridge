@@ -34,7 +34,12 @@ impl DateProvider for SystemClock {
 
 fn main() {
     // 1. Initialise tracing (writes to stderr).
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    // Always silence the keyring/secret-service targets so `RUST_LOG=debug`
+    // cannot emit the account address (the keyring username) or other secrets.
+    for directive in ["keyring=off", "secret_service=off", "zbus=off"] {
+        filter = filter.add_directive(directive.parse().expect("valid directive"));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

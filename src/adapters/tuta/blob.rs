@@ -27,17 +27,18 @@ use tutasdk::{GeneratedId, IdTupleGenerated, LoggedInSdk, CLIENT_VERSION};
 use super::content::file_is_intact;
 use crate::domain::{Attachment, Error, Result};
 
-/// Build the JSON body for a blob-service GET request over a single archive.
-pub fn blob_get_body(archive_id: &str, blob_ids: &[String]) -> Result<Vec<u8>> {
-    let blob_entries: Vec<serde_json::Value> = blob_ids
-        .iter()
-        .map(|id| json!({ "145": "0", "146": id }))
-        .collect();
+/// Build the JSON body for a single-blob blob-service GET request.
+///
+/// The singular form (`"110"` populated and `"193"` empty) selects one blob by
+/// id; the plural form would return a framed multi-blob envelope whose layout
+/// does not match the raw ciphertext the caller expects. One blob is fetched
+/// per GET request.
+pub fn blob_get_body(archive_id: &str, blob_id: &str) -> Result<Vec<u8>> {
     let value = json!({
         "51": "0",
         "52": archive_id,
-        "110": null,
-        "193": blob_entries,
+        "110": blob_id,
+        "193": [],
     });
     serde_json::to_vec(&value).map_err(|_| Error::Message("attachment body build failed".into()))
 }
@@ -192,7 +193,7 @@ pub async fn load_attachment(
         let token = access.blobAccessInfo.blobAccessToken.clone();
 
         for blob in &groups[&archive_id.to_string()] {
-            let body = blob_get_body(archive_id.as_str(), &[blob.blobId.to_string()])?;
+            let body = blob_get_body(archive_id.as_str(), blob.blobId.as_str())?;
             let url = blob_url(&server, &token, &body);
             let chunk = fetch_blob(rest, &url, user_access_token).await?;
             ciphertext_chunks.push(chunk);

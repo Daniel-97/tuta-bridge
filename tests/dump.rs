@@ -274,3 +274,62 @@ async fn resolves_custom_folder_case_insensitively() {
     assert_eq!(folders.len(), 1);
     assert_eq!(folders[0].list_id, "projects-list");
 }
+
+#[tokio::test]
+async fn rejects_zero_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let out = dir.path().join("out");
+    write_config(&config_path);
+
+    let store = store_with_credentials();
+    let (factory, _mail) = factory_with_mail(support::FakeMailSource::new());
+
+    let uc = DumpUseCase::new(factory, store, renderer(), config_path);
+
+    let result = uc
+        .execute(DumpArgs {
+            folder: "inbox".into(),
+            limit: 0,
+            out,
+        })
+        .await;
+
+    assert!(matches!(result, Err(Error::Config(_))));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dump_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let out = dir.path().join("out");
+    write_config(&config_path);
+
+    let store = store_with_credentials();
+
+    let e1 = summary("inbox-list", "e1");
+
+    let mut mail = support::FakeMailSource::new();
+    mail.folders = vec![inbox_folder()];
+    mail.messages = vec![e1.clone()];
+    mail.content = Some(content(&e1));
+
+    let (factory, _mail) = factory_with_mail(mail);
+
+    let uc = DumpUseCase::new(factory, store, renderer(), config_path);
+
+    uc.execute(DumpArgs {
+        folder: "inbox".into(),
+        limit: 10,
+        out: out.clone(),
+    })
+    .await
+    .unwrap();
+
+    let path = out.join(format!("{}.eml", e1.file_stem()));
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+}

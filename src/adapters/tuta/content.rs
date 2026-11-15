@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use tutasdk::entities::generated::tutanota::{
-    Body, EncryptedMailAddress, MailAddress, MailDetails, MailDetailsBlob, MailDetailsDraft,
+    Body, EncryptedMailAddress, Mail, MailAddress, MailDetails, MailDetailsBlob, MailDetailsDraft,
     TutanotaFile,
 };
 
@@ -177,6 +177,15 @@ pub fn file_is_intact(file: &TutanotaFile) -> bool {
     file._errors.is_empty() && (file.size == 0 || !file.blobs.is_empty())
 }
 
+/// Decide whether a decrypted [`Mail`] entity is intact.
+///
+/// Like the details blob, the mail itself and its sender can carry `_errors`
+/// when a field fails to decrypt while still deserializing successfully. Both
+/// must be empty before the mail's content can be trusted.
+pub fn mail_is_intact(mail: &Mail) -> bool {
+    mail._errors.is_empty() && mail.sender._errors.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +285,58 @@ mod tests {
         }
     }
 
+    fn intact_mail() -> Mail {
+        Mail {
+            _id: Some(IdTupleGenerated::new(
+                GeneratedId("list".into()),
+                GeneratedId("element".into()),
+            )),
+            _permissions: GeneratedId("permissions".into()),
+            _format: 0,
+            _ownerEncSessionKey: None,
+            subject: String::new(),
+            receivedDate: DateTime::from_millis(0),
+            state: 0,
+            unread: false,
+            confidential: false,
+            replyType: 0,
+            _ownerGroup: None,
+            differentEnvelopeSender: None,
+            listUnsubscribe: false,
+            movedTime: None,
+            phishingStatus: 0,
+            authStatus: None,
+            method: 0,
+            recipientCount: 0,
+            encryptionAuthStatus: None,
+            _ownerKeyVersion: None,
+            processingState: 0,
+            processNeeded: false,
+            sendAt: None,
+            serverClassificationData: None,
+            _kdfNonce: None,
+            sender: MailAddress {
+                _id: None,
+                name: String::new(),
+                address: "a@b".into(),
+                contact: None,
+                _errors: Default::default(),
+            },
+            attachments: Vec::new(),
+            conversationEntry: IdTupleGenerated::new(
+                GeneratedId("list".into()),
+                GeneratedId("element".into()),
+            ),
+            firstRecipient: None,
+            mailDetails: None,
+            mailDetailsDraft: None,
+            bucketKey: None,
+            sets: Vec::new(),
+            clientSpamClassifierResult: None,
+            _errors: Default::default(),
+        }
+    }
+
     #[test]
     fn intact_blob_is_accepted() {
         assert!(details_are_intact(&intact_blob()));
@@ -358,5 +419,24 @@ mod tests {
         let mut file = intact_file();
         file.blobs = Vec::new();
         assert!(!file_is_intact(&file));
+    }
+
+    #[test]
+    fn intact_mail_is_accepted() {
+        assert!(mail_is_intact(&intact_mail()));
+    }
+
+    #[test]
+    fn mail_with_top_level_errors_is_rejected() {
+        let mut mail = intact_mail();
+        mail._errors = error_map();
+        assert!(!mail_is_intact(&mail));
+    }
+
+    #[test]
+    fn mail_with_sender_errors_is_rejected() {
+        let mut mail = intact_mail();
+        mail.sender._errors = error_map();
+        assert!(!mail_is_intact(&mail));
     }
 }

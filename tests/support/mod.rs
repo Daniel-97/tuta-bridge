@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::SecretString;
@@ -60,6 +61,7 @@ pub struct FakeStore {
     pub calls: Mutex<Vec<String>>,
     pub saved: Mutex<Vec<(AccountId, StoredCredentials)>>,
     pub load_result: Mutex<Option<StoredCredentials>>,
+    pub save_result: Mutex<Option<Result<()>>>,
 }
 
 impl FakeStore {
@@ -68,6 +70,7 @@ impl FakeStore {
             calls: Mutex::new(Vec::new()),
             saved: Mutex::new(Vec::new()),
             load_result: Mutex::new(None),
+            save_result: Mutex::new(None),
         }
     }
 
@@ -79,6 +82,9 @@ impl FakeStore {
 impl CredentialStore for FakeStore {
     fn save(&self, account: &AccountId, credentials: &StoredCredentials) -> Result<()> {
         self.calls.lock().unwrap().push("save".to_string());
+        if let Some(result) = self.save_result.lock().unwrap().take() {
+            return result;
+        }
         self.saved
             .lock()
             .unwrap()
@@ -107,6 +113,7 @@ pub struct FakeFactory {
     pub close_should_fail: bool,
     pub mail: Arc<FakeMailSource>,
     pub calls: Mutex<Vec<String>>,
+    pub close_calls: Arc<AtomicUsize>,
 }
 
 impl FakeFactory {
@@ -117,6 +124,7 @@ impl FakeFactory {
             close_should_fail: false,
             mail: Arc::new(FakeMailSource::new()),
             calls: Mutex::new(Vec::new()),
+            close_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -138,6 +146,7 @@ impl SessionFactory for FakeFactory {
             account: self.resume_account.clone(),
             mail: Arc::clone(&self.mail),
             close_should_fail: self.close_should_fail,
+            close_calls: Arc::clone(&self.close_calls),
         }))
     }
 }
@@ -150,6 +159,7 @@ pub struct FakeSession {
     pub account: AccountInfo,
     pub mail: Arc<FakeMailSource>,
     pub close_should_fail: bool,
+    pub close_calls: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -163,6 +173,7 @@ impl Session for FakeSession {
     }
 
     async fn close(&self) -> Result<()> {
+        self.close_calls.fetch_add(1, Ordering::SeqCst);
         if self.close_should_fail {
             Err(Error::Network("close failed".into()))
         } else {

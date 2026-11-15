@@ -47,6 +47,10 @@ impl DumpUseCase {
     }
 
     pub async fn execute(&self, args: DumpArgs) -> Result<DumpReport> {
+        if args.limit == 0 {
+            return Err(Error::Config("limit must be greater than zero".into()));
+        }
+
         // 1. Load configuration and require an active account.
         let config = Config::load(&self.config_path).map_err(|e| Error::Config(e.to_string()))?;
         let account = config.active_account.ok_or(Error::NoActiveAccount)?;
@@ -90,7 +94,7 @@ impl DumpUseCase {
             };
 
             let path = args.out.join(format!("{}.eml", message.file_stem()));
-            if std::fs::write(&path, &bytes).is_err() {
+            if crate::config::write_private_file(&path, &bytes).is_err() {
                 failed.push(format!("{}/{}", message.list_id, message.element_id));
                 continue;
             }

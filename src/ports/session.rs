@@ -9,7 +9,6 @@ pub struct SessionRequest {
     pub mail_address: String,
     pub password: SecretString,
     pub totp: Arc<dyn Fn() -> Result<String> + Send + Sync>,
-    pub on_device_approval: Arc<dyn Fn() + Send + Sync>,
 }
 
 pub struct NewSession {

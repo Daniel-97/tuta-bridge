@@ -3284,6 +3284,7 @@ dependencies = [
  "tracing-subscriber",
  "tuta-sdk",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

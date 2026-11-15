@@ -84,3 +84,50 @@ fn date_comes_from_sent_at_not_clock() {
     let parsed = mail_parser::MessageParser::default().parse(&bytes).unwrap();
     assert_eq!(parsed.date().unwrap().to_timestamp(), 1_700_000_000);
 }
+
+#[test]
+fn crlf_in_cid_is_dropped_as_normal_attachment() {
+    let mut c = fixture();
+    c.attachments[1].cid = Some("img1\r\nX-Evil: injected".into());
+    let bytes = MimeRenderer.render(&c).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(!raw.contains("X-Evil: injected"));
+    assert!(!raw.contains("Content-ID"));
+}
+
+#[test]
+fn invalid_media_type_falls_back_to_octet_stream() {
+    let mut c = fixture();
+    c.attachments[0].mime_type = "text/plain\r\nBcc: evil@example.com".into();
+    let bytes = MimeRenderer.render(&c).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(!raw.contains("Bcc: evil@example.com"));
+    assert!(raw.contains("application/octet-stream"));
+}
+
+#[test]
+fn crlf_in_filename_is_sanitized() {
+    let mut c = fixture();
+    c.attachments[0].name = "report.pdf\r\nX-Evil: injected".into();
+    let bytes = MimeRenderer.render(&c).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(!raw.contains("\r\nX-Evil:"));
+    assert!(raw.contains("filename="));
+}
+
+#[test]
+fn cid_attachment_without_html_is_emitted_inline() {
+    let mut c = fixture();
+    c.body_html = None;
+    c.body_text = Some("plain body".into());
+    c.attachments = vec![Attachment {
+        name: "logo.png".into(),
+        mime_type: "image/png".into(),
+        data: b"PNG".to_vec(),
+        cid: Some("img1".into()),
+    }];
+    let bytes = MimeRenderer.render(&c).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(raw.contains("Content-ID: <img1>"));
+    assert!(raw.contains("Content-Disposition: inline"));
+}

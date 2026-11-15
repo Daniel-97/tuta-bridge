@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 const DEFAULT_BASE_URL: &str = "https://app.tuta.com";
 const APP_DIR: &str = "tuta-bridge";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,9 +41,31 @@ impl Config {
             create_private_dir(parent)?;
         }
         let text = toml::to_string(self).context("failed to serialize config")?;
-        fs::write(path, text)
+        write_private_file(path, text.as_bytes())
             .with_context(|| format!("failed to write config file {}", path.display()))
     }
+}
+
+/// Write `contents` to `path`, creating the file (and tightening an existing
+/// one) with mode `0600` on Unix so it is never world-readable.
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Tighten an already-existing file that may carry looser permissions.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 pub fn validate_base_url(url: &str) -> std::result::Result<(), String> {
@@ -178,7 +200,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "base_url = \"secret-looking-value\n").unwrap();
-        let msg = format!("{:#}", Config::load(&path).unwrap_err());
+        let err = match Config::load(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("expected parse error"),
+        };
+        let msg = format!("{:#}", err);
         assert!(msg.contains(&path.display().to_string()));
         assert!(!msg.contains("secret-looking-value"));
     }
@@ -200,7 +226,7 @@ mod tests {
             base_url: "https://cfg.example".into(),
         };
         cfg.save(&path).unwrap();
-        assert_eq!(Config::load(&path).unwrap(), cfg);
+        assert!(Config::load(&path).unwrap() == cfg);
         assert_eq!(
             resolve_base_url(
                 Some("https://cli.example"),

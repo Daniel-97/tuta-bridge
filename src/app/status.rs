@@ -30,8 +30,8 @@ impl StatusUseCase {
 
         // 4. Return AccountInfo derived from the stored credentials.
         Ok(Some(AccountInfo {
-            mail_address: credentials.login,
-            user_id: credentials.user_id,
+            mail_address: credentials.login.clone(),
+            user_id: credentials.user_id.clone(),
         }))
     }
 }
