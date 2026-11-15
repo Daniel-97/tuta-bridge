@@ -10,6 +10,7 @@ use tutasdk::entities::generated::tutanota::{
 use tutasdk::entities::Entity;
 use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk};
 
+use super::blob::load_attachment;
 use super::content::{
     address_from_encrypted, address_from_mail_address, details_are_intact,
     draft_details_are_intact, parse_headers, select_body, threading_headers,
@@ -78,8 +79,6 @@ pub fn resolve_folder<'a>(folders: &'a [Folder], requested: &str) -> Result<&'a 
 /// Tuta implementation of the mail source: lists folders and message summaries.
 pub struct TutaMailSource {
     logged: Arc<LoggedInSdk>,
-    // Used by Task 12/13 for content and attachments.
-    #[allow(dead_code)]
     rest: Arc<dyn RestClient>,
 }
 
@@ -280,6 +279,14 @@ impl MailSource for TutaMailSource {
             from.address = envelope.to_string();
         }
 
+        let mut attachments = Vec::new();
+        for attachment_id in &mail.attachments {
+            match load_attachment(&self.logged, self.rest.as_ref(), attachment_id).await {
+                Ok(attachment) => attachments.push(attachment),
+                Err(_) => return Err(Error::Message("attachment load failed".into())),
+            }
+        }
+
         Ok(MessageContent {
             summary: message.clone(),
             from,
@@ -313,7 +320,7 @@ impl MailSource for TutaMailSource {
             references,
             body_html,
             body_text,
-            attachments: Vec::new(),
+            attachments,
         })
     }
 }

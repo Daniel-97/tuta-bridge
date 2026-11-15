@@ -1,3 +1,4 @@
+pub mod blob;
 pub mod content;
 pub mod json;
 pub mod mail_source;
