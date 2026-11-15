@@ -10,7 +10,7 @@ impl fmt::Display for AccountId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredCredentials {
     pub login: String,
     pub user_id: String,
@@ -18,7 +18,7 @@ pub struct StoredCredentials {
     pub encrypted_passphrase_key: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AccountInfo {
     pub mail_address: String,
     pub user_id: String,

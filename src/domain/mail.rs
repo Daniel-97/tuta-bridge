@@ -32,7 +32,7 @@ pub struct Folder {
     pub kind: FolderKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MessageSummary {
     pub list_id: String,
     pub element_id: String,
@@ -69,13 +69,13 @@ impl MessageSummary {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Address {
     pub name: Option<String>,
     pub address: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Attachment {
     pub name: String,
     pub mime_type: String,
@@ -83,7 +83,7 @@ pub struct Attachment {
     pub cid: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MessageContent {
     pub summary: MessageSummary,
     pub from: Address,
