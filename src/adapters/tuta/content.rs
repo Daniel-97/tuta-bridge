@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use tutasdk::entities::generated::tutanota::{
     Body, EncryptedMailAddress, MailAddress, MailDetails, MailDetailsBlob, MailDetailsDraft,
+    TutanotaFile,
 };
 
 use crate::domain::Address;
@@ -164,9 +165,22 @@ fn mail_details_are_intact(details: &MailDetails) -> bool {
     details.replyTos.iter().all(|a| a._errors.is_empty())
 }
 
+/// Decide whether a decrypted [`TutanotaFile`] is intact.
+///
+/// The SDK reports per-field decryption failures in the entity's `_errors` map
+/// and still returns `Ok` with default (empty) values, so a successful `load`
+/// alone is not proof of intactness. A file is intact only when its `_errors`
+/// map is empty and, whenever it declares a non-zero size, it carries at least
+/// one blob. A non-zero size with no blobs means the blob list failed to
+/// decrypt and defaulted to empty.
+pub fn file_is_intact(file: &TutanotaFile) -> bool {
+    file._errors.is_empty() && (file.size == 0 || !file.blobs.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tutasdk::entities::generated::sys::Blob;
     use tutasdk::entities::generated::tutanota::{Header, Recipients};
     use tutasdk::entities::DateTime;
     use tutasdk::{GeneratedId, IdTupleGenerated};
@@ -234,6 +248,34 @@ mod tests {
         serde_json::from_str(r#"{"body":{"String":"decryption failed"}}"#).unwrap()
     }
 
+    fn intact_file() -> TutanotaFile {
+        TutanotaFile {
+            _id: Some(IdTupleGenerated::new(
+                GeneratedId("list".into()),
+                GeneratedId("element".into()),
+            )),
+            _permissions: GeneratedId("permissions".into()),
+            _format: 0,
+            _ownerEncSessionKey: None,
+            name: "file.bin".into(),
+            size: 5,
+            mimeType: None,
+            _ownerGroup: None,
+            cid: None,
+            _ownerKeyVersion: None,
+            _kdfNonce: None,
+            parent: None,
+            subFiles: None,
+            blobs: vec![Blob {
+                _id: None,
+                archiveId: GeneratedId("arch".into()),
+                size: 5,
+                blobId: GeneratedId("blob".into()),
+            }],
+            _errors: Default::default(),
+        }
+    }
+
     #[test]
     fn intact_blob_is_accepted() {
         assert!(details_are_intact(&intact_blob()));
@@ -289,5 +331,32 @@ mod tests {
         reply_to._errors = error_map();
         blob.details.replyTos = vec![reply_to];
         assert!(!details_are_intact(&blob));
+    }
+
+    #[test]
+    fn intact_file_is_accepted() {
+        assert!(file_is_intact(&intact_file()));
+    }
+
+    #[test]
+    fn file_with_errors_is_rejected() {
+        let mut file = intact_file();
+        file._errors = error_map();
+        assert!(!file_is_intact(&file));
+    }
+
+    #[test]
+    fn zero_sized_file_without_blobs_is_accepted() {
+        let mut file = intact_file();
+        file.size = 0;
+        file.blobs = Vec::new();
+        assert!(file_is_intact(&file));
+    }
+
+    #[test]
+    fn non_zero_file_without_blobs_is_rejected() {
+        let mut file = intact_file();
+        file.blobs = Vec::new();
+        assert!(!file_is_intact(&file));
     }
 }

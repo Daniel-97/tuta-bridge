@@ -16,6 +16,9 @@ fn builds_blob_get_json_and_url() {
     assert!(url.starts_with("https://blob.example/rest/storage/blobservice?"));
     assert!(url.contains("blobAccessToken=tok"));
     assert!(url.contains("v=16"));
+    let trimmed = blob_url("https://blob.example/", "tok", b"{\"a\":1}");
+    assert!(trimmed.starts_with("https://blob.example/rest/storage/blobservice?"));
+    assert!(!trimmed.contains("//rest"));
 }
 
 #[test]
@@ -32,14 +35,16 @@ async fn fetches_binary_blob_with_access_token() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/rest/storage/blobservice"))
-        .and(header("accessToken", "tok"))
+        .and(header("accessToken", "user-token"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"cipher".to_vec()))
         .expect(1)
         .mount(&server)
         .await;
 
     let rest = NativeRestClient::try_new().unwrap();
-    let url = blob_url(&server.uri(), "tok", b"{\"a\":1}");
-    let data = fetch_blob(&rest, &url, "tok").await.unwrap();
+    // The blob token stays in the query; the user session token goes in the header.
+    let url = blob_url(&server.uri(), "blob-token", b"{\"a\":1}");
+    assert!(url.contains("blobAccessToken=blob-token"));
+    let data = fetch_blob(&rest, &url, "user-token").await.unwrap();
     assert_eq!(data, b"cipher");
 }

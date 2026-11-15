@@ -24,6 +24,7 @@ use tutasdk::services::ExtraServiceParams;
 use tutasdk::tutanota_constants::ArchiveDataType;
 use tutasdk::{GeneratedId, IdTupleGenerated, LoggedInSdk, CLIENT_VERSION};
 
+use super::content::file_is_intact;
 use crate::domain::{Attachment, Error, Result};
 
 /// Build the JSON body for a blob-service GET request over a single archive.
@@ -43,6 +44,7 @@ pub fn blob_get_body(archive_id: &str, blob_ids: &[String]) -> Result<Vec<u8>> {
 
 /// Build the full URL for fetching a blob from a blob server.
 pub fn blob_url(server: &str, token: &str, body: &[u8]) -> String {
+    let server = server.trim_end_matches('/');
     let query = encode_query_params([
         ("blobAccessToken".as_bytes(), token.as_bytes()),
         ("v".as_bytes(), "16".as_bytes()),
@@ -52,10 +54,17 @@ pub fn blob_url(server: &str, token: &str, body: &[u8]) -> String {
 }
 
 /// Fetch a blob over the blob service and return its raw bytes.
-pub async fn fetch_blob(rest: &dyn RestClient, url: &str, access_token: &str) -> Result<Vec<u8>> {
+///
+/// The blob access token stays in the `blobAccessToken` query parameter built by
+/// [`blob_url`]; the `accessToken` header carries the user session access token.
+pub async fn fetch_blob(
+    rest: &dyn RestClient,
+    url: &str,
+    user_access_token: &str,
+) -> Result<Vec<u8>> {
     let options = RestClientOptions {
         headers: HashMap::from([
-            ("accessToken".to_string(), access_token.to_string()),
+            ("accessToken".to_string(), user_access_token.to_string()),
             ("cv".to_string(), CLIENT_VERSION.to_string()),
         ]),
         body: None,
@@ -112,6 +121,7 @@ async fn resolve_file_session_key(
 pub async fn load_attachment(
     logged: &LoggedInSdk,
     rest: &dyn RestClient,
+    user_access_token: &str,
     id: &IdTupleGenerated,
 ) -> Result<Attachment> {
     let file: TutanotaFile = logged
@@ -120,6 +130,10 @@ pub async fn load_attachment(
         .load(id)
         .await
         .map_err(|_| Error::Message("attachment load failed".into()))?;
+
+    if !file_is_intact(&file) {
+        return Err(Error::Message("attachment load failed".into()));
+    }
 
     if file.blobs.is_empty() {
         return Ok(Attachment {
@@ -180,7 +194,7 @@ pub async fn load_attachment(
         for blob in &groups[&archive_id.to_string()] {
             let body = blob_get_body(archive_id.as_str(), &[blob.blobId.to_string()])?;
             let url = blob_url(&server, &token, &body);
-            let chunk = fetch_blob(rest, &url, &token).await?;
+            let chunk = fetch_blob(rest, &url, user_access_token).await?;
             ciphertext_chunks.push(chunk);
         }
     }

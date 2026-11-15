@@ -60,7 +60,11 @@ impl SessionFactory for TutaSessionFactory {
             mail_address: credentials.login.clone(),
             user_id: credentials.user_id.clone(),
         };
-        let mail = TutaMailSource::new(Arc::clone(&logged), Arc::clone(&self.rest));
+        let mail = TutaMailSource::new(
+            Arc::clone(&logged),
+            Arc::clone(&self.rest),
+            credentials.access_token.clone(),
+        );
 
         Ok(Box::new(TutaSession {
             logged,

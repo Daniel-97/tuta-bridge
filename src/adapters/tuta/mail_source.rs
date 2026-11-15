@@ -80,11 +80,16 @@ pub fn resolve_folder<'a>(folders: &'a [Folder], requested: &str) -> Result<&'a 
 pub struct TutaMailSource {
     logged: Arc<LoggedInSdk>,
     rest: Arc<dyn RestClient>,
+    access_token: String,
 }
 
 impl TutaMailSource {
-    pub fn new(logged: Arc<LoggedInSdk>, rest: Arc<dyn RestClient>) -> Self {
-        Self { logged, rest }
+    pub fn new(logged: Arc<LoggedInSdk>, rest: Arc<dyn RestClient>, access_token: String) -> Self {
+        Self {
+            logged,
+            rest,
+            access_token,
+        }
     }
 
     /// Resolve the session key for a mail's owner-group encryption.
@@ -281,7 +286,14 @@ impl MailSource for TutaMailSource {
 
         let mut attachments = Vec::new();
         for attachment_id in &mail.attachments {
-            match load_attachment(&self.logged, self.rest.as_ref(), attachment_id).await {
+            match load_attachment(
+                &self.logged,
+                self.rest.as_ref(),
+                &self.access_token,
+                attachment_id,
+            )
+            .await
+            {
                 Ok(attachment) => attachments.push(attachment),
                 Err(_) => return Err(Error::Message("attachment load failed".into())),
             }
