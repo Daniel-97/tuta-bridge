@@ -65,6 +65,19 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_store_is_secret_service_not_mock() {
+        let entry = keyring::Entry::new("tuta-bridge-test", "backend-check").unwrap();
+        assert!(
+            entry
+                .get_credential()
+                .downcast_ref::<keyring::secret_service::SsCredential>()
+                .is_some(),
+            "default keyring backend must be Secret Service, not mock"
+        );
+    }
+
     #[test]
     #[ignore = "requires a running Secret Service; run manually"]
     fn keyring_roundtrip() {
