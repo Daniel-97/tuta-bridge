@@ -25,6 +25,8 @@ pub enum Command {
     },
     Logout,
     Status,
+    Sync,
+    Resync,
     Dump {
         #[arg(long)]
         folder: String,
@@ -59,6 +61,18 @@ mod tests {
     fn parses_debug_flag() {
         let cli = parse_from(["tuta-bridge", "--debug", "status"]).unwrap();
         assert!(cli.debug);
+    }
+
+    #[test]
+    fn parses_sync_commands() {
+        assert!(matches!(
+            parse_from(["tuta-bridge", "sync"]).unwrap().command,
+            Command::Sync
+        ));
+        assert!(matches!(
+            parse_from(["tuta-bridge", "resync"]).unwrap().command,
+            Command::Resync
+        ));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use tuta_bridge::adapters::tuta::session::TutaSessionFactory;
 use tuta_bridge::app::dump::{DumpArgs, DumpUseCase};
 use tuta_bridge::app::login::LoginUseCase;
 use tuta_bridge::app::logout::LogoutUseCase;
+use tuta_bridge::app::state_sync::StateSyncUseCase;
 use tuta_bridge::app::status::StatusUseCase;
 use tuta_bridge::config::{config_path, data_dir, resolve_base_url, validate_base_url, Config};
 use tuta_bridge::domain::Error;
@@ -129,6 +130,32 @@ fn main() {
                     Some(info) => println!("{} ({})", info.mail_address, info.user_id),
                     None => println!("not logged in"),
                 }
+                Ok(())
+            }
+            Command::Sync => {
+                let uc = StateSyncUseCase::new(
+                    Arc::clone(&factory) as Arc<dyn tuta_bridge::ports::session::SessionFactory>,
+                    Arc::clone(&store) as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
+                    config_path,
+                );
+                let report = uc.sync().await?;
+                println!(
+                    "synced {} folders, {} messages",
+                    report.folders, report.messages
+                );
+                Ok(())
+            }
+            Command::Resync => {
+                let uc = StateSyncUseCase::new(
+                    Arc::clone(&factory) as Arc<dyn tuta_bridge::ports::session::SessionFactory>,
+                    Arc::clone(&store) as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
+                    config_path,
+                );
+                let report = uc.resync().await?;
+                println!(
+                    "resynced {} folders, {} messages",
+                    report.folders, report.messages
+                );
                 Ok(())
             }
             Command::Logout => {
