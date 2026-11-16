@@ -4,7 +4,7 @@ use serde_json::Value;
 use tutasdk::bindings::rest_client::RestClient;
 use tutasdk::crypto::crypto_facade::ResolvedSessionKey;
 use tutasdk::entities::generated::tutanota::{
-    Mail, MailDetails, MailDetailsDraft, MailSet, MailSetEntry,
+    Mail, MailAddress, MailDetails, MailDetailsDraft, MailSet, MailSetEntry,
 };
 use tutasdk::entities::Entity;
 use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk};
@@ -15,7 +15,9 @@ use super::content::{
     parse_headers, select_body, threading_headers,
 };
 use super::wire::decrypt_mail_details;
-use crate::domain::{Error, Folder, FolderKind, MessageContent, MessageSummary, Result};
+use crate::domain::{
+    Error, Folder, FolderKind, MessageContent, MessageHeader, MessagePage, MessageSummary, Result,
+};
 use crate::ports::mail_source::MailSource;
 
 /// Map a Tuta folder-type code to our [`FolderKind`]. Type 7 ("All") is skipped.
@@ -57,6 +59,47 @@ pub fn summary_from_parts(
         subject: subject.to_string(),
         unread,
     }
+}
+
+/// Build a [`MessageHeader`] from raw Tuta mail-list parts.
+///
+/// Only metadata available on the `Mail` list entity is mapped. Details that
+/// require decrypting the mail body (`sent` date, threading headers, cc/bcc,
+/// reply-to) stay empty and `envelope_complete` is `false`. Returns `None`
+/// when the mail has no element id and therefore cannot be referenced.
+pub fn header_from_parts(
+    list_id: &str,
+    element_id: &str,
+    received_at_ms: i64,
+    subject: &str,
+    sender: &MailAddress,
+    first_recipient: Option<&MailAddress>,
+    unread: bool,
+) -> Option<MessageHeader> {
+    if element_id.is_empty() {
+        return None;
+    }
+
+    Some(MessageHeader {
+        list_id: list_id.to_string(),
+        element_id: element_id.to_string(),
+        received_at_ms,
+        sent_at_ms: 0,
+        subject: subject.to_string(),
+        from: address_from_mail_address(sender),
+        to: first_recipient
+            .map(address_from_mail_address)
+            .into_iter()
+            .collect(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        reply_to: Vec::new(),
+        unread,
+        message_id: None,
+        in_reply_to: None,
+        references: Vec::new(),
+        envelope_complete: false,
+    })
 }
 
 /// Resolve a requested folder name (alias or custom name) case-insensitively.
@@ -243,6 +286,51 @@ impl MailSource for TutaMailSource {
                 ))
             })
             .collect())
+    }
+
+    async fn headers_page(
+        &self,
+        folder: &Folder,
+        _start: Option<&str>,
+        _limit: usize,
+    ) -> Result<MessagePage> {
+        let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+        // M3 loads every entry in the folder. `start` and `limit` are accepted
+        // for a later paginated implementation and intentionally ignored.
+        let entries: Vec<MailSetEntry> = crypto_client
+            .load_all(
+                &GeneratedId(folder.list_id.clone()),
+                ListLoadDirection::DESC,
+            )
+            .await
+            .map_err(|_| Error::Network("failed to load message entries".into()))?;
+
+        let mut headers = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mail: Mail = crypto_client
+                .load(&entry.mail)
+                .await
+                .map_err(|_| Error::Network("failed to load message".into()))?;
+            let Some(id) = mail._id.as_ref() else {
+                continue;
+            };
+            if let Some(header) = header_from_parts(
+                id.list_id.as_str(),
+                id.element_id.as_str(),
+                mail.receivedDate.as_millis() as i64,
+                &mail.subject,
+                &mail.sender,
+                mail.firstRecipient.as_ref(),
+                mail.unread,
+            ) {
+                headers.push(header);
+            }
+        }
+
+        Ok(MessagePage {
+            headers,
+            next_start: None,
+        })
     }
 
     async fn content(&self, message: &MessageSummary) -> Result<MessageContent> {
