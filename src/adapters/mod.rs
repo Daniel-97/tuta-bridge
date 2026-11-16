@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod keyring_store;
 pub mod mime;
+pub mod sqlite_state;
 pub mod terminal_prompt;
 pub mod tuta;

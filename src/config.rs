@@ -136,6 +136,11 @@ pub fn data_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Path of the SQLite state database inside the private data directory.
+pub fn state_path() -> anyhow::Result<PathBuf> {
+    Ok(data_dir()?.join("state.sqlite3"))
+}
+
 fn xdg_base(
     xdg: Option<OsString>,
     home: Option<OsString>,
