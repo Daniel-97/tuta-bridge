@@ -135,7 +135,7 @@ pub async fn request_archive_read_token(
         .get_service_executor()
         .post::<BlobAccessTokenService>(input, ExtraServiceParams::default())
         .await
-        .map_err(|_| Error::Message("mail details token failed".into()))?;
+        .map_err(|e| Error::Network(format!("mail details token failed: {e}")))?;
     Ok(output.blobAccessInfo)
 }
 
