@@ -53,14 +53,13 @@ CREATE TABLE accounts (
 CREATE TABLE mailboxes (
     id INTEGER PRIMARY KEY,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    tuta_set_id TEXT NOT NULL,          -- identità stabile della MailSet
-    entries_list_id TEXT NOT NULL,      -- lista degli entry della cartella
+    list_id TEXT NOT NULL,              -- lista degli entry della cartella
     name TEXT NOT NULL,
     kind TEXT NOT NULL,                 -- inbox/sent/drafts/trash/junk/archive/custom
-    parent_set_id TEXT,
+    parent_list_id TEXT,
     uidvalidity INTEGER NOT NULL,
     next_uid INTEGER NOT NULL,
-    UNIQUE (account_id, tuta_set_id)
+    UNIQUE (account_id, list_id)
 );
 
 CREATE TABLE messages (
@@ -69,16 +68,17 @@ CREATE TABLE messages (
     tuta_list_id TEXT NOT NULL,
     tuta_element_id TEXT NOT NULL,
     received_at_ms INTEGER NOT NULL,
-    sent_at_ms INTEGER NOT NULL,
+    sent_at_ms INTEGER NOT NULL DEFAULT 0,
     subject TEXT NOT NULL,
     from_name TEXT,
     from_address TEXT NOT NULL,
-    recipients_json TEXT NOT NULL,      -- to/cc/bcc/reply_to, solo indirizzi
+    recipients_json TEXT,               -- to/cc/bcc/reply_to; NULL finché non arricchito
     unread INTEGER NOT NULL,
     message_id TEXT,
     in_reply_to TEXT,
     references_json TEXT NOT NULL,
     rfc822_size INTEGER,                -- calcolato al primo rendering
+    envelope_complete INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (mailbox_id, uid),
     UNIQUE (mailbox_id, tuta_list_id, tuta_element_id)
 );
@@ -95,7 +95,10 @@ PRAGMA user_version = 1;
 ```
 
 `messages` è un indice di intestazioni, non una cache di posta: nessun corpo,
-nessun allegato, nessun blob.
+nessun allegato, nessun blob. I campi che il modello `Mail` non espone (ad
+esempio tutti i destinatari e `Message-ID`) restano `NULL` finché un client non
+chiede `ENVELOPE`/`RFC822.SIZE`; in quel momento il bridge carica i dettagli,
+aggiorna **solo i metadati** nel DB e scarta corpo e allegati.
 
 ### Perché l’indice delle intestazioni
 
@@ -150,6 +153,8 @@ che la seconda esecuzione sia idempotente e non cambi UID.
 - `SELECT`/`EXAMINE`: `UIDVALIDITY`, `UIDNEXT`, `EXISTS` da SQLite.
 - `FETCH`/`UID FETCH`:
   - `FLAGS`, `UID`, `INTERNALDATE`, `ENVELOPE`, `RFC822.SIZE` da `messages`;
+  - se `envelope_complete = 0` o `rfc822_size` è nullo, il bridge carica i
+    dettagli, aggiorna i metadati e scarta il contenuto;
   - `BODYSTRUCTURE`/`BODY[]`/`BODY.PEEK[]` sintetizzano il MIME on demand;
   - `RFC822.SIZE` viene calcolato al primo rendering e salvato come numero.
 - `SEARCH`: supporta header, flag, data e dimensione dall’indice. `BODY`/`TEXT`
