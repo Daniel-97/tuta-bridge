@@ -7,8 +7,9 @@ use crate::ports::prompt::LoginPrompt;
 
 /// A [`LoginPrompt`] that reads from the controlling terminal.
 ///
-/// Passwords and TOTP codes are read with `rpassword` so that no input is
-/// echoed.  The mail address is read as a plain stdin line.
+/// The password is read with `rpassword` so that it is not echoed. The TOTP
+/// code is read as a plain line so the user can see and correct it. The mail
+/// address is also read as a plain line.
 pub struct TerminalPrompt;
 
 impl LoginPrompt for TerminalPrompt {
@@ -37,9 +38,14 @@ impl LoginPrompt for TerminalPrompt {
     }
 
     fn totp_code(&self) -> Result<String> {
-        let code = rpassword::prompt_password("TOTP code: ")
+        let mut stdin = io::stdin().lock();
+        let mut line = String::new();
+        eprint!("TOTP code: ");
+        io::stderr().flush().ok();
+        stdin
+            .read_line(&mut line)
             .map_err(|_| Error::Login("prompt failed".into()))?;
-        let trimmed = code.trim().to_owned();
+        let trimmed = line.trim().replace(' ', "");
         if trimmed.is_empty() {
             return Err(Error::Login("prompt failed".into()));
         }
