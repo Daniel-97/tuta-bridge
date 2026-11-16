@@ -1,20 +1,20 @@
 use std::sync::Arc;
 
-use crypto_primitives::randomizer_facade::RandomizerFacade;
+use serde_json::Value;
 use tutasdk::bindings::rest_client::RestClient;
 use tutasdk::crypto::crypto_facade::ResolvedSessionKey;
-use tutasdk::entities::entity_facade::{EntityFacade, EntityFacadeImpl};
 use tutasdk::entities::generated::tutanota::{
-    Mail, MailDetails, MailDetailsBlob, MailDetailsDraft, MailSet, MailSetEntry,
+    Mail, MailDetails, MailDetailsDraft, MailSet, MailSetEntry,
 };
 use tutasdk::entities::Entity;
 use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk};
 
-use super::blob::load_attachment;
+use super::blob::{fetch_blob_element, load_attachment, request_archive_read_token};
 use super::content::{
-    address_from_encrypted, address_from_mail_address, details_are_intact,
-    draft_details_are_intact, mail_is_intact, parse_headers, select_body, threading_headers,
+    address_from_encrypted, address_from_mail_address, draft_details_are_intact, mail_is_intact,
+    parse_headers, select_body, threading_headers,
 };
+use super::wire::decrypt_mail_details;
 use crate::domain::{Error, Folder, FolderKind, MessageContent, MessageSummary, Result};
 use crate::ports::mail_source::MailSource;
 
@@ -114,38 +114,29 @@ impl TutaMailSource {
             .ok_or_else(|| Error::Message("mail details unavailable".into()))
     }
 
-    /// Load and decrypt a [`MailDetailsBlob`] using an already-resolved session key.
-    async fn load_blob_with_key(
-        &self,
-        details_id: &IdTupleGenerated,
-        key: ResolvedSessionKey,
-    ) -> Result<MailDetailsBlob> {
-        let raw = self
-            .logged
-            .get_entity_client()
-            .load(&MailDetailsBlob::type_ref(), details_id)
-            .await
-            .map_err(|_| Error::Message("mail details load failed".into()))?;
-        let blob_model = self
-            .logged
-            .type_model_provider
-            .resolve_server_type_ref(&MailDetailsBlob::type_ref())
-            .ok_or_else(|| Error::Message("mail details model unavailable".into()))?;
-        let facade = EntityFacadeImpl::new(
-            self.logged.type_model_provider.clone(),
-            RandomizerFacade::from_core(rand_core::OsRng),
-        );
-        let decrypted = facade
-            .decrypt_and_map(&blob_model, raw, key)
-            .map_err(|_| Error::Message("mail details decrypt failed".into()))?;
-        self.logged
-            .instance_mapper
-            .parse_entity::<MailDetailsBlob>(decrypted)
+    /// Fetch and parse a `MailDetailsBlob` wire object from the blob server.
+    async fn load_blob_element(&self, details_id: &IdTupleGenerated) -> Result<Value> {
+        let access = request_archive_read_token(&self.logged, details_id.list_id.as_str()).await?;
+        let server = access
+            .servers
+            .first()
+            .map(|server| server.url.clone())
+            .ok_or_else(|| Error::Message("mail details server unavailable".into()))?;
+        let bytes = fetch_blob_element(
+            self.rest.as_ref(),
+            &server,
+            details_id.list_id.as_str(),
+            details_id.element_id.as_str(),
+            &access.blobAccessToken,
+            &self.access_token,
+        )
+        .await?;
+        serde_json::from_slice(&bytes)
             .map_err(|_| Error::Message("mail details parse failed".into()))
     }
 
     /// Load the [`MailDetails`] for a mail, preferring the draft details and
-    /// verifying that every loaded blob is intact (no decryption errors).
+    /// decrypting a blob element with the mail's session key otherwise.
     async fn load_details(&self, mail: &Mail) -> Result<MailDetails> {
         let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
 
@@ -164,37 +155,16 @@ impl TutaMailSource {
             return Err(Error::Message("message has no details".into()));
         };
 
-        // Try the blob's own session key first. `CryptoEntityClient::load`
-        // decrypts with the blob's owner session key in a single request, so it
-        // is the cheapest correct path. It is only trusted when
-        // `details_are_intact` confirms no decryption error was recorded: the
-        // SDK reports per-field decryption failures in `_errors` and still
-        // returns `Ok`, so a successful load alone is not proof of intactness.
-        let first_error = match crypto_client.load::<MailDetailsBlob, _>(details_id).await {
-            Ok(blob) if details_are_intact(&blob) => return Ok(blob.details),
-            Ok(_) => "details blob corrupted",
-            Err(_) => "details blob load failed",
-        };
-
-        // Fall back to resolving the mail's session key and decrypting the raw
-        // blob manually. This covers mails whose details blob is not readable
-        // with the current user's own key (e.g. shared mails decrypted with the
-        // mail's session key instead of the blob's owner key).
-        match self.resolve_mail_session_key(mail).await {
-            Ok(key) => match self.load_blob_with_key(details_id, key).await {
-                Ok(blob) if details_are_intact(&blob) => Ok(blob.details),
-                Ok(_) => Err(Error::Message(format!(
-                    "{first_error}; details blob corrupted (mail key)"
-                ))),
-                Err(e) => Err(Error::Message(match e {
-                    Error::Message(message) => format!("{first_error}; {message}"),
-                    _ => format!("{first_error}; details blob decrypt failed"),
-                })),
-            },
-            Err(_) => Err(Error::Message(format!(
-                "{first_error}; mail details key unavailable"
-            ))),
-        }
+        let raw = self.load_blob_element(details_id).await?;
+        let blob = raw
+            .as_array()
+            .and_then(|items| items.first())
+            .unwrap_or(&raw);
+        let key = self
+            .resolve_mail_session_key(mail)
+            .await
+            .map_err(|_| Error::Message("mail details key unavailable".into()))?;
+        decrypt_mail_details(blob, &key.session_key)
     }
 }
 

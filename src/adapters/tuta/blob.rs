@@ -15,7 +15,9 @@ use tutasdk::bindings::rest_client::{
     encode_query_params, HttpMethod, RestClient, RestClientOptions,
 };
 use tutasdk::bindings::suspendable_rest_client::SuspensionBehavior;
-use tutasdk::entities::generated::storage::{BlobAccessTokenPostIn, BlobReadData, InstanceId};
+use tutasdk::entities::generated::storage::{
+    BlobAccessTokenPostIn, BlobReadData, BlobServerAccessInfo, InstanceId,
+};
 use tutasdk::entities::generated::sys::Blob;
 use tutasdk::entities::generated::tutanota::TutanotaFile;
 use tutasdk::entities::Entity;
@@ -109,6 +111,72 @@ pub async fn fetch_blob(
         .map_err(|_| Error::Network("blob download failed".into()))?;
     if response.status < 200 || response.status >= 300 {
         return Err(Error::Network("blob download failed".into()));
+    }
+    Ok(response.body.unwrap_or_default())
+}
+
+/// Request a read token for a whole blob archive.
+pub async fn request_archive_read_token(
+    logged: &LoggedInSdk,
+    archive_id: &str,
+) -> Result<BlobServerAccessInfo> {
+    let input = BlobAccessTokenPostIn {
+        _format: 0,
+        archiveDataType: None,
+        write: None,
+        read: Some(BlobReadData {
+            _id: None,
+            archiveId: GeneratedId(archive_id.to_string()),
+            instanceListId: None,
+            instanceIds: Vec::new(),
+        }),
+    };
+    let output = logged
+        .get_service_executor()
+        .post::<BlobAccessTokenService>(input, ExtraServiceParams::default())
+        .await
+        .map_err(|_| Error::Message("mail details token failed".into()))?;
+    Ok(output.blobAccessInfo)
+}
+
+/// Fetch a blob element (server-model JSON) from the blob server.
+///
+/// Blob elements use the archive read token in the query and the user session
+/// token as `accessToken`; the type model version is `v=118` for
+/// `MailDetailsBlob`.
+pub async fn fetch_blob_element(
+    rest: &dyn RestClient,
+    server: &str,
+    list_id: &str,
+    element_id: &str,
+    blob_token: &str,
+    user_access_token: &str,
+) -> Result<Vec<u8>> {
+    validate_blob_server(server)?;
+    let query = encode_query_params([
+        ("accessToken".as_bytes(), user_access_token.as_bytes()),
+        ("v".as_bytes(), "118".as_bytes()),
+        ("ids".as_bytes(), element_id.as_bytes()),
+        ("blobAccessToken".as_bytes(), blob_token.as_bytes()),
+        ("cv".as_bytes(), CLIENT_VERSION.as_bytes()),
+    ]);
+    let url = format!(
+        "{}/rest/tutanota/maildetailsblob/{}{}",
+        server.trim_end_matches('/'),
+        list_id,
+        query
+    );
+    let options = RestClientOptions {
+        headers: HashMap::from([("v".to_string(), "118".to_string())]),
+        body: None,
+        suspension_behavior: Some(SuspensionBehavior::Suspend),
+    };
+    let response = rest
+        .request_binary(url, HttpMethod::GET, options)
+        .await
+        .map_err(|_| Error::Network("mail details download failed".into()))?;
+    if response.status < 200 || response.status >= 300 {
+        return Err(Error::Network("mail details download failed".into()));
     }
     Ok(response.body.unwrap_or_default())
 }
