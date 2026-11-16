@@ -100,14 +100,17 @@ La ricognizione è stata fatta sul clone sparse di `tutao/tutanota` al commit
 5. **Formato JSON del protocollo.** I numeri viaggiano come stringhe e i byte
    come base64 standard. `serde_json` sui tipi generati non basta: serve un
    piccolo codec dedicato per le quattro strutture di pre-sessione.
-6. **Corpo e allegati.** `MailDetailsBlob` va decifrato con la chiave di
-   sessione della mail, non con quella del blob. Gli allegati sono entità
+6. **Corpo e allegati.** `MailDetailsBlob` è un **BLOB_ELEMENT_TYPE**, non
+   un'entità normale: si scarica dal blob server con un read token d'archivio
+   (`BlobAccessTokenService`, storage `v=13`, `read` come array e `write` come
+   `[]`) e si richiede con `v=118`. I campi del server-model vengono decifrati
+   con la chiave di sessione della mail. Gli allegati sono entità
    `tutanota::TutanotaFile` con `blobs: Vec<Blob>`; il download richiede un
-   read token (`BlobAccessTokenService`), una GET binaria su `BlobService` e la
-   decifratura dei chunk con la chiave della `TutanotaFile`. La GET usa il
-   campo singolo `blobId` (`"110"`), non la lista `blobIds` (`"193"`):
-   quest'ultima restituisce un involucro multi-blob, non il ciphertext grezzo.
-   L'SDK non espone il download: va portato in `tuta-client`.
+   read token d'istanza, una GET su `BlobService` nel formato multiplo (`193`)
+   con risposta incapsulata (conteggio, id, size, ciphertext) e la decifratura
+   dei chunk con la chiave della `TutanotaFile`. `TutanotaFile.size` è la
+   dimensione cifrata, non quella in chiaro. L'SDK non espone il download: va
+   portato in `tuta-client`.
 
 ## 7. Architettura
 

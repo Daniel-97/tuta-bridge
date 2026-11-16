@@ -39,5 +39,17 @@
 
 ## Mail content model
 
-- `MailDetailsBlob` is encrypted with the mail's session key.
+- `MailDetailsBlob` is a **BLOB_ELEMENT_TYPE**, not a regular list entity. It is fetched from the blob server with an archive read token (`BlobAccessTokenService`, storage `v=13`, `read` as an array and `write` as `[]`) and `v=118` for the blob-element GET.
+- The blob-element response is server-model JSON; fields are decrypted with the mail's session key.
 - Attachments are `TutanotaFile` instances, each referencing blobs that are decrypted separately.
+- BlobService GET uses the plural form (`193` with one `BlobId` per blob) and returns a framed multi-blob response: 4-byte count, then per blob 9-byte id, 6-byte padding, 4-byte size, ciphertext. `v=13`, `accessToken` and `cv` are query parameters.
+- `TutanotaFile.size` is the encrypted blob size, not the decrypted length.
+
+## M1/M2 manual acceptance (2026-11-16)
+
+- Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.
+- KDF was Argon2id (`kdfVersion = 1`); no bcrypt migration.
+- `dump --folder inbox --limit 3 --out ./out` wrote 3 `.eml` files. The message with a PDF attachment produced a valid 3-page PDF, and the MIME parts included `text/plain` and `text/html`.
+- A second dump over the same folder produced identical filenames and SHA-256 hashes.
+- TOTP input is echoed on the terminal by request; the password remains hidden.
+
