@@ -5,7 +5,7 @@ pub struct MailboxId(pub i64);
 
 #[derive(Clone)]
 pub struct StoredMailbox {
-    pub id: i64,
+    pub id: MailboxId,
     pub account_id: i64,
     pub list_id: String,
     pub name: String,
@@ -50,6 +50,21 @@ pub struct MessagePage {
 mod tests {
     use super::*;
     use crate::domain::Address;
+
+    #[test]
+    fn stored_mailbox_uses_typed_id() {
+        let mailbox = StoredMailbox {
+            id: MailboxId(7),
+            account_id: 1,
+            list_id: "list".into(),
+            name: "Custom".into(),
+            kind: FolderKind::Custom,
+            uidvalidity: 100,
+            next_uid: 3,
+        };
+        assert_eq!(mailbox.id, MailboxId(7));
+        assert_eq!(mailbox.kind, FolderKind::Custom);
+    }
 
     #[test]
     fn header_keeps_ids_and_optional_metadata() {

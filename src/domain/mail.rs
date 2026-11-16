@@ -23,6 +23,35 @@ impl FolderKind {
             _ => None,
         }
     }
+
+    /// Stable string stored in the SQLite `mailboxes.kind` column.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::Sent => "sent",
+            Self::Drafts => "drafts",
+            Self::Trash => "trash",
+            Self::Junk => "junk",
+            Self::Archive => "archive",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Parse a value produced by [`Self::as_db_str`].
+    ///
+    /// Unlike [`Self::from_alias`], this accepts the generic `custom` kind.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "inbox" => Some(Self::Inbox),
+            "sent" => Some(Self::Sent),
+            "drafts" => Some(Self::Drafts),
+            "trash" => Some(Self::Trash),
+            "junk" => Some(Self::Junk),
+            "archive" => Some(Self::Archive),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +139,34 @@ mod tests {
         assert_eq!(FolderKind::from_alias("Inbox"), Some(FolderKind::Inbox));
         assert_eq!(FolderKind::from_alias("TRASH"), Some(FolderKind::Trash));
         assert_eq!(FolderKind::from_alias("custom-folder"), None);
+    }
+
+    #[test]
+    fn folder_kind_db_strings_roundtrip_all_variants() {
+        let kinds = [
+            FolderKind::Inbox,
+            FolderKind::Sent,
+            FolderKind::Drafts,
+            FolderKind::Trash,
+            FolderKind::Junk,
+            FolderKind::Archive,
+            FolderKind::Custom,
+        ];
+        for kind in kinds {
+            assert_eq!(
+                FolderKind::from_db_str(kind.as_db_str()),
+                Some(kind),
+                "kind must round-trip through its database string"
+            );
+        }
+        assert_eq!(FolderKind::Custom.as_db_str(), "custom");
+        assert_eq!(FolderKind::from_db_str("custom-folder"), None);
+    }
+
+    #[test]
+    fn aliases_do_not_accept_the_custom_db_string() {
+        assert_eq!(FolderKind::from_alias("custom"), None);
+        assert_eq!(FolderKind::from_db_str("custom"), Some(FolderKind::Custom));
     }
 
     #[test]
