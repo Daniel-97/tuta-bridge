@@ -5,7 +5,7 @@ use tuta_bridge::adapters::tuta::pre_session::TutaPreSession;
 use tuta_bridge::domain::Error;
 use tuta_bridge::ports::session::SessionRequest;
 use tutasdk::net::native_rest_client::NativeRestClient;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SALT_JSON: &str = r#"{"421":"0","422":"AAECAwQFBgcICQoLDA0ODw==","2133":"1"}"#;
@@ -28,6 +28,8 @@ async fn creates_session_with_totp() {
 
     Mock::given(method("GET"))
         .and(path("/rest/sys/saltservice"))
+        .and(header("v", "158"))
+        .and(header("cv", tutasdk::CLIENT_VERSION))
         .respond_with(ResponseTemplate::new(200).set_body_string(SALT_JSON))
         .expect(1)
         .mount(&server)
@@ -77,6 +79,8 @@ async fn rejects_bcrypt() {
     let salt_json = r#"{"421":"0","422":"AAECAwQFBgcICQoLDA0ODw==","2133":"0"}"#;
     Mock::given(method("GET"))
         .and(path("/rest/sys/saltservice"))
+        .and(header("v", "158"))
+        .and(header("cv", tutasdk::CLIENT_VERSION))
         .respond_with(ResponseTemplate::new(200).set_body_string(salt_json))
         .expect(1)
         .mount(&server)
@@ -98,6 +102,8 @@ async fn non_totp_challenge_is_unsupported() {
 
     Mock::given(method("GET"))
         .and(path("/rest/sys/saltservice"))
+        .and(header("v", "158"))
+        .and(header("cv", tutasdk::CLIENT_VERSION))
         .respond_with(ResponseTemplate::new(200).set_body_string(SALT_JSON))
         .expect(1)
         .mount(&server)
@@ -129,6 +135,8 @@ async fn wrong_password_maps_to_login_error() {
 
     Mock::given(method("GET"))
         .and(path("/rest/sys/saltservice"))
+        .and(header("v", "158"))
+        .and(header("cv", tutasdk::CLIENT_VERSION))
         .respond_with(ResponseTemplate::new(200).set_body_string(SALT_JSON))
         .expect(1)
         .mount(&server)
@@ -157,6 +165,8 @@ async fn wrong_totp_maps_to_second_factor_error() {
 
     Mock::given(method("GET"))
         .and(path("/rest/sys/saltservice"))
+        .and(header("v", "158"))
+        .and(header("cv", tutasdk::CLIENT_VERSION))
         .respond_with(ResponseTemplate::new(200).set_body_string(SALT_JSON))
         .expect(1)
         .mount(&server)

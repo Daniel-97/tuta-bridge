@@ -65,6 +65,7 @@ impl TutaPreSession {
                 None,
                 salt_headers,
                 AuthFailure::Login,
+                "salt request",
             )
             .await?;
         let salt_resp = parse_salt_response(&salt_data)?;
@@ -100,6 +101,7 @@ impl TutaPreSession {
                 Some(session_body),
                 session_headers,
                 AuthFailure::Login,
+                "session request",
             )
             .await?;
         let mut session_resp = parse_session_response(&session_data)?;
@@ -123,6 +125,7 @@ impl TutaPreSession {
                         Some(totp_body),
                         totp_headers,
                         AuthFailure::SecondFactor,
+                        "second factor request",
                     )
                     .await?;
                     need_poll = true;
@@ -175,6 +178,7 @@ impl TutaPreSession {
                     None,
                     headers,
                     AuthFailure::SecondFactor,
+                    "second factor poll",
                 )
                 .await?;
             if !parse_pending(&data)? {
@@ -190,6 +194,9 @@ impl TutaPreSession {
     fn common_headers(&self, with_content_type: bool) -> HashMap<String, String> {
         let mut headers = HashMap::new();
         headers.insert("cv".to_string(), CLIENT_VERSION.to_string());
+        // Every sys service call carries the service model version. SaltService
+        // rejects a missing `v` with 400 before authentication.
+        headers.insert("v".to_string(), "158".to_string());
         if with_content_type {
             headers.insert("Content-Type".to_string(), "application/json".to_string());
         }
@@ -207,6 +214,7 @@ impl TutaPreSession {
         body: Option<Vec<u8>>,
         headers: HashMap<String, String>,
         failure: AuthFailure,
+        phase: &'static str,
     ) -> crate::domain::Result<Vec<u8>> {
         let options = RestClientOptions {
             headers,
@@ -227,7 +235,10 @@ impl TutaPreSession {
         }
 
         if response.status < 200 || response.status >= 300 {
-            return Err(Error::Network(format!("status {}", response.status)));
+            return Err(Error::Network(format!(
+                "{} failed with status {}",
+                phase, response.status
+            )));
         }
 
         Ok(response.body.unwrap_or_default())
