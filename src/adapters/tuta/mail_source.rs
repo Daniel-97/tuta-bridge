@@ -125,23 +125,23 @@ impl TutaMailSource {
             .get_entity_client()
             .load(&MailDetailsBlob::type_ref(), details_id)
             .await
-            .map_err(|_| Error::Message("mail details unavailable".into()))?;
+            .map_err(|_| Error::Message("mail details load failed".into()))?;
         let blob_model = self
             .logged
             .type_model_provider
             .resolve_server_type_ref(&MailDetailsBlob::type_ref())
-            .ok_or_else(|| Error::Message("mail details unavailable".into()))?;
+            .ok_or_else(|| Error::Message("mail details model unavailable".into()))?;
         let facade = EntityFacadeImpl::new(
             self.logged.type_model_provider.clone(),
             RandomizerFacade::from_core(rand_core::OsRng),
         );
         let decrypted = facade
             .decrypt_and_map(&blob_model, raw, key)
-            .map_err(|_| Error::Message("mail details unavailable".into()))?;
+            .map_err(|_| Error::Message("mail details decrypt failed".into()))?;
         self.logged
             .instance_mapper
             .parse_entity::<MailDetailsBlob>(decrypted)
-            .map_err(|_| Error::Message("mail details unavailable".into()))
+            .map_err(|_| Error::Message("mail details parse failed".into()))
     }
 
     /// Load the [`MailDetails`] for a mail, preferring the draft details and
@@ -153,9 +153,9 @@ impl TutaMailSource {
             let draft: MailDetailsDraft = crypto_client
                 .load(draft_id)
                 .await
-                .map_err(|_| Error::Message("mail details unavailable".into()))?;
+                .map_err(|_| Error::Message("draft details load failed".into()))?;
             if !draft_details_are_intact(&draft) {
-                return Err(Error::Message("mail details unavailable".into()));
+                return Err(Error::Message("draft details corrupted".into()));
             }
             return Ok(draft.details);
         }
@@ -170,25 +170,32 @@ impl TutaMailSource {
         // `details_are_intact` confirms no decryption error was recorded: the
         // SDK reports per-field decryption failures in `_errors` and still
         // returns `Ok`, so a successful load alone is not proof of intactness.
-        if let Ok(blob) = crypto_client.load::<MailDetailsBlob, _>(details_id).await {
-            if details_are_intact(&blob) {
-                return Ok(blob.details);
-            }
+        let mut last_error = "mail details unavailable";
+        match crypto_client.load::<MailDetailsBlob, _>(details_id).await {
+            Ok(blob) if details_are_intact(&blob) => return Ok(blob.details),
+            Ok(_) => last_error = "details blob corrupted",
+            Err(_) => last_error = "details blob load failed",
         }
 
         // Fall back to resolving the mail's session key and decrypting the raw
         // blob manually. This covers mails whose details blob is not readable
         // with the current user's own key (e.g. shared mails decrypted with the
         // mail's session key instead of the blob's owner key).
-        if let Ok(key) = self.resolve_mail_session_key(mail).await {
-            if let Ok(blob) = self.load_blob_with_key(details_id, key).await {
-                if details_are_intact(&blob) {
-                    return Ok(blob.details);
+        match self.resolve_mail_session_key(mail).await {
+            Ok(key) => match self.load_blob_with_key(details_id, key).await {
+                Ok(blob) if details_are_intact(&blob) => return Ok(blob.details),
+                Ok(_) => last_error = "details blob corrupted (mail key)",
+                Err(e) => {
+                    return Err(Error::Message(match e {
+                        Error::Message(message) => message,
+                        _ => "details blob decrypt failed".into(),
+                    }));
                 }
-            }
+            },
+            Err(_) => last_error = "mail details key unavailable",
         }
 
-        Err(Error::Message("mail details unavailable".into()))
+        Err(Error::Message(last_error.into()))
     }
 }
 
