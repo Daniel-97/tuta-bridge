@@ -25,7 +25,12 @@ pub enum Command {
     },
     Logout,
     Status,
+    /// Sync folder and message metadata, keeping existing UIDs stable.
     Sync,
+    /// Discard all local state and sync from scratch.
+    ///
+    /// WARNING: this assigns new UIDs, invalidating any UID mappings held by
+    /// mail clients.
     Resync,
     Dump {
         #[arg(long)]

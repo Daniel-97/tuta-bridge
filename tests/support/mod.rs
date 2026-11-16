@@ -432,7 +432,10 @@ pub struct FakeMailSource {
     pub messages: Vec<MessageSummary>,
     pub content: Option<MessageContent>,
     pub failing_elements: Vec<String>,
+    pub fail_folders: bool,
     pub headers_by_folder: Mutex<HashMap<String, Vec<MessageHeader>>>,
+    pub failing_header_folders: Mutex<Vec<String>>,
+    pub skipped_by_folder: Mutex<HashMap<String, usize>>,
     pub message_limits: Mutex<Vec<usize>>,
     pub message_folders: Mutex<Vec<Folder>>,
     pub header_limits: Mutex<Vec<usize>>,
@@ -447,7 +450,10 @@ impl FakeMailSource {
             messages: Vec::new(),
             content: None,
             failing_elements: Vec::new(),
+            fail_folders: false,
             headers_by_folder: Mutex::new(HashMap::new()),
+            failing_header_folders: Mutex::new(Vec::new()),
+            skipped_by_folder: Mutex::new(HashMap::new()),
             message_limits: Mutex::new(Vec::new()),
             message_folders: Mutex::new(Vec::new()),
             header_limits: Mutex::new(Vec::new()),
@@ -462,6 +468,22 @@ impl FakeMailSource {
             .lock()
             .unwrap()
             .insert(list_id.to_string(), headers);
+    }
+
+    /// Make `headers_page` fail for `list_id`.
+    pub fn fail_headers_in(&self, list_id: &str) {
+        self.failing_header_folders
+            .lock()
+            .unwrap()
+            .push(list_id.to_string());
+    }
+
+    /// Report `count` unreadable mails for `list_id`'s header page.
+    pub fn set_skipped(&self, list_id: &str, count: usize) {
+        self.skipped_by_folder
+            .lock()
+            .unwrap()
+            .insert(list_id.to_string(), count);
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -479,6 +501,9 @@ impl Default for FakeMailSource {
 impl MailSource for FakeMailSource {
     async fn folders(&self) -> Result<Vec<Folder>> {
         self.calls.lock().unwrap().push("folders".to_string());
+        if self.fail_folders {
+            return Err(Error::Network("folders failed".into()));
+        }
         Ok(self.folders.clone())
     }
 
@@ -508,6 +533,14 @@ impl MailSource for FakeMailSource {
         self.calls.lock().unwrap().push("headers_page".to_string());
         self.header_limits.lock().unwrap().push(limit);
         self.header_folders.lock().unwrap().push(folder.clone());
+        if self
+            .failing_header_folders
+            .lock()
+            .unwrap()
+            .contains(&folder.list_id)
+        {
+            return Err(Error::Network("headers failed".into()));
+        }
         let headers = self
             .headers_by_folder
             .lock()
@@ -515,9 +548,17 @@ impl MailSource for FakeMailSource {
             .get(&folder.list_id)
             .cloned()
             .unwrap_or_default();
+        let skipped = self
+            .skipped_by_folder
+            .lock()
+            .unwrap()
+            .get(&folder.list_id)
+            .copied()
+            .unwrap_or(0);
         Ok(MessagePage {
             headers,
             next_start: None,
+            skipped,
         })
     }
 }

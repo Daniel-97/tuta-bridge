@@ -44,6 +44,8 @@ pub struct StoredMessage {
 pub struct MessagePage {
     pub headers: Vec<MessageHeader>,
     pub next_start: Option<String>,
+    /// Number of mails the source could not load into this page.
+    pub skipped: usize,
 }
 
 #[cfg(test)]

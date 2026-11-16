@@ -193,6 +193,7 @@ mod tests {
             Ok(MessagePage {
                 headers: self.headers.clone(),
                 next_start: None,
+                skipped: 0,
             })
         }
     }

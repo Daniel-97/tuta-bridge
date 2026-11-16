@@ -13,6 +13,7 @@ use tuta_bridge::app::login::LoginUseCase;
 use tuta_bridge::app::logout::LogoutUseCase;
 use tuta_bridge::app::state_sync::StateSyncUseCase;
 use tuta_bridge::app::status::StatusUseCase;
+use tuta_bridge::app::sync::SyncReport;
 use tuta_bridge::config::{config_path, data_dir, resolve_base_url, validate_base_url, Config};
 use tuta_bridge::domain::Error;
 use tuta_bridge::ports::renderer::MessageRenderer;
@@ -139,10 +140,7 @@ fn main() {
                     config_path,
                 );
                 let report = uc.sync().await?;
-                println!(
-                    "synced {} folders, {} messages",
-                    report.folders, report.messages
-                );
+                print_sync_report("synced", &report);
                 Ok(())
             }
             Command::Resync => {
@@ -152,10 +150,7 @@ fn main() {
                     config_path,
                 );
                 let report = uc.resync().await?;
-                println!(
-                    "resynced {} folders, {} messages",
-                    report.folders, report.messages
-                );
+                print_sync_report("resynced", &report);
                 Ok(())
             }
             Command::Logout => {
@@ -192,6 +187,25 @@ fn main() {
 
     if let Err(e) = result {
         exit_with_error(e);
+    }
+}
+
+/// Print sync counters, showing optional counters only when non-zero.
+///
+/// Only aggregate counts are written; subjects and addresses never appear.
+fn print_sync_report(verb: &str, report: &SyncReport) {
+    println!(
+        "{verb} {} folders, {} messages",
+        report.folders, report.messages
+    );
+    if report.removed > 0 {
+        println!("removed {} messages", report.removed);
+    }
+    if report.skipped_messages > 0 {
+        println!("skipped {} messages", report.skipped_messages);
+    }
+    if report.skipped_folders > 0 {
+        println!("skipped {} folders", report.skipped_folders);
     }
 }
 

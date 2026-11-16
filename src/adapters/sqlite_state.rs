@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -81,7 +82,8 @@ impl SqliteStateStore {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
         let pool = pool_options().connect_with(options).await?;
         tighten_state_files(path)?;
         let store = Self { pool };
@@ -100,7 +102,8 @@ impl SqliteStateStore {
         restrict_process_umask();
         let options = SqliteConnectOptions::new()
             .in_memory(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
         let pool = pool_options().connect_with(options).await?;
         let store = Self { pool };
         store.apply_schema().await?;
@@ -160,6 +163,15 @@ UPDATE messages SET
     received_at_ms = ?, sent_at_ms = ?, subject = ?, from_name = ?, from_address = ?,
     recipients_json = ?, unread = ?, message_id = ?, in_reply_to = ?, references_json = ?,
     envelope_complete = ?, rfc822_size = COALESCE(?, rfc822_size)
+WHERE mailbox_id = ? AND uid = ?";
+
+/// Refresh only the fields present on a list-level (partial) header.
+///
+/// Envelope fields enriched from decrypted details are left untouched so a
+/// later sync cannot regress them, and `rfc822_size` is preserved.
+const UPDATE_PARTIAL_MESSAGE_SQL: &str = "\
+UPDATE messages SET
+    received_at_ms = ?, subject = ?, from_name = ?, from_address = ?, unread = ?
 WHERE mailbox_id = ? AND uid = ?";
 
 const INCREMENT_NEXT_UID_SQL: &str = "UPDATE mailboxes SET next_uid = next_uid + 1 WHERE id = ?";
@@ -321,6 +333,33 @@ where
     Ok(())
 }
 
+async fn write_partial_metadata<'e, E>(
+    executor: E,
+    mailbox: MailboxId,
+    uid: u32,
+    header: &MessageHeader,
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let result = sqlx::query(UPDATE_PARTIAL_MESSAGE_SQL)
+        .bind(header.received_at_ms)
+        .bind(&header.subject)
+        .bind(header.from.name.as_deref())
+        .bind(&header.from.address)
+        .bind(bool_to_int(header.unread))
+        .bind(mailbox.0)
+        .bind(i64::from(uid))
+        .execute(executor)
+        .await
+        .map_err(storage_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(Error::Storage("message UID not found".into()));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl StateStore for SqliteStateStore {
     async fn upsert_account(&self, mail_address: &str) -> Result<i64> {
@@ -385,7 +424,11 @@ impl StateStore for SqliteStateStore {
         let uid = match existing {
             Some(uid) => {
                 let uid = u32_from_i64(uid)?;
-                write_message_metadata(&mut *transaction, mailbox, uid, header, None).await?;
+                if header.envelope_complete {
+                    write_message_metadata(&mut *transaction, mailbox, uid, header, None).await?;
+                } else {
+                    write_partial_metadata(&mut *transaction, mailbox, uid, header).await?;
+                }
                 uid
             }
             None => {
@@ -566,10 +609,13 @@ fn state_file_paths(path: &Path) -> [PathBuf; 3] {
 
 /// Tighten the database file and its WAL sidecars to owner-only access.
 ///
-/// SQLite creates `-wal` and `-shm` itself, so the permissions are applied
-/// again after schema creation has forced those files into existence. This is
-/// preferred over changing the process umask, which is global and racy in a
-/// multithreaded program. Files that do not exist are skipped.
+/// On Unix the actual strategy is two-layered: [`restrict_process_umask`] sets
+/// the process umask to `0o077` before SQLite creates anything, so any sidecar
+/// SQLite later recreates is already owner-only, and this function re-applies
+/// `0o600` after schema creation has forced `-wal`/`-shm` into existence. The
+/// pool also disables connection recycling (see [`pool_options`]) so a
+/// recycled connection cannot reopen SQLite behind our back. Files that do not
+/// exist are skipped.
 #[cfg(unix)]
 fn tighten_state_files(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -750,6 +796,51 @@ mod tests {
         assert!(!stored[0].header.unread);
         assert_eq!(stored[0].header.references, changed.references);
         assert_eq!(store.mailboxes(account).await.unwrap()[0].next_uid, 2);
+    }
+
+    #[tokio::test]
+    async fn assign_uid_partial_header_preserves_enriched_envelope() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (_, mailbox) = account_and_mailbox(&store).await;
+
+        let mut complete = header("entries", "e1");
+        complete.sent_at_ms = 1_699_999_999_000;
+        complete.in_reply_to = Some("<parent@example.invalid>".into());
+        assert!(complete.envelope_complete);
+        assert_eq!(store.assign_uid(mailbox, &complete).await.unwrap(), 1);
+
+        let mut partial = complete.clone();
+        partial.received_at_ms = 1_700_000_001_000;
+        partial.sent_at_ms = 0;
+        partial.subject = "refreshed subject".into();
+        partial.from.address = "new-sender@example.invalid".into();
+        partial.to.clear();
+        partial.cc.clear();
+        partial.bcc.clear();
+        partial.reply_to.clear();
+        partial.message_id = None;
+        partial.in_reply_to = None;
+        partial.references.clear();
+        partial.unread = false;
+        partial.envelope_complete = false;
+
+        assert_eq!(store.assign_uid(mailbox, &partial).await.unwrap(), 1);
+
+        let stored = store.messages(mailbox).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        let stored = &stored[0].header;
+        // List-level fields follow the incoming partial header.
+        assert_eq!(stored.received_at_ms, partial.received_at_ms);
+        assert_eq!(stored.subject, "refreshed subject");
+        assert_eq!(stored.from.address, "new-sender@example.invalid");
+        assert!(!stored.unread);
+        // Envelope fields stay enriched from the complete header.
+        assert!(stored.envelope_complete);
+        assert_eq!(stored.sent_at_ms, complete.sent_at_ms);
+        assert_eq!(stored.to.len(), 1);
+        assert_eq!(stored.message_id, complete.message_id);
+        assert_eq!(stored.in_reply_to, complete.in_reply_to);
+        assert_eq!(stored.references, complete.references);
     }
 
     #[tokio::test]

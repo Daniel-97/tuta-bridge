@@ -306,11 +306,17 @@ impl MailSource for TutaMailSource {
             .map_err(|_| Error::Network("failed to load message entries".into()))?;
 
         let mut headers = Vec::with_capacity(entries.len());
+        let mut skipped = 0;
         for entry in entries {
-            let mail: Mail = crypto_client
-                .load(&entry.mail)
-                .await
-                .map_err(|_| Error::Network("failed to load message".into()))?;
+            // One unreadable mail must not fail the whole folder: count it and
+            // keep loading the remaining headers.
+            let mail: Mail = match crypto_client.load(&entry.mail).await {
+                Ok(mail) => mail,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
             let Some(id) = mail._id.as_ref() else {
                 continue;
             };
@@ -330,6 +336,7 @@ impl MailSource for TutaMailSource {
         Ok(MessagePage {
             headers,
             next_start: None,
+            skipped,
         })
     }
 
