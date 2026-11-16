@@ -170,12 +170,11 @@ impl TutaMailSource {
         // `details_are_intact` confirms no decryption error was recorded: the
         // SDK reports per-field decryption failures in `_errors` and still
         // returns `Ok`, so a successful load alone is not proof of intactness.
-        let mut last_error = "mail details unavailable";
-        match crypto_client.load::<MailDetailsBlob, _>(details_id).await {
+        let first_error = match crypto_client.load::<MailDetailsBlob, _>(details_id).await {
             Ok(blob) if details_are_intact(&blob) => return Ok(blob.details),
-            Ok(_) => last_error = "details blob corrupted",
-            Err(_) => last_error = "details blob load failed",
-        }
+            Ok(_) => "details blob corrupted",
+            Err(_) => "details blob load failed",
+        };
 
         // Fall back to resolving the mail's session key and decrypting the raw
         // blob manually. This covers mails whose details blob is not readable
@@ -184,18 +183,24 @@ impl TutaMailSource {
         match self.resolve_mail_session_key(mail).await {
             Ok(key) => match self.load_blob_with_key(details_id, key).await {
                 Ok(blob) if details_are_intact(&blob) => return Ok(blob.details),
-                Ok(_) => last_error = "details blob corrupted (mail key)",
+                Ok(_) => {
+                    return Err(Error::Message(format!(
+                        "{first_error}; details blob corrupted (mail key)"
+                    )))
+                }
                 Err(e) => {
                     return Err(Error::Message(match e {
-                        Error::Message(message) => message,
-                        _ => "details blob decrypt failed".into(),
+                        Error::Message(message) => format!("{first_error}; {message}"),
+                        _ => format!("{first_error}; details blob decrypt failed"),
                     }));
                 }
             },
-            Err(_) => last_error = "mail details key unavailable",
+            Err(_) => {
+                return Err(Error::Message(format!(
+                    "{first_error}; mail details key unavailable"
+                )))
+            }
         }
-
-        Err(Error::Message(last_error.into()))
     }
 }
 
