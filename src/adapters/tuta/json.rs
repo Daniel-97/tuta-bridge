@@ -111,9 +111,16 @@ pub fn parse_session_response(data: &[u8]) -> crate::domain::Result<SessionRespo
 
     let user_id = v
         .get("1223")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| Error::Login("invalid session response".into()))?
-        .to_string();
+        .and_then(|value| {
+            value.as_str().map(ToOwned::to_owned).or_else(|| {
+                value
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.as_str())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .ok_or_else(|| Error::Login("invalid session response".into()))?;
 
     let challenges_arr = v
         .get("1222")
@@ -196,7 +203,7 @@ mod tests {
     use super::*;
 
     const SALT: &str = r#"{"421":"0","422":"AAECAwQFBgcICQoLDA0ODw==","2133":"1"}"#;
-    const SESSION: &str = r#"{"1220":"0","1221":"tok_abc","1222":[{"1188":"0","1189":"1","1247":{"1239":"x"}}],"1223":"userid"}"#;
+    const SESSION: &str = r#"{"1220":"0","1221":"tok_abc","1222":[{"1188":"0","1189":"1","1247":[{"1239":"x"}]}],"1223":["userid"]}"#;
 
     #[test]
     fn parses_salt_and_session() {
@@ -206,6 +213,14 @@ mod tests {
         let s = parse_session_response(SESSION.as_bytes()).unwrap();
         assert_eq!(s.access_token, "tok_abc");
         assert_eq!(s.challenges, vec![ChallengeType::Totp]);
+    }
+
+    #[test]
+    fn accepts_string_and_array_user_id() {
+        let array = br#"{"1221":"tok","1222":[],"1223":["userid"]}"#;
+        assert_eq!(parse_session_response(array).unwrap().user_id, "userid");
+        let string = br#"{"1221":"tok","1222":[],"1223":"userid"}"#;
+        assert_eq!(parse_session_response(string).unwrap().user_id, "userid");
     }
 
     #[test]
