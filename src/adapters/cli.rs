@@ -10,6 +10,9 @@ use std::path::PathBuf;
 pub struct Cli {
     #[arg(long, global = true)]
     pub base_url: Option<String>,
+    /// Print HTTP phase, status, and sanitized server error details to stderr.
+    #[arg(long, global = true)]
+    pub debug: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -49,6 +52,13 @@ mod tests {
         let cli = parse_from(["tuta-bridge", "status"]).unwrap();
         assert!(matches!(cli.command, Command::Status));
         assert_eq!(cli.base_url, None);
+        assert!(!cli.debug);
+    }
+
+    #[test]
+    fn parses_debug_flag() {
+        let cli = parse_from(["tuta-bridge", "--debug", "status"]).unwrap();
+        assert!(cli.debug);
     }
 
     #[test]

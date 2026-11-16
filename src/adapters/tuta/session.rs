@@ -25,8 +25,8 @@ pub struct TutaSessionFactory {
 }
 
 impl TutaSessionFactory {
-    pub fn new(sdk: Sdk, rest: Arc<dyn RestClient>, base_url: String) -> Self {
-        let pre = TutaPreSession::new(Arc::clone(&rest), base_url.clone());
+    pub fn new(sdk: Sdk, rest: Arc<dyn RestClient>, base_url: String, debug: bool) -> Self {
+        let pre = TutaPreSession::new(Arc::clone(&rest), base_url.clone(), debug);
         Self {
             pre,
             sdk,

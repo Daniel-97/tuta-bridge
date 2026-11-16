@@ -27,6 +27,7 @@ use crate::ports::session::{NewSession, SessionRequest};
 pub struct TutaPreSession {
     rest: Arc<dyn RestClient>,
     base_url: String,
+    debug: bool,
 }
 
 /// Which error a 401/403 response should map to, depending on the auth phase.
@@ -41,8 +42,15 @@ enum AuthFailure {
 /// Enabled only by `TUTA_BRIDGE_DEBUG_HTTP=1`. The URL query (which contains
 /// `_body` with the mail address/verifier) is never printed; only the path,
 /// status, and recognized error fields from a JSON response.
-fn debug_http(phase: &str, method: &str, url: &str, status: u32, body: Option<&[u8]>) {
-    if std::env::var_os("TUTA_BRIDGE_DEBUG_HTTP").is_none() {
+fn debug_http(
+    enabled: bool,
+    phase: &str,
+    method: &str,
+    url: &str,
+    status: u32,
+    body: Option<&[u8]>,
+) {
+    if !enabled {
         return;
     }
     let path = url.split('?').next().unwrap_or(url);
@@ -53,29 +61,64 @@ fn debug_http(phase: &str, method: &str, url: &str, status: u32, body: Option<&[
 }
 
 fn describe_error_body(body: &[u8]) -> String {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(serde_json::Value::Object(map)) => {
-            let mut parts = Vec::new();
-            for key in ["errorCode", "error", "code", "message", "msg"] {
-                if let Some(value) = map.get(key).and_then(|v| v.as_str()) {
-                    let truncated: String = value.chars().take(300).collect();
-                    parts.push(format!("{key}={truncated}"));
-                }
-            }
-            if parts.is_empty() {
-                format!("<json object with {} keys>", map.len())
-            } else {
-                parts.join(", ")
-            }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        let text = String::from_utf8_lossy(body);
+        let truncated: String = text.chars().take(500).collect();
+        return format!("<non-json> {truncated}");
+    };
+
+    let redacted = redact_json(value);
+    let compact =
+        serde_json::to_string(&redacted).unwrap_or_else(|_| "<unprintable json>".to_string());
+    let truncated: String = compact.chars().take(2000).collect();
+    truncated
+}
+
+/// Redact values that could carry credentials or account identifiers. The
+/// server's error code/message remain visible for diagnosis.
+fn redact_json(value: serde_json::Value) -> serde_json::Value {
+    const SENSITIVE: &[&str] = &[
+        "password",
+        "passphrase",
+        "authverifier",
+        "accesstoken",
+        "encryptedpassphrasekey",
+        "mailaddress",
+        "salt",
+        "accesskey",
+        "totp",
+        "otpcode",
+        "session",
+    ];
+    match value {
+        serde_json::Value::Object(map) => {
+            let redacted = map
+                .into_iter()
+                .map(|(key, value)| {
+                    let lower = key.to_ascii_lowercase();
+                    if SENSITIVE.contains(&lower.as_str()) {
+                        (key, serde_json::Value::String("<redacted>".to_string()))
+                    } else {
+                        (key, redact_json(value))
+                    }
+                })
+                .collect();
+            serde_json::Value::Object(redacted)
         }
-        Ok(_) => "<non-object json>".to_string(),
-        Err(_) => format!("<{} bytes non-json>", body.len()),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(redact_json).collect())
+        }
+        other => other,
     }
 }
 
 impl TutaPreSession {
-    pub fn new(rest: Arc<dyn RestClient>, base_url: String) -> Self {
-        Self { rest, base_url }
+    pub fn new(rest: Arc<dyn RestClient>, base_url: String, debug: bool) -> Self {
+        Self {
+            rest,
+            base_url,
+            debug,
+        }
     }
     /// Execute the full pre-session login flow and return a `NewSession`.
     pub async fn create(&self, request: SessionRequest) -> crate::domain::Result<NewSession> {
@@ -265,6 +308,7 @@ impl TutaPreSession {
             .map_err(|_| Error::Network("request failed".into()))?;
 
         debug_http(
+            self.debug,
             phase,
             &method_label,
             url,
@@ -298,16 +342,26 @@ mod tests {
     fn describes_json_error_fields_without_the_raw_body() {
         let body = br#"{"errorCode":"invalid","message":"bad request","other":"ignored"}"#;
         let text = describe_error_body(body);
-        assert!(text.contains("errorCode=invalid"));
-        assert!(text.contains("message=bad request"));
-        assert!(!text.contains("other=ignored"));
+        assert!(text.contains(r#""errorCode":"invalid""#));
+        assert!(text.contains(r#""message":"bad request""#));
+        assert!(text.contains(r#""other":"ignored""#));
     }
 
     #[test]
-    fn describes_non_json_body_by_size_only() {
-        assert_eq!(
-            describe_error_body(b"<html>oops</html>"),
-            "<17 bytes non-json>"
-        );
+    fn redacts_sensitive_json_values() {
+        let body = br#"{"message":"bad request","mailAddress":"a@b.c","accessToken":"tok","nested":{"password":"pw"}}"#;
+        let text = describe_error_body(body);
+        assert!(text.contains(r#""message":"bad request""#));
+        assert!(!text.contains("a@b.c"));
+        assert!(!text.contains("tok"));
+        assert!(!text.contains("pw"));
+        assert!(text.contains("<redacted>"));
+    }
+
+    #[test]
+    fn describes_non_json_body_with_a_truncated_prefix() {
+        let text = describe_error_body(b"<html>oops</html>");
+        assert!(text.starts_with("<non-json>"));
+        assert!(text.contains("<html>oops</html>"));
     }
 }

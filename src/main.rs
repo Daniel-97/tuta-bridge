@@ -50,6 +50,7 @@ fn main() {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
+    let debug = cli.debug;
 
     // 3. Load configuration and resolve the base URL.
     let config_path = match config_path() {
@@ -92,7 +93,7 @@ fn main() {
 
     let store = Arc::new(KeyringCredentialStore::new("tuta-bridge"));
     let prompt = Arc::new(TerminalPrompt);
-    let factory = Arc::new(TutaSessionFactory::new(sdk, suspendable, base_url));
+    let factory = Arc::new(TutaSessionFactory::new(sdk, suspendable, base_url, debug));
 
     // 6. Dispatch.
     let rt = match tokio::runtime::Runtime::new() {

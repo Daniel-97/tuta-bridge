@@ -47,11 +47,11 @@ tuta-bridge logout
 ## Debugging HTTP errors
 
 Errors are printed to stderr. To also print the HTTP phase, path, status, and
-recognized JSON error fields (never the query string or request body), run
-with:
+a sanitized server error body (sensitive JSON fields are redacted), add the
+global `--debug` flag:
 
 ```bash
-TUTA_BRIDGE_DEBUG_HTTP=1 cargo run -- login
+cargo run -- --debug login
 ```
 
 The diagnostic line may include a server-provided error message; review it

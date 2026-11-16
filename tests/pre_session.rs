@@ -57,7 +57,7 @@ async fn creates_session_with_totp() {
         .await;
 
     let rest = Arc::new(NativeRestClient::try_new().unwrap());
-    let pre_session = TutaPreSession::new(rest, server.uri());
+    let pre_session = TutaPreSession::new(rest, server.uri(), false);
     let totp_count = Arc::new(AtomicUsize::new(0));
     let request = make_request(totp_count.clone());
 
@@ -87,7 +87,7 @@ async fn rejects_bcrypt() {
         .await;
 
     let rest = Arc::new(NativeRestClient::try_new().unwrap());
-    let pre_session = TutaPreSession::new(rest, server.uri());
+    let pre_session = TutaPreSession::new(rest, server.uri(), false);
     let totp_count = Arc::new(AtomicUsize::new(0));
     let request = make_request(totp_count.clone());
 
@@ -119,7 +119,7 @@ async fn non_totp_challenge_is_unsupported() {
         .await;
 
     let rest = Arc::new(NativeRestClient::try_new().unwrap());
-    let pre_session = TutaPreSession::new(rest, server.uri());
+    let pre_session = TutaPreSession::new(rest, server.uri(), false);
     let totp_count = Arc::new(AtomicUsize::new(0));
     let request = make_request(totp_count.clone());
 
@@ -150,7 +150,7 @@ async fn wrong_password_maps_to_login_error() {
         .await;
 
     let rest = Arc::new(NativeRestClient::try_new().unwrap());
-    let pre_session = TutaPreSession::new(rest, server.uri());
+    let pre_session = TutaPreSession::new(rest, server.uri(), false);
     let totp_count = Arc::new(AtomicUsize::new(0));
     let request = make_request(totp_count.clone());
 
@@ -187,7 +187,7 @@ async fn wrong_totp_maps_to_second_factor_error() {
         .await;
 
     let rest = Arc::new(NativeRestClient::try_new().unwrap());
-    let pre_session = TutaPreSession::new(rest, server.uri());
+    let pre_session = TutaPreSession::new(rest, server.uri(), false);
     let totp_count = Arc::new(AtomicUsize::new(0));
     let request = make_request(totp_count.clone());
 
