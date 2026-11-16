@@ -64,7 +64,10 @@ pub fn create_session_body(
         "1216": access_key,
         "1217": null,
         "1417": null,
-        "1218": null,
+        // `user` is an ELEMENT_ASSOCIATION: empty associations are encoded as
+        // an empty array, not null. Sending null makes the server reject the
+        // whole request with 400.
+        "1218": [],
     });
     serde_json::to_vec(&v).expect("create session body serialization cannot fail")
 }
@@ -223,6 +226,7 @@ mod tests {
         assert_eq!(v["1215"], "tuta-bridge");
         assert_eq!(v["1216"], "AAECAw==");
         assert!(v["1217"].is_null());
+        assert_eq!(v["1218"], serde_json::json!([]));
 
         let v: serde_json::Value = serde_json::from_slice(&second_factor_body(
             &SessionId {
