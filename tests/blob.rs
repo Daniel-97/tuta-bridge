@@ -1,36 +1,50 @@
+use base64::Engine as _;
 use crypto_primitives::aes::InitializationVector;
 use crypto_primitives::key::GenericAesKey;
 use tuta_bridge::adapters::tuta::blob::{
-    blob_get_body, blob_url, decrypt_chunks, fetch_blob, validate_blob_server,
+    blob_get_body, blob_url, decrypt_chunks, fetch_blob, parse_multiple_blobs, validate_blob_server,
 };
 use tutasdk::net::native_rest_client::NativeRestClient;
+use tutasdk::util::BASE64_EXT;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
 fn builds_blob_get_json_and_url() {
-    let body = blob_get_body("arch", "b1").unwrap();
+    let body = blob_get_body("arch", &["b1".to_string()]).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["52"], "arch");
-    assert_eq!(v["110"], "b1");
-    assert_eq!(v["193"], serde_json::json!([]));
-    let url = blob_url("https://blob.example", "tok", b"{\"a\":1}");
+    assert!(v["110"].is_null());
+    assert_eq!(v["193"][0]["146"], "b1");
+    assert!(v["193"][0]["145"].is_string());
+
+    let body = blob_get_body("arch", &["b1".to_string()]).unwrap();
+    let url = blob_url("https://blob.example", "tok", "user-token", &body);
     assert!(url.starts_with("https://blob.example/rest/storage/blobservice?"));
     assert!(url.contains("blobAccessToken=tok"));
-    assert!(url.contains("v=16"));
-    let trimmed = blob_url("https://blob.example/", "tok", b"{\"a\":1}");
+    assert!(url.contains("accessToken=user-token"));
+    assert!(url.contains("v=13"));
+    let trimmed = blob_url("https://blob.example/", "tok", "user", &body);
     assert!(trimmed.starts_with("https://blob.example/rest/storage/blobservice?"));
     assert!(!trimmed.contains("//rest"));
 }
 
 #[test]
-fn single_blob_json_is_protocol_shaped() {
-    let body = blob_get_body("arch", "b1").unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    // Singular request: "110" carries the blob id, "193" is empty.
-    assert_eq!(v["110"], "b1");
-    assert_eq!(v["193"], serde_json::json!([]));
-    assert!(v["193"].as_array().is_some_and(|a| a.is_empty()));
+fn parses_framed_multi_blob_response() {
+    let id = [7u8; 9];
+    let payload = b"cipher";
+    let mut response = Vec::new();
+    response.extend_from_slice(&1i32.to_be_bytes());
+    response.extend_from_slice(&id);
+    response.extend_from_slice(&[0u8; 6]);
+    response.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+    response.extend_from_slice(payload);
+
+    let parsed = parse_multiple_blobs(&response).unwrap();
+    assert_eq!(
+        parsed.get(&BASE64_EXT.encode(id)).map(Vec::as_slice),
+        Some(payload.as_slice())
+    );
 }
 
 #[test]
@@ -66,8 +80,9 @@ async fn fetches_binary_blob_with_access_token() {
 
     let rest = NativeRestClient::try_new().unwrap();
     // The blob token stays in the query; the user session token goes in the header.
-    let url = blob_url(&server.uri(), "blob-token", b"{\"a\":1}");
+    let url = blob_url(&server.uri(), "blob-token", "user-token", b"{\"a\":1}");
     assert!(url.contains("blobAccessToken=blob-token"));
+    assert!(url.contains("accessToken=user-token"));
     let data = fetch_blob(&rest, &url, "user-token").await.unwrap();
     assert_eq!(data, b"cipher");
 }

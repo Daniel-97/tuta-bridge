@@ -64,6 +64,7 @@ impl SessionFactory for TutaSessionFactory {
             Arc::clone(&logged),
             Arc::clone(&self.rest),
             credentials.access_token.clone(),
+            self.base_url.clone(),
         );
 
         Ok(Box::new(TutaSession {

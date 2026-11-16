@@ -81,14 +81,21 @@ pub struct TutaMailSource {
     logged: Arc<LoggedInSdk>,
     rest: Arc<dyn RestClient>,
     access_token: String,
+    base_url: String,
 }
 
 impl TutaMailSource {
-    pub fn new(logged: Arc<LoggedInSdk>, rest: Arc<dyn RestClient>, access_token: String) -> Self {
+    pub fn new(
+        logged: Arc<LoggedInSdk>,
+        rest: Arc<dyn RestClient>,
+        access_token: String,
+        base_url: String,
+    ) -> Self {
         Self {
             logged,
             rest,
             access_token,
+            base_url,
         }
     }
 
@@ -116,18 +123,24 @@ impl TutaMailSource {
 
     /// Fetch and parse a `MailDetailsBlob` wire object from the blob server.
     async fn load_blob_element(&self, details_id: &IdTupleGenerated) -> Result<Value> {
-        let access = request_archive_read_token(&self.logged, details_id.list_id.as_str()).await?;
+        let access = request_archive_read_token(
+            self.rest.as_ref(),
+            &self.base_url,
+            &self.access_token,
+            details_id.list_id.as_str(),
+        )
+        .await?;
         let server = access
             .servers
             .first()
-            .map(|server| server.url.clone())
+            .cloned()
             .ok_or_else(|| Error::Message("mail details server unavailable".into()))?;
         let bytes = fetch_blob_element(
             self.rest.as_ref(),
             &server,
             details_id.list_id.as_str(),
             details_id.element_id.as_str(),
-            &access.blobAccessToken,
+            &access.blob_access_token,
             &self.access_token,
         )
         .await?;
@@ -280,12 +293,13 @@ impl MailSource for TutaMailSource {
                 &self.logged,
                 self.rest.as_ref(),
                 &self.access_token,
+                &self.base_url,
                 attachment_id,
             )
             .await
             {
                 Ok(attachment) => attachments.push(attachment),
-                Err(_) => return Err(Error::Message("attachment load failed".into())),
+                Err(e) => return Err(e),
             }
         }
 
