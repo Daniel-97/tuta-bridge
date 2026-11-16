@@ -36,11 +36,47 @@ enum AuthFailure {
     SecondFactor,
 }
 
+/// Print a short, opt-in diagnostic line for an HTTP response.
+///
+/// Enabled only by `TUTA_BRIDGE_DEBUG_HTTP=1`. The URL query (which contains
+/// `_body` with the mail address/verifier) is never printed; only the path,
+/// status, and recognized error fields from a JSON response.
+fn debug_http(phase: &str, method: &str, url: &str, status: u32, body: Option<&[u8]>) {
+    if std::env::var_os("TUTA_BRIDGE_DEBUG_HTTP").is_none() {
+        return;
+    }
+    let path = url.split('?').next().unwrap_or(url);
+    let detail = body
+        .map(describe_error_body)
+        .unwrap_or_else(|| "<empty body>".to_string());
+    eprintln!("http debug: {phase} {method} {path} -> {status}; {detail}");
+}
+
+fn describe_error_body(body: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(map)) => {
+            let mut parts = Vec::new();
+            for key in ["errorCode", "error", "code", "message", "msg"] {
+                if let Some(value) = map.get(key).and_then(|v| v.as_str()) {
+                    let truncated: String = value.chars().take(300).collect();
+                    parts.push(format!("{key}={truncated}"));
+                }
+            }
+            if parts.is_empty() {
+                format!("<json object with {} keys>", map.len())
+            } else {
+                parts.join(", ")
+            }
+        }
+        Ok(_) => "<non-object json>".to_string(),
+        Err(_) => format!("<{} bytes non-json>", body.len()),
+    }
+}
+
 impl TutaPreSession {
     pub fn new(rest: Arc<dyn RestClient>, base_url: String) -> Self {
         Self { rest, base_url }
     }
-
     /// Execute the full pre-session login flow and return a `NewSession`.
     pub async fn create(&self, request: SessionRequest) -> crate::domain::Result<NewSession> {
         let SessionRequest {
@@ -221,11 +257,20 @@ impl TutaPreSession {
             body,
             suspension_behavior: Some(SuspensionBehavior::Suspend),
         };
+        let method_label = format!("{method:?}");
         let response = self
             .rest
             .request_binary(url.to_string(), method, options)
             .await
             .map_err(|_| Error::Network("request failed".into()))?;
+
+        debug_http(
+            phase,
+            &method_label,
+            url,
+            response.status,
+            response.body.as_deref(),
+        );
 
         if response.status == 401 || response.status == 403 {
             return Err(match failure {
@@ -242,5 +287,27 @@ impl TutaPreSession {
         }
 
         Ok(response.body.unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_error_body;
+
+    #[test]
+    fn describes_json_error_fields_without_the_raw_body() {
+        let body = br#"{"errorCode":"invalid","message":"bad request","other":"ignored"}"#;
+        let text = describe_error_body(body);
+        assert!(text.contains("errorCode=invalid"));
+        assert!(text.contains("message=bad request"));
+        assert!(!text.contains("other=ignored"));
+    }
+
+    #[test]
+    fn describes_non_json_body_by_size_only() {
+        assert_eq!(
+            describe_error_body(b"<html>oops</html>"),
+            "<17 bytes non-json>"
+        );
     }
 }

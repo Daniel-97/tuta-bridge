@@ -44,6 +44,19 @@ tuta-bridge dump --folder inbox --limit 10 --out ~/tuta-inbox
 tuta-bridge logout
 ```
 
+## Debugging HTTP errors
+
+Errors are printed to stderr. To also print the HTTP phase, path, status, and
+recognized JSON error fields (never the query string or request body), run
+with:
+
+```bash
+TUTA_BRIDGE_DEBUG_HTTP=1 cargo run -- login
+```
+
+The diagnostic line may include a server-provided error message; review it
+before sharing.
+
 ## Development
 
 ```sh
