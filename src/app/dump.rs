@@ -79,23 +79,27 @@ impl DumpUseCase {
         let mut failed = Vec::new();
 
         for message in messages {
+            let id = format!("{}/{}", message.list_id, message.element_id);
             let bytes = match source.content(&message).await {
                 Ok(content) => match self.renderer.render(&content) {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        failed.push(format!("{}/{}", message.list_id, message.element_id));
+                        eprintln!("message {id} failed: rendering");
+                        failed.push(id);
                         continue;
                     }
                 },
-                Err(_) => {
-                    failed.push(format!("{}/{}", message.list_id, message.element_id));
+                Err(e) => {
+                    eprintln!("message {id} failed: {e}");
+                    failed.push(id);
                     continue;
                 }
             };
 
             let path = args.out.join(format!("{}.eml", message.file_stem()));
             if crate::config::write_private_file(&path, &bytes).is_err() {
-                failed.push(format!("{}/{}", message.list_id, message.element_id));
+                eprintln!("message {id} failed: writing");
+                failed.push(id);
                 continue;
             }
             written += 1;
