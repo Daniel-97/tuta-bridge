@@ -70,16 +70,19 @@ pub struct SqliteStateStore {
 
 impl SqliteStateStore {
     /// Open the database at `path`, creating it and the schema if missing.
+    ///
+    /// On Unix this sets the process umask to `0o077` before SQLite creates
+    /// any file. The umask is process-global and is intentionally left in
+    /// place: if SQLite ever recreates a WAL sidecar, it must not become
+    /// group- or world-readable.
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        restrict_process_umask();
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await?;
+        let pool = pool_options().connect_with(options).await?;
         tighten_state_files(path)?;
         let store = Self { pool };
         store.apply_schema().await?;
@@ -90,14 +93,15 @@ impl SqliteStateStore {
     }
 
     /// Open a throwaway in-memory database with the same schema.
+    ///
+    /// This applies the same private umask as [`Self::open`] for consistent
+    /// process-wide protection. It creates no sidecar files itself.
     pub async fn open_in_memory() -> anyhow::Result<Self> {
+        restrict_process_umask();
         let options = SqliteConnectOptions::new()
             .in_memory(true)
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await?;
+        let pool = pool_options().connect_with(options).await?;
         let store = Self { pool };
         store.apply_schema().await?;
         Ok(store)
@@ -589,6 +593,36 @@ fn tighten_state_files(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pool settings shared by the file and in-memory stores.
+///
+/// The store uses one connection for its whole lifetime and explicitly
+/// disables connection recycling. A recycled connection would reopen SQLite
+/// and let it recreate `-wal`/`-shm`, bypassing the permission tightening in
+/// `SqliteStateStore::open`.
+fn pool_options() -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .max_lifetime(None)
+        .idle_timeout(None)
+}
+
+/// Set a restrictive process umask so files created by SQLite are owner-only.
+///
+/// The umask is process-global and intentionally left at `0o077`: SQLite may
+/// recreate WAL sidecars after a connection error or checkpoint, and those
+/// files contain plaintext header metadata.
+#[cfg(unix)]
+fn restrict_process_umask() {
+    // SAFETY: `umask` only updates a process-global permission setting and
+    // cannot violate memory safety.
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_process_umask() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,6 +1013,8 @@ mod tests {
         use std::ffi::OsString;
         use std::path::PathBuf;
 
+        // Regression test: a file-backed store must never leave readable
+        // sidecars, including ones SQLite creates lazily after opening.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite3");
         let store = SqliteStateStore::open(&path).await.unwrap();

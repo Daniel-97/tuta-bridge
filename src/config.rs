@@ -133,6 +133,7 @@ pub fn data_dir() -> anyhow::Result<PathBuf> {
     )?;
     let dir = base.join(APP_DIR);
     create_private_dir(&dir)?;
+    tighten_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -167,6 +168,24 @@ fn create_private_dir(path: &Path) -> anyhow::Result<()> {
     builder
         .create(path)
         .with_context(|| format!("failed to create directory {}", path.display()))
+}
+
+/// Restrict an already existing directory to owner-only access.
+///
+/// `DirBuilder::mode` only affects newly created directories, so the data
+/// directory is tightened explicitly in case it predates this code or was
+/// created with a looser mode.
+#[cfg(unix)]
+fn tighten_private_dir(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to tighten permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn tighten_private_dir(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -287,5 +306,21 @@ mod tests {
         assert!(validate_base_url("ftp://example.com").is_err());
         assert!(validate_base_url("file:///etc/passwd").is_err());
         assert!(validate_base_url("not-a-url").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tighten_private_dir_tightens_existing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("state");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        tighten_private_dir(&dir).unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "existing directory must be tightened");
     }
 }
