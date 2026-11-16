@@ -5,7 +5,7 @@ use tutasdk::bindings::rest_client::RestClient;
 use tutasdk::crypto::crypto_facade::ResolvedSessionKey;
 use tutasdk::entities::entity_facade::{EntityFacade, EntityFacadeImpl};
 use tutasdk::entities::generated::tutanota::{
-    Mail, MailDetails, MailDetailsBlob, MailDetailsDraft, MailSet,
+    Mail, MailDetails, MailDetailsBlob, MailDetailsDraft, MailSet, MailSetEntry,
 };
 use tutasdk::entities::Entity;
 use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk};
@@ -218,10 +218,11 @@ impl MailSource for TutaMailSource {
     }
 
     async fn messages(&self, folder: &Folder, limit: usize) -> Result<Vec<MessageSummary>> {
-        let mails: Vec<Mail> = self
-            .logged
-            .mail_facade()
-            .get_crypto_entity_client()
+        let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+        // A mail set's `entries` list contains MailSetEntry elements, each of
+        // which references the actual Mail. Loading Mail directly from that
+        // list returns an empty page.
+        let entries: Vec<MailSetEntry> = crypto_client
             .load_range(
                 &GeneratedId(folder.list_id.clone()),
                 &CustomId(GeneratedId::max_id().to_string()),
@@ -229,7 +230,16 @@ impl MailSource for TutaMailSource {
                 ListLoadDirection::DESC,
             )
             .await
-            .map_err(|_| Error::Network("failed to load messages".into()))?;
+            .map_err(|_| Error::Network("failed to load message entries".into()))?;
+
+        let mut mails = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mail: Mail = crypto_client
+                .load(&entry.mail)
+                .await
+                .map_err(|_| Error::Network("failed to load message".into()))?;
+            mails.push(mail);
+        }
 
         Ok(mails
             .iter()
