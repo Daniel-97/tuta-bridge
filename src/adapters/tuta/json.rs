@@ -169,10 +169,13 @@ pub fn second_factor_body(session_id: &SessionId, code: &str) -> Vec<u8> {
     let v = json!({
         "542": "0",
         "1230": "1",
-        "1231": null,
-        "1232": [&session_id.list_id, &session_id.element_id],
+        // Empty aggregations are encoded as empty lists.
+        "1231": [],
+        // `session` is a list element association: the wire format is a list
+        // of [list_id, element_id] tuples, not a bare tuple.
+        "1232": [[&session_id.list_id, &session_id.element_id]],
         "1243": code,
-        "1905": null,
+        "1905": [],
     });
     serde_json::to_vec(&v).expect("second factor body serialization cannot fail")
 }
@@ -253,7 +256,9 @@ mod tests {
         .unwrap();
         assert_eq!(v["1230"], "1");
         assert_eq!(v["1243"], "123456");
-        assert_eq!(v["1232"], serde_json::json!(["L", "E"]));
+        assert_eq!(v["1232"], serde_json::json!([["L", "E"]]));
+        assert_eq!(v["1231"], serde_json::json!([]));
+        assert_eq!(v["1905"], serde_json::json!([]));
     }
 
     #[test]
