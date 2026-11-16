@@ -182,24 +182,18 @@ impl TutaMailSource {
         // mail's session key instead of the blob's owner key).
         match self.resolve_mail_session_key(mail).await {
             Ok(key) => match self.load_blob_with_key(details_id, key).await {
-                Ok(blob) if details_are_intact(&blob) => return Ok(blob.details),
-                Ok(_) => {
-                    return Err(Error::Message(format!(
-                        "{first_error}; details blob corrupted (mail key)"
-                    )))
-                }
-                Err(e) => {
-                    return Err(Error::Message(match e {
-                        Error::Message(message) => format!("{first_error}; {message}"),
-                        _ => format!("{first_error}; details blob decrypt failed"),
-                    }));
-                }
+                Ok(blob) if details_are_intact(&blob) => Ok(blob.details),
+                Ok(_) => Err(Error::Message(format!(
+                    "{first_error}; details blob corrupted (mail key)"
+                ))),
+                Err(e) => Err(Error::Message(match e {
+                    Error::Message(message) => format!("{first_error}; {message}"),
+                    _ => format!("{first_error}; details blob decrypt failed"),
+                })),
             },
-            Err(_) => {
-                return Err(Error::Message(format!(
-                    "{first_error}; mail details key unavailable"
-                )))
-            }
+            Err(_) => Err(Error::Message(format!(
+                "{first_error}; mail details key unavailable"
+            ))),
         }
     }
 }
