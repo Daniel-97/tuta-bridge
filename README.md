@@ -2,12 +2,34 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M2 complete for a single account (login, status/logout, dump with body and attachments). IMAP/SMTP are not implemented yet.
+Status: M0–M3 code complete; M3 manual acceptance pending. IMAP/SMTP are not implemented yet.
 
 ## Credentials
 
 - Credentials are stored only in the system Secret Service (service name `tuta-bridge`, username = mail address). There is no file fallback.
 - The password and TOTP code are never accepted from command-line arguments or environment variables.
+
+## State and sync
+
+The bridge keeps only the protocol state needed by IMAP: stable UIDs,
+`UIDVALIDITY`, the last event batch, and a lightweight header index. It never
+stores message bodies, attachments, or complete `.eml` files; those remain in
+Thunderbird's own cache.
+
+```sh
+# Index folders and mail headers; safe to run repeatedly
+tuta-bridge sync
+
+# Invalidate all UIDs/UIDVALIDITY and rebuild the index
+tuta-bridge resync
+```
+
+- `sync` is idempotent: known mail keeps its UID; new mail gets the next one.
+- Mail deleted or moved in Tuta is removed from the index on the next sync.
+- `resync` deliberately changes `UIDVALIDITY`, so IMAP clients redownload
+  headers. Use it only when the state is suspect.
+- The state database is `$XDG_DATA_HOME/tuta-bridge/state.sqlite3`
+  (`0600`), inside a `0700` directory.
 
 ## Dump
 

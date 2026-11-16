@@ -45,6 +45,16 @@
 - BlobService GET uses the plural form (`193` with one `BlobId` per blob) and returns a framed multi-blob response: 4-byte count, then per blob 9-byte id, 6-byte padding, 4-byte size, ciphertext. `v=13`, `accessToken` and `cv` are query parameters.
 - `TutanotaFile.size` is the encrypted blob size, not the decrypted length.
 
+## M3 state and sync
+
+- SQLite (`sqlx`) stores only protocol state and header metadata: accounts, mailboxes (`uidvalidity`, `next_uid`), messages (`uid`, Tuta ids, subject/from/first recipient/date/flags), and `sync_state`.
+- Bodies, attachments, inline images, and `.eml` files are never stored.
+- `assign_uid` is transactional: known mail keeps its UID, new mail gets `next_uid`, and `next_uid` increments atomically.
+- `sync` sorts headers by `received_at_ms` ascending before assigning UIDs and reconciles deletions/moves; it skips unreadable mails/folders and reports counts.
+- `resync` clears the account state and chooses a strictly different `UIDVALIDITY`, restarting UIDs at 1.
+- State DB permissions: directory `0700`, database and WAL/SHM `0600`; pool recycling is disabled and the process umask is restricted.
+- Manual acceptance against a real account is pending; record the twice-sync/resync/no-content results here when run.
+
 ## M1/M2 manual acceptance (2026-11-16)
 
 - Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.
