@@ -37,7 +37,12 @@ fn main() {
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     // Always silence the keyring/secret-service targets so `RUST_LOG=debug`
     // cannot emit the account address (the keyring username) or other secrets.
-    for directive in ["keyring=off", "secret_service=off", "zbus=off"] {
+    for directive in [
+        "keyring=off",
+        "secret_service=off",
+        "zbus=off",
+        "tutasdk::bindings::native_file_client=off",
+    ] {
         filter = filter.add_directive(directive.parse().expect("valid directive"));
     }
     tracing_subscriber::fmt()
