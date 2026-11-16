@@ -54,6 +54,38 @@ pub fn blob_url(server: &str, token: &str, body: &[u8]) -> String {
     format!("{}/rest/storage/blobservice{}", server, query)
 }
 
+/// Reject blob-server URLs that could downgrade or redirect the user token.
+///
+/// Tuta returns these URLs in `BlobServerAccessInfo`; accept HTTPS hosts only,
+/// plus loopback HTTP for local tests. No userinfo, path, query, or fragment.
+pub fn validate_blob_server(server: &str) -> Result<()> {
+    let error = || Error::Message("attachment load failed".into());
+
+    if let Some(rest) = server.strip_prefix("https://") {
+        if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
+            return Err(error());
+        }
+        return Ok(());
+    }
+
+    let Some(rest) = server.strip_prefix("http://") else {
+        return Err(error());
+    };
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
+        return Err(error());
+    }
+    let host = if rest.starts_with('[') {
+        rest.find(']').map(|i| &rest[..=i]).unwrap_or(rest)
+    } else {
+        rest.split(':').next().unwrap_or(rest)
+    };
+    if host == "127.0.0.1" || host == "localhost" || host == "[::1]" {
+        Ok(())
+    } else {
+        Err(error())
+    }
+}
+
 /// Fetch a blob over the blob service and return its raw bytes.
 ///
 /// The blob access token stays in the `blobAccessToken` query parameter built by
@@ -190,6 +222,7 @@ pub async fn load_attachment(
             .first()
             .map(|s| s.url.clone())
             .ok_or_else(|| Error::Message("attachment load failed".into()))?;
+        validate_blob_server(&server)?;
         let token = access.blobAccessInfo.blobAccessToken.clone();
 
         for blob in &groups[&archive_id.to_string()] {

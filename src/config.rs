@@ -69,25 +69,31 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()>
 }
 
 pub fn validate_base_url(url: &str) -> std::result::Result<(), String> {
-    let rest = if let Some(rest) = url.strip_prefix("https://") {
-        if rest.is_empty()
-            || rest.starts_with('/')
-            || rest.starts_with('?')
-            || rest.starts_with('#')
-        {
-            return Err("base URL must have a non-empty host".to_string());
-        }
-        return Ok(());
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        rest
-    } else {
-        return Err("base URL must be https (http is allowed only for loopback)".to_string());
-    };
+    let error =
+        || "base URL must be https://app.tuta.com (http is allowed only for loopback)".to_string();
 
-    // http: only allowed for loopback hosts
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if let Some(rest) = url.strip_prefix("https://") {
+        // Only the official Tuta API hosts, with no userinfo, path, query,
+        // fragment, or explicit port.
+        if rest.contains(['/', '?', '#', '@']) {
+            return Err(error());
+        }
+        return match rest {
+            "app.tuta.com" | "app.tutanota.com" => Ok(()),
+            _ => Err(error()),
+        };
+    }
+
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Err(error());
+    };
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
+        return Err(error());
+    }
+
+    // http is only allowed for loopback hosts.
+    let authority = rest;
     let host = if authority.starts_with('[') {
-        // IPv6: take up to the closing bracket
         authority
             .find(']')
             .map(|i| &authority[..=i])
@@ -99,7 +105,7 @@ pub fn validate_base_url(url: &str) -> std::result::Result<(), String> {
     if host == "127.0.0.1" || host == "localhost" || host == "[::1]" {
         Ok(())
     } else {
-        Err("base URL must be https (http is allowed only for loopback)".to_string())
+        Err(error())
     }
 }
 
@@ -243,14 +249,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_base_url_accepts_https_with_host() {
+    fn validate_base_url_accepts_only_official_tuta_hosts() {
         assert!(validate_base_url("https://app.tuta.com").is_ok());
-        assert!(validate_base_url("https://example.com:443/path").is_ok());
-        assert!(validate_base_url("https://sub.domain.example").is_ok());
-    }
-
-    #[test]
-    fn validate_base_url_rejects_https_without_host() {
+        assert!(validate_base_url("https://app.tutanota.com").is_ok());
+        assert!(validate_base_url("https://app.tuta.com.evil.example").is_err());
+        assert!(validate_base_url("https://evil.example").is_err());
+        assert!(validate_base_url("https://app.tuta.com/path").is_err());
+        assert!(validate_base_url("https://user@app.tuta.com").is_err());
+        assert!(validate_base_url("https://app.tuta.com:443").is_err());
         assert!(validate_base_url("https://").is_err());
         assert!(validate_base_url("https:///path").is_err());
     }
