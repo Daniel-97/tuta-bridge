@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod credentials;
 pub mod event_lookup;
 pub mod event_stream;
@@ -7,6 +8,7 @@ pub mod renderer;
 pub mod session;
 pub mod state_store;
 
+pub use clock::Clock;
 pub use credentials::CredentialStore;
 pub use event_lookup::EventLookup;
 pub use event_stream::{EventHandles, EventStream};

@@ -67,7 +67,8 @@ impl StateSyncUseCase {
     }
 }
 
-async fn open_state_store() -> Result<Arc<dyn StateStore>> {
+/// Open the SQLite state store at the platform data path.
+pub async fn open_state_store() -> Result<Arc<dyn StateStore>> {
     let path = state_path().map_err(|e| Error::Config(e.to_string()))?;
     let store = SqliteStateStore::open(&path)
         .await
@@ -75,7 +76,7 @@ async fn open_state_store() -> Result<Arc<dyn StateStore>> {
     Ok(Arc::new(store))
 }
 
-async fn sync_with(
+pub(crate) async fn sync_with(
     state: Arc<dyn StateStore>,
     source: &dyn MailSource,
     account_id: i64,
@@ -86,7 +87,7 @@ async fn sync_with(
         .await
 }
 
-async fn resync_with(
+pub(crate) async fn resync_with(
     state: Arc<dyn StateStore>,
     source: &dyn MailSource,
     account_id: i64,
@@ -109,7 +110,7 @@ async fn resync_with(
 }
 
 /// Pick a UIDVALIDITY guaranteed to differ from `previous`.
-fn next_uidvalidity(previous: Option<u32>, now: u32) -> Result<u32> {
+pub(crate) fn next_uidvalidity(previous: Option<u32>, now: u32) -> Result<u32> {
     match previous {
         None => Ok(now),
         Some(previous) if previous >= now => previous
@@ -120,7 +121,7 @@ fn next_uidvalidity(previous: Option<u32>, now: u32) -> Result<u32> {
 }
 
 /// Seconds since the Unix epoch, clamped to the `u32` UIDVALIDITY range.
-fn current_uidvalidity() -> u32 {
+pub(crate) fn current_uidvalidity() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX))

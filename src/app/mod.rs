@@ -5,3 +5,4 @@ pub mod logout;
 pub mod state_sync;
 pub mod status;
 pub mod sync;
+pub mod watch;

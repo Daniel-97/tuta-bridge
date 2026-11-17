@@ -32,6 +32,8 @@ pub enum Command {
     /// WARNING: this assigns new UIDs, invalidating any UID mappings held by
     /// mail clients.
     Resync,
+    /// Stream Tuta events and update the local index.
+    Watch,
     Dump {
         #[arg(long)]
         folder: String,
@@ -77,6 +79,14 @@ mod tests {
         assert!(matches!(
             parse_from(["tuta-bridge", "resync"]).unwrap().command,
             Command::Resync
+        ));
+    }
+
+    #[test]
+    fn parses_watch_command() {
+        assert!(matches!(
+            parse_from(["tuta-bridge", "watch"]).unwrap().command,
+            Command::Watch
         ));
     }
 

@@ -1,17 +1,18 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::SecretString;
 use tuta_bridge::domain::{
-    AccountId, AccountInfo, Error, Folder, MailPlacement, MailboxId, MessageContent, MessageHeader,
-    MessagePage, MessageSummary, Result, StateChange, StoredCredentials, StoredMailbox,
-    StoredMessage,
+    AccountId, AccountInfo, Error, EventFrame, Folder, MailPlacement, MailboxId, MessageContent,
+    MessageHeader, MessagePage, MessageSummary, Result, StateChange, StoredCredentials,
+    StoredMailbox, StoredMessage,
 };
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::event_lookup::EventLookup;
+use tuta_bridge::ports::event_stream::{EventHandles, EventStream};
 use tuta_bridge::ports::mail_source::MailSource;
 use tuta_bridge::ports::prompt::LoginPrompt;
 use tuta_bridge::ports::renderer::MessageRenderer;
@@ -872,6 +873,135 @@ impl MailSource for FakeMailSource {
             next_start: None,
             skipped,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeEventSession
+// ---------------------------------------------------------------------------
+
+/// Scripted event-bus session for watch tests.
+///
+/// Every `events()` call consumes the next queued script and replays its
+/// frames in order. A call without a queued script, or a script that runs
+/// out of frames, panics so a broken test fails loudly instead of hanging.
+/// The batch markers handed to each call are recorded for assertions.
+///
+/// `SessionFactory::resume` must return an owned `Box<dyn Session>`, so
+/// tests share one session through an [`Arc`] and hand out
+/// [`FakeEventSessionHandle`]s that keep it alive.
+pub struct FakeEventSession {
+    pub account: AccountInfo,
+    /// Groups reported by `event_groups`.
+    pub groups: Vec<String>,
+    /// One script per `events()` call, consumed in order.
+    pub scripts: Mutex<VecDeque<Vec<Result<EventFrame>>>>,
+    /// Lookup handed out with every stream.
+    pub lookup: Arc<FakeEventLookup>,
+    /// Mail source used for baseline syncs.
+    pub mail: Arc<FakeMailSource>,
+    /// Batch markers passed to each `events()` call.
+    pub marker_calls: Mutex<Vec<HashMap<String, String>>>,
+}
+
+impl FakeEventSession {
+    pub fn new(account: AccountInfo, groups: Vec<String>) -> Self {
+        Self {
+            account,
+            groups,
+            scripts: Mutex::new(VecDeque::new()),
+            lookup: Arc::new(FakeEventLookup::new()),
+            mail: Arc::new(FakeMailSource::new()),
+            marker_calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Queue the frames the next `events()` call will replay.
+    pub fn push_script(&self, frames: Vec<Result<EventFrame>>) {
+        self.scripts.lock().unwrap().push_back(frames);
+    }
+
+    /// Replace the lookup handed out by `events()`.
+    pub fn with_lookup(mut self, lookup: Arc<FakeEventLookup>) -> Self {
+        self.lookup = lookup;
+        self
+    }
+
+    /// Replace the mail source used for baseline syncs.
+    pub fn with_mail(mut self, mail: Arc<FakeMailSource>) -> Self {
+        self.mail = mail;
+        self
+    }
+
+    /// Number of `events()` calls so far.
+    pub fn events_calls(&self) -> usize {
+        self.marker_calls.lock().unwrap().len()
+    }
+
+    /// Batch markers passed to the `events()` call at `index`.
+    pub fn markers_for_call(&self, index: usize) -> HashMap<String, String> {
+        self.marker_calls.lock().unwrap()[index].clone()
+    }
+}
+
+/// Owned [`Session`] handle over a shared [`FakeEventSession`].
+pub struct FakeEventSessionHandle(pub Arc<FakeEventSession>);
+
+#[async_trait::async_trait]
+impl Session for FakeEventSessionHandle {
+    fn account(&self) -> AccountInfo {
+        self.0.account.clone()
+    }
+
+    fn mail(&self) -> &dyn MailSource {
+        self.0.mail.as_ref()
+    }
+
+    fn event_groups(&self) -> Vec<String> {
+        self.0.groups.clone()
+    }
+
+    async fn events(
+        &self,
+        last_batches: &HashMap<String, String>,
+        _now_ms: i64,
+    ) -> Result<EventHandles> {
+        self.0
+            .marker_calls
+            .lock()
+            .unwrap()
+            .push(last_batches.clone());
+        let frames = self
+            .0
+            .scripts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("events() was called more times than scripted");
+        Ok(EventHandles {
+            stream: Box::new(ScriptedEventStream {
+                frames: frames.into(),
+            }),
+            lookup: Arc::clone(&self.0.lookup) as Arc<dyn EventLookup>,
+        })
+    }
+
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Replays one script; an exhausted script panics so tests fail loudly.
+struct ScriptedEventStream {
+    frames: VecDeque<Result<EventFrame>>,
+}
+
+#[async_trait::async_trait]
+impl EventStream for ScriptedEventStream {
+    async fn next_frame(&mut self) -> Result<EventFrame> {
+        self.frames
+            .pop_front()
+            .expect("script ran out of frames; end every script with an error")
     }
 }
 

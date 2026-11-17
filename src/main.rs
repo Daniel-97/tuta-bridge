@@ -11,11 +11,13 @@ use tuta_bridge::adapters::tuta::session::TutaSessionFactory;
 use tuta_bridge::app::dump::{DumpArgs, DumpUseCase};
 use tuta_bridge::app::login::LoginUseCase;
 use tuta_bridge::app::logout::LogoutUseCase;
-use tuta_bridge::app::state_sync::StateSyncUseCase;
+use tuta_bridge::app::state_sync::{open_state_store, StateSyncUseCase};
 use tuta_bridge::app::status::StatusUseCase;
 use tuta_bridge::app::sync::SyncReport;
+use tuta_bridge::app::watch::{BackoffPolicy, WatchUseCase};
 use tuta_bridge::config::{config_path, data_dir, resolve_base_url, validate_base_url, Config};
 use tuta_bridge::domain::Error;
+use tuta_bridge::ports::clock::Clock;
 use tuta_bridge::ports::renderer::MessageRenderer;
 
 use tutasdk::bindings::native_file_client::NativeFileClient;
@@ -31,6 +33,15 @@ struct SystemClock;
 impl DateProvider for SystemClock {
     fn now(&self) -> DateTime {
         DateTime::from_system_time(std::time::SystemTime::now())
+    }
+}
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
     }
 }
 
@@ -151,6 +162,21 @@ fn main() {
                 );
                 let report = uc.resync().await?;
                 print_sync_report("resynced", &report);
+                Ok(())
+            }
+            Command::Watch => {
+                let state = open_state_store().await?;
+                let uc = WatchUseCase {
+                    factory: Arc::clone(&factory)
+                        as Arc<dyn tuta_bridge::ports::session::SessionFactory>,
+                    credentials: Arc::clone(&store)
+                        as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
+                    config_path,
+                    state,
+                    clock: Arc::new(SystemClock),
+                    backoff: BackoffPolicy::production(),
+                };
+                uc.run().await?;
                 Ok(())
             }
             Command::Logout => {
