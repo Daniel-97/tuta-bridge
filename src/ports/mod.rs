@@ -1,5 +1,6 @@
 pub mod credentials;
 pub mod event_lookup;
+pub mod event_stream;
 pub mod mail_source;
 pub mod prompt;
 pub mod renderer;
@@ -8,6 +9,7 @@ pub mod state_store;
 
 pub use credentials::CredentialStore;
 pub use event_lookup::EventLookup;
+pub use event_stream::{EventHandles, EventStream};
 pub use mail_source::MailSource;
 pub use prompt::LoginPrompt;
 pub use renderer::MessageRenderer;

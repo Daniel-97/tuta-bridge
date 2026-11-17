@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tutasdk::bindings::rest_client::RestClient;
@@ -7,10 +8,16 @@ use tutasdk::services::generated::sys::CloseSessionService;
 use tutasdk::services::ExtraServiceParams;
 use tutasdk::{CustomId, GeneratedId, IdTupleCustom, LoggedInSdk, Sdk};
 
+use super::event_lookup::TutaEventLookup;
+use super::event_stream::{
+    event_url, is_event_group, model_versions, TutaEventStream, TUTA_CLIENT_VERSION,
+};
+use super::generated_id::timestamp_to_generated_id;
 use super::json::session_id_from_access_token;
 use super::mail_source::TutaMailSource;
 use super::pre_session::TutaPreSession;
 use crate::domain::{AccountInfo, Error, Result, StoredCredentials};
+use crate::ports::event_stream::EventHandles;
 use crate::ports::mail_source::MailSource;
 use crate::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
 
@@ -19,8 +26,6 @@ pub struct TutaSessionFactory {
     pre: TutaPreSession,
     sdk: Sdk,
     rest: Arc<dyn RestClient>,
-    // Retained for composition symmetry with the pre-session.
-    #[allow(dead_code)]
     base_url: String,
 }
 
@@ -72,6 +77,7 @@ impl SessionFactory for TutaSessionFactory {
             rest: Arc::clone(&self.rest),
             info,
             access_token: credentials.access_token.clone(),
+            base_url: self.base_url.clone(),
             mail,
         }))
     }
@@ -85,6 +91,7 @@ pub struct TutaSession {
     rest: Arc<dyn RestClient>,
     info: AccountInfo,
     access_token: String,
+    base_url: String,
     mail: TutaMailSource,
 }
 
@@ -96,6 +103,60 @@ impl Session for TutaSession {
 
     fn mail(&self) -> &dyn MailSource {
         &self.mail
+    }
+
+    fn event_groups(&self) -> Vec<String> {
+        let user = self.logged.get_user();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut groups = Vec::with_capacity(user.memberships.len() + 1);
+        for membership in user
+            .memberships
+            .iter()
+            .chain(std::iter::once(&user.userGroup))
+        {
+            if !is_event_group(membership.groupType) {
+                continue;
+            }
+            let group = membership.group.0.as_str();
+            if seen.insert(group) {
+                groups.push(group.to_string());
+            }
+        }
+        groups
+    }
+
+    async fn events(
+        &self,
+        last_batches: &HashMap<String, String>,
+        now_ms: i64,
+    ) -> Result<EventHandles> {
+        let fallback = timestamp_to_generated_id(now_ms.saturating_sub(5_000).max(0));
+        let groups: Vec<(String, String)> = self
+            .event_groups()
+            .into_iter()
+            .map(|group| {
+                let batch = last_batches
+                    .get(&group)
+                    .cloned()
+                    .unwrap_or_else(|| fallback.clone());
+                (group, batch)
+            })
+            .collect();
+        let versions = model_versions(self.logged.type_model_provider.as_ref())
+            .ok_or_else(|| Error::Config("event model versions unavailable".into()))?;
+        let url = event_url(
+            &self.base_url,
+            &self.info.user_id,
+            &self.access_token,
+            &groups,
+            &versions,
+            TUTA_CLIENT_VERSION,
+        )?;
+        let stream = TutaEventStream::connect(&url).await?;
+        Ok(EventHandles {
+            stream: Box::new(stream),
+            lookup: Arc::new(TutaEventLookup::new(Arc::clone(&self.logged))),
+        })
     }
 
     async fn close(&self) -> Result<()> {

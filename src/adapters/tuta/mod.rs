@@ -1,6 +1,7 @@
 pub mod blob;
 pub mod content;
 pub mod event_lookup;
+pub mod event_stream;
 pub mod event_wire;
 pub mod generated_id;
 pub mod json;

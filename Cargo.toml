@@ -7,7 +7,7 @@ rust-version = "1.84"
 [dependencies]
 tuta-sdk = { git = "https://github.com/tutao/tutanota.git", rev = "5dba96493532804ebd5a541024aa217ca3b7874d", features = ["net"] }
 crypto-primitives = { git = "https://github.com/tutao/tutanota.git", rev = "5dba96493532804ebd5a541024aa217ca3b7874d", package = "crypto-primitives", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 rpassword = "7"
@@ -27,6 +27,9 @@ mail-parser = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+urlencoding = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
