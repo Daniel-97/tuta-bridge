@@ -679,7 +679,7 @@ Sequence:
    - After the sync/reset, for every group without a marker generate `timestamp_to_generated_id((now_ms - 5_000).max(0))`, persist with `set_last_batch`, and add it to the in-memory map.
 5. `event_uidvalidity = next_uidvalidity(max stored uidvalidity, current_uidvalidity())?`.
 6. Reconnect loop:
-   - `handles = session.events(&batches, clock.now_ms()).await?`; keep `lookup`.
+   - `handles = session.events(&batches, clock.now_ms()).await`; keep `lookup`. Fatal errors return; `Error::Network` (including a failed websocket *connect*) counts the attempt, sleeps the backoff with `tokio::select!` against `stop`, and continues, so an outage longer than one delay keeps `watch` alive instead of exiting.
    - Inner loop with `tokio::select!` between `stop` and `stream.next_frame()`.
    - `Batch(batch)` → `EventProcessor::apply(account_id, lookup.as_ref(), event_uidvalidity, &batch).await?`; update `batches` with the batch's owner group and batch id; print `applied {changes} changes` only when `changes > 0`.
    - `InitialSyncDone` → print `event stream caught up`.
@@ -715,6 +715,8 @@ async fn applies_batches_and_persists_the_batch_id() {
 
 Add:
 - `reconnects_from_the_latest_batch`: first script returns `Err(Error::Network(...))`, second returns a batch; `backoff.first_ms = 0`; assert `events()` was called twice and the second call saw `batch-1`.
+- `connect_failure_is_retried_with_backoff`: the first `events()` call returns `Err(Error::Network(...))` before any frame (scripted connect failure); the second returns a batch and then a fatal error; assert two calls and one applied batch.
+- `stop_future_is_honored`: a stream whose `next_frame` never resolves, with `run_until(tokio::time::sleep(Duration::ZERO))`, returns `Ok(())` promptly.
 - `expired_marker_triggers_resync_before_events`: pre-store an old marker; fake mail source has a folder/header; assert `reset_account`/`apply_batch`/UIDVALIDITY changed and the marker is replaced.
 - `missing_marker_runs_a_baseline_sync`: store has a mailbox but no marker; assert the fake mail source was synced and the marker persisted.
 - `auth_failure_stops_without_retrying`: `Err(Error::Login)` on the first frame; assert one `events()` call.
