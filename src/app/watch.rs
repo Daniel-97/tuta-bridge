@@ -2,10 +2,11 @@
 //!
 //! [`WatchUseCase`] resumes the stored session, reconciles the local index
 //! with a baseline (re)sync, and then consumes the event bus until it is
-//! stopped. Network failures reconnect with a capped backoff; every other
-//! error is fatal because it needs the user to act. A run of batches whose
-//! entity lookups fail resyncs the index, exactly like an expired marker.
-//! The output is fixed text and counters only: ids, tokens, subjects,
+//! stopped. Network failures — including connects that hang until the
+//! connect timeout — reconnect with a capped backoff; every other error is
+//! fatal because it needs the user to act. A run of batches whose entity
+//! lookups fail resyncs the index, exactly like an expired marker. The
+//! output is fixed text and counters only: ids, tokens, subjects,
 //! addresses, and URLs never appear in it.
 
 use std::collections::HashMap;
@@ -133,12 +134,23 @@ impl WatchUseCase {
         // triggers the resync valve below.
         let mut failing_batches: usize = 0;
         loop {
-            // A failed connect is retried like a dropped connection: it
-            // shares the backoff below with frame errors.
-            let connected = match session.events(&batches, self.clock.now_ms()).await {
-                Ok(handles) => Some(handles),
-                Err(e) if is_fatal(&e) => return Err(e),
-                Err(_) => None,
+            // A failed or hung connect is retried like a dropped
+            // connection: it shares the backoff below with frame errors.
+            // The timeout bounds how long one connect may stall the
+            // loop, and the stop future stays responsive while it runs.
+            let connected = tokio::select! {
+                biased;
+                connected = tokio::time::timeout(
+                    self.connect_timeout,
+                    session.events(&batches, self.clock.now_ms()),
+                ) => match connected {
+                    Ok(Ok(handles)) => Some(handles),
+                    Ok(Err(e)) if is_fatal(&e) => return Err(e),
+                    // A network error or a timed-out connect is retried
+                    // on a fresh connection.
+                    Ok(Err(_)) | Err(_) => None,
+                },
+                () = &mut stop => return Ok(()),
             };
 
             if let Some(handles) = connected {

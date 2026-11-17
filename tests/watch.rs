@@ -603,3 +603,41 @@ async fn consecutive_lookup_failures_resync_once_and_continue() {
         Some("batch-3")
     );
 }
+
+#[tokio::test]
+async fn connect_timeout_is_retried() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, marker) = synced_account(&state).await;
+
+    // The first connect hangs forever; the tiny connect timeout must
+    // abandon it, and the retry must deliver one batch before the
+    // fatal end.
+    let session = event_session();
+    session.push_hung_connect();
+    session.push_script(vec![
+        Ok(EventFrame::Batch(empty_batch("batch-6", "group1"))),
+        Err(Error::Login("stop".into())),
+    ]);
+
+    let mut watch = use_case(&session, credentials, config_path, state.clone());
+    watch.connect_timeout = Duration::from_millis(50);
+
+    let error = watch.run_until(std::future::pending()).await.unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+
+    // The hung call was recorded and abandoned; the retry connected and
+    // resumed from the stored marker.
+    assert_eq!(session.events_calls(), 2);
+    assert_eq!(session.markers_for_call(1).get("group1"), Some(&marker));
+    // The retried connection applied its batch.
+    assert_eq!(
+        state
+            .last_batch(account, "group1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("batch-6")
+    );
+}

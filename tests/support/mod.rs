@@ -918,6 +918,9 @@ pub struct FakeEventSession {
     pub scripts: Mutex<VecDeque<Vec<Result<EventFrame>>>>,
     /// Errors the next `events()` calls return before replaying a script.
     pub connect_errors: Mutex<VecDeque<Error>>,
+    /// Calls whose `events()` future never resolves, consumed before
+    /// scripts and after connect errors.
+    pub hung_connects: Mutex<VecDeque<()>>,
     /// Calls whose stream never resolves, consumed before scripts.
     pub pending_calls: Mutex<VecDeque<()>>,
     /// Lookup handed out with every stream.
@@ -935,6 +938,7 @@ impl FakeEventSession {
             groups,
             scripts: Mutex::new(VecDeque::new()),
             connect_errors: Mutex::new(VecDeque::new()),
+            hung_connects: Mutex::new(VecDeque::new()),
             pending_calls: Mutex::new(VecDeque::new()),
             lookup: Arc::new(FakeEventLookup::new()),
             mail: Arc::new(FakeMailSource::new()),
@@ -951,6 +955,12 @@ impl FakeEventSession {
     /// are replayed; scripts queued for that call stay untouched.
     pub fn push_connect_error(&self, error: Error) {
         self.connect_errors.lock().unwrap().push_back(error);
+    }
+
+    /// Make the next `events()` call hang forever; only the watch's
+    /// connect timeout can end it.
+    pub fn push_hung_connect(&self) {
+        self.hung_connects.lock().unwrap().push_back(());
     }
 
     /// Make the next `events()` call hand out a stream that never
@@ -1011,6 +1021,10 @@ impl Session for FakeEventSessionHandle {
             .push(last_batches.clone());
         if let Some(error) = self.0.connect_errors.lock().unwrap().pop_front() {
             return Err(error);
+        }
+        if self.0.hung_connects.lock().unwrap().pop_front().is_some() {
+            // A hung connect never resolves on its own.
+            return std::future::pending().await;
         }
         if self.0.pending_calls.lock().unwrap().pop_front().is_some() {
             return Ok(EventHandles {
