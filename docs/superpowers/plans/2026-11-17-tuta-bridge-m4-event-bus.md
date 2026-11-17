@@ -83,7 +83,7 @@ Modify:
 - Test: inline module in `src/adapters/tuta/event_wire.rs`
 
 **Interfaces:**
-- Consumes: `tutasdk::entities::generated::sys::{EntityUpdate, WebsocketEntityData}`.
+- Consumes: `serde_json` and the numeric attribute ids of `WebsocketEntityData` (1484/1485/1486/2557/2558/1487) and `EntityUpdate` (463/464/466/467/624/2556/2617/2701/2618). Do **not** reuse the SDK structs: the Rust SDK models the `NumberString` wire fields as `i64`, but the server sends them as JSON strings (`"624":"0"`, `"2556":"97"`), which the SDK models cannot deserialize. Define a private raw struct instead.
 - Produces:
   - `pub enum EntityOperation { Create, Update, Delete }` (derive `Debug, Clone, Copy, PartialEq, Eq`)
   - `pub struct EntityEvent { pub application: String, pub type_id: i64, pub list_id: String, pub element_id: String, pub operation: EntityOperation }` (derive `Clone, PartialEq, Eq`; no `Debug`)
@@ -102,7 +102,8 @@ Use the real numeric attribute ids: `1485` batch id, `1486` owner, `1487` update
 ```rust
 #[test]
 fn parses_entity_update_batch() {
-    let json = r#"{"1484":0,"1485":"batch1","1486":"group1","2557":7,"2558":"hash","1487":[{"463":null,"464":"tutanota","466":"list1","467":"mail1","624":0,"2556":97,"2617":null,"2701":null,"2618":null},{"463":null,"464":"tutanota","466":"list1","467":"entry1","624":2,"2556":1450,"2617":null,"2701":null,"2618":null}]}"#;
+    // Real wire shape: the server sends every NumberString field as a string.
+    let json = r#"{"1484":"0","1485":"batch1","1486":"group1","2557":"7","2558":"hash","1487":[{"463":"u1","464":"tutanota","466":"list1","467":"mail1","624":"0","2556":"97","2617":null,"2701":null,"2618":null},{"463":"u2","464":"tutanota","466":"list1","467":"entry1","624":"2","2556":"1450","2617":null,"2701":null,"2618":null}]}"#;
     let frame = parse_frame(&format!("entityUpdate;{json}")).unwrap();
     let EventFrame::Batch(batch) = frame else { panic!("expected batch") };
     assert_eq!(batch.batch_id, "batch1");
@@ -112,6 +113,14 @@ fn parses_entity_update_batch() {
     assert_eq!(batch.events[1].operation, EntityOperation::Delete);
     assert_eq!(batch.events[1].list_id, "list1");
     assert_eq!(batch.events[1].element_id, "entry1");
+}
+
+#[test]
+fn accepts_the_same_batch_with_json_numbers() {
+    let json = r#"{"1484":0,"1485":"batch1","1486":"group1","2557":7,"2558":"hash","1487":[{"463":null,"464":"tutanota","466":"list1","467":"mail1","624":0,"2556":97,"2617":null,"2701":null,"2618":null}]}"#;
+    let EventFrame::Batch(batch) = parse_frame(&format!("entityUpdate;{json}")).unwrap() else { panic!() };
+    assert_eq!(batch.events[0].type_id, 97);
+    assert_eq!(batch.events[0].operation, EntityOperation::Create);
 }
 
 #[test]
@@ -140,7 +149,7 @@ Expected: FAIL because the module does not exist.
 - [ ] **Step 3: Implement the domain types and parser**
 
 `parse_frame` splits once on the first `;`, trims nothing from the value, and:
-- `entityUpdate` → deserialize `WebsocketEntityData` with `serde_json`; map each `EntityUpdate` with `application`, `typeId`, `instanceListId`, `instanceId`; map `operation` 0/1/2 and silently drop other values; keep unknown apps/types so the processor decides.
+- `entityUpdate` → deserialize a **private raw struct** (`serde_json`, unknown fields ignored) with the numeric attribute ids above. The number-like fields (`624` operation, `2556` type id) must go through a tolerant deserializer that accepts a JSON number **or** a numeric string, because the server sends them as strings. Map each update's `application`, `typeId`, `instanceListId`, `instanceId`; map `operation` 0/1/2 and silently drop other values; keep unknown apps/types so the processor decides. Never read or store `instance`/`blobInstance`/`patch`.
 - `initialSyncDone` → `EventFrame::InitialSyncDone`.
 - every other known or unknown type → `EventFrame::Ignored`.
 - a malformed `entityUpdate` payload → `Error::Network("invalid event message".into())`; never include the raw payload.
