@@ -249,7 +249,8 @@ git commit -m "feat: map event batch ids to timestamps"
 **Interfaces:**
 - Consumes: existing `StateStore`, `Folder`, `MessageHeader`, `MailboxId`.
 - Produces:
-  - `pub enum StateChange { UpsertMailbox { folder: Folder, uidvalidity: u32 }, UpsertHeader { header: MessageHeader }, RemoveHeaderEverywhere { element_id: String }, RemoveOtherPlacements { element_id: String, keep_list_ids: Vec<String> } }`
+  - `pub struct MailPlacement { pub mailbox_list_id: String, pub header: MessageHeader }` (no `Debug`)
+  - `pub enum StateChange { UpsertMailbox { folder: Folder, uidvalidity: u32 }, UpsertHeader { mailbox_list_id: String, header: MessageHeader }, RemoveHeaderEverywhere { element_id: String }, RemoveOtherPlacements { element_id: String, keep_list_ids: Vec<String> } }`
   - `StateStore::apply_batch(&self, account_id: i64, group_id: &str, batch_id: &str, changes: &[StateChange]) -> Result<()>`
   - `StateStore::remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()>`
   - `SyncReport` keeps its fields; folder reconciliation is observable in the store.
@@ -264,10 +265,10 @@ async fn apply_batch_writes_changes_and_last_batch_in_one_transaction() {
     let store = SqliteStateStore::open_in_memory().await.unwrap();
     let account = store.upsert_account("owner@example.invalid").await.unwrap();
     let folder = Folder { list_id: "list".into(), name: "Inbox".into(), kind: FolderKind::Inbox };
-    let header = header("list", "e1");
+    let header = header("mail-list", "e1");
     store.apply_batch(account, "group", "batch-1", &[
         StateChange::UpsertMailbox { folder, uidvalidity: 7 },
-        StateChange::UpsertHeader { header },
+        StateChange::UpsertHeader { mailbox_list_id: "list".into(), header },
     ]).await.unwrap();
 
     let mailbox = store.mailboxes(account).await.unwrap().remove(0);
@@ -285,7 +286,7 @@ async fn apply_batch_rolls_back_updates_when_a_later_change_fails() {
     let folder = Folder { list_id: "list".into(), name: "Inbox".into(), kind: FolderKind::Inbox };
     let error = store.apply_batch(account, "group", "batch-1", &[
         StateChange::UpsertMailbox { folder, uidvalidity: 7 },
-        StateChange::UpsertHeader { header: header("list", "e1") },
+        StateChange::UpsertHeader { mailbox_list_id: "list".into(), header: header("mail-list", "e1") },
     ]).await.unwrap_err();
     assert!(matches!(error, Error::Storage(_)));
     assert!(store.mailboxes(account).await.unwrap().is_empty());
@@ -298,7 +299,7 @@ Add:
 - `apply_batch_assigns_new_uids_in_received_order`: two new headers in reverse time order in one batch; the older header gets UID 1 and the newer UID 2.
 - `apply_batch_removes_other_placements`: two mailboxes, same element id, `keep_list_ids` only the first; second row gone.
 - `apply_batch_removes_a_mailbox_and_its_messages` via `remove_mailbox`.
-- `apply_batch_skips_unknown_mailbox`: `UpsertHeader` whose `header.list_id` is not stored does not error and writes no row.
+- `apply_batch_skips_unknown_mailbox`: `UpsertHeader` whose `mailbox_list_id` is not stored does not error and writes no row.
 - `upsert_mailbox_updates_name_and_kind_without_touching_uid_state`.
 - `sync_removes_mailboxes_missing_from_source` in `tests/sync.rs`: pre-store two mailboxes/messages, source returns one folder, after `sync` the other mailbox and its messages are gone.
 
@@ -310,8 +311,8 @@ Expected: FAIL because `apply_batch`, `remove_mailbox`, and folder reconciliatio
 - [ ] **Step 3: Implement the SQLite batch transaction**
 
 - Extract the body of `assign_uid` into `async fn assign_uid_in<'e, E: Executor<'e, Database = Sqlite>>(&self, executor: E, mailbox: MailboxId, header: &MessageHeader) -> Result<u32>`; keep `assign_uid` as `begin` + helper + `commit`.
-- `apply_batch` begins one transaction, applies changes, then calls the `last_batch` upsert with the same executor, then commits. Apply all `UpsertMailbox` changes first, then every other change in its original order, so a new folder and its mail can arrive in the same batch regardless of update order. Within the header pass, sort `UpsertHeader` changes by `(header.list_id, header.received_at_ms, header.element_id)` so new UIDs follow arrival order; existing UIDs are untouched.
-- `UpsertHeader` looks up `mailboxes.id` by `(account_id, header.list_id)`; if absent, skip silently. Existing header update keeps the established partial/complete envelope rules.
+- `apply_batch` begins one transaction, applies changes, then calls the `last_batch` upsert with the same executor, then commits. Apply all `UpsertMailbox` changes first, then every other change in its original order, so a new folder and its mail can arrive in the same batch regardless of update order. Within the header pass, sort `UpsertHeader` changes by `(mailbox_list_id, header.received_at_ms, header.element_id)` so new UIDs follow arrival order; existing UIDs are untouched.
+- `UpsertHeader` resolves the mailbox by `(account_id, mailbox_list_id)`. `header.list_id` is the Mail's own list id and is stored in `messages.tuta_list_id` for later `content()` reloads; it is never used to resolve the mailbox. If the mailbox is absent, skip silently. Existing header update keeps the established partial/complete envelope rules.
 - `RemoveHeaderEverywhere` deletes `messages` for the account by `tuta_element_id`.
 - `RemoveOtherPlacements` deletes rows for the element id whose mailbox `list_id` is not in `keep_list_ids`; build the `NOT IN` placeholders with runtime SQL.
 - `RemoveMailbox`/`remove_mailbox` delete the mailbox's messages then the mailbox row, in one transaction.
@@ -347,26 +348,26 @@ git commit -m "feat: apply event batches transactionally"
 - Consumes: `LoggedInSdk::mail_facade().get_crypto_entity_client()`, `header_from_parts`, `folder_from_parts`, `mail_is_intact`.
 - Produces:
   - `#[async_trait] pub trait EventLookup: Send + Sync` with:
-    - `async fn headers_for_mail(&self, mail_list_id: &str, mail_element_id: &str) -> Result<Option<Vec<MessageHeader>>>`
-    - `async fn header_for_entry(&self, entry_list_id: &str, entry_element_id: &str) -> Result<Option<MessageHeader>>`
+    - `async fn headers_for_mail(&self, mail_list_id: &str, mail_element_id: &str) -> Result<Option<Vec<MailPlacement>>>`
+    - `async fn header_for_entry(&self, entry_list_id: &str, entry_element_id: &str) -> Result<Option<MailPlacement>>`
     - `async fn folder(&self, set_list_id: &str, set_element_id: &str) -> Result<Option<Folder>>`
   - `pub struct TutaEventLookup { logged: Arc<LoggedInSdk> }` with `new`.
 
 - [ ] **Step 1: Write the failing helper test**
 
-Add a pure helper `fn dedupe_placements(headers: Vec<MessageHeader>) -> Vec<MessageHeader>` that keeps the first header per `list_id`, and test:
+Add a pure helper `fn dedupe_placements(placements: Vec<MailPlacement>) -> Vec<MailPlacement>` that keeps the first placement per `mailbox_list_id`, and test:
 
 ```rust
 #[test]
-fn deduplicates_headers_for_the_same_mailbox() {
-    let headers = dedupe_placements(vec![
-        header("list-a", "m1"),
-        header("list-a", "m1"),
-        header("list-b", "m1"),
+fn deduplicates_placements_for_the_same_mailbox() {
+    let placements = dedupe_placements(vec![
+        placement("list-a", "mail-list", "m1"),
+        placement("list-a", "mail-list", "m1"),
+        placement("list-b", "mail-list", "m1"),
     ]);
-    assert_eq!(headers.len(), 2);
-    assert_eq!(headers[0].list_id, "list-a");
-    assert_eq!(headers[1].list_id, "list-b");
+    assert_eq!(placements.len(), 2);
+    assert_eq!(placements[0].mailbox_list_id, "list-a");
+    assert_eq!(placements[1].mailbox_list_id, "list-b");
 }
 ```
 
@@ -377,12 +378,12 @@ Expected: FAIL because the module does not exist.
 
 - [ ] **Step 3: Implement `TutaEventLookup`**
 
-- `headers_for_mail`: load `Mail` by `IdTupleGenerated::new(GeneratedId(mail_list_id), GeneratedId(mail_element_id))`. If `mail_is_intact` is false, return `Ok(None)` so the processor skips it and keeps the existing row. For each `mail.sets` tuple, load the `MailSetEntry`; use `entry._id.list_id` as the header's `list_id`; build with `header_from_parts(list_id, mail_element_id, mail.receivedDate, mail.subject, mail.sender, mail.firstRecipient, mail.unread)`. Skip entries without `_id`; run `dedupe_placements` and return `Ok(Some(headers))`, where an empty vector means the mail genuinely has no placements. If any placement entry fails to load, return an error for the whole mail instead of returning a partial placement list, so the processor never removes a folder because one entry could not be read.
-- `header_for_entry`: load `MailSetEntry` by `IdTupleCustom::new(GeneratedId(entry_list_id), CustomId(entry_element_id))`, then its `Mail`. Return `None` when the mail is not intact or has no `_id`. Use `entry_list_id` as the header's `list_id` and the mail's element id as `element_id`.
+- `headers_for_mail`: load `Mail` by `IdTupleGenerated::new(GeneratedId(mail_list_id), GeneratedId(mail_element_id))`. If `mail_is_intact` is false, return `Ok(None)` so the processor skips it and keeps the existing row. `Mail.sets` is a `ListElementAssociationGenerated` to **`MailSet` (type 429)**, not to `MailSetEntry` (confirmed by the pinned type model: field 1465, `refTypeId: 429`). For each `mail.sets` tuple, load the `MailSet`; its `entries` value is the folder's entries list id, which becomes `MailPlacement.mailbox_list_id`. Build the header with `header_from_parts(mail_id.list_id, mail_element_id, mail.receivedDate, mail.subject, mail.sender, mail.firstRecipient, mail.unread)`; `mail_id.list_id` is the Mail's own list id stored in `messages.tuta_list_id`, never the mailbox id. Skip sets whose `entries` list id is empty; run `dedupe_placements` and return `Ok(Some(placements))`, where an empty vector means the mail genuinely has no placements. If any placement set fails to load, return an error for the whole mail instead of returning a partial placement list, so the processor never removes a folder because one set could not be read.
+- `header_for_entry`: load `MailSetEntry` by `IdTupleCustom::new(GeneratedId(entry_list_id), CustomId(entry_element_id))`, then its `Mail`. Return `None` when the mail is not intact or has no `_id`. Return `MailPlacement { mailbox_list_id: entry_list_id.to_string(), header }`, where the header's `list_id` is the Mail's own list id and its `element_id` is the Mail's element id (never the entry id).
 - `folder`: load `MailSet` by `IdTupleGenerated::new(GeneratedId(set_list_id), GeneratedId(set_element_id))` and return `folder_from_parts(set.entries.as_str(), &set.name, set.folderType)`.
 - Map every SDK failure to `Error::Network("event entity unavailable".into())`; no ids, addresses, or subjects in the error.
 
-Add a `FakeEventLookup` to `tests/support/mod.rs` with maps keyed by the three tuple pairs plus an optional failure flag.
+Add a `FakeEventLookup` to `tests/support/mod.rs` with maps keyed by the three tuple pairs plus an optional failure flag. Builders return `MailPlacement` and preserve the three-branch contract (`Ok(None)` default).
 
 - [ ] **Step 4: Run tests and checks**
 
@@ -406,7 +407,7 @@ git commit -m "feat: reload entities for event updates"
 - Test: `tests/event_sync.rs`
 
 **Interfaces:**
-- Consumes: `EventBatch`, `EventLookup`, `StateStore::apply_batch`, `StateChange`, `MAIL_TYPE_ID`, `MAIL_SET_TYPE_ID`, `MAIL_SET_ENTRY_TYPE_ID`.
+- Consumes: `EventBatch`, `EventLookup`, `MailPlacement`, `StateStore::apply_batch`, `StateChange`, `MAIL_TYPE_ID`, `MAIL_SET_TYPE_ID`, `MAIL_SET_ENTRY_TYPE_ID`.
 - Produces:
   - `pub struct EventReport { pub changes: usize, pub skipped: usize }`
   - `pub struct EventProcessor { pub store: Arc<dyn StateStore> }` with `new` and
@@ -422,21 +423,21 @@ async fn mail_set_entry_create_assigns_a_uid() {
     let store = Arc::new(FakeStateStore::new());
     let account = store.upsert_account("owner@example.invalid").await.unwrap();
     store.upsert_mailbox(account, &folder("list-a"), 7).await.unwrap();
-    let lookup = FakeEventLookup::new().with_entry_header("list-a", "entry-1", header("list-a", "mail-1"));
+    let lookup = FakeEventLookup::new().with_entry_placement("list-a", "entry-1", placement("list-a", "mail-list", "mail-1"));
     let batch = batch(vec![event("tutanota", MAIL_SET_ENTRY_TYPE_ID, "list-a", "entry-1", EntityOperation::Create)]);
 
     let report = EventProcessor::new(store.clone()).apply(account, &lookup, 7, &batch).await.unwrap();
 
     assert_eq!(report.changes, 1);
     let mailbox = store.mailbox_id(account, "list-a");
-    assert_eq!(store.uid_for(mailbox, "list-a", "mail-1"), Some(1));
+    assert_eq!(store.uid_for(mailbox, "mail-list", "mail-1"), Some(1));
     assert_eq!(store.last_batches_for(account).get("group-1").map(String::as_str), Some("batch-1"));
 }
 ```
 
 Add tests:
 - `mail_set_create_upserts_a_folder`.
-- `mail_update_adds_every_placement_and_removes_old_ones`: lookup returns placements `list-a` and `list-b`; store already has `list-a`, `list-b`, `list-c` for the same element; after apply, `list-c` row is gone and `list-a`/`list-b` keep their UIDs.
+- `mail_update_adds_every_placement_and_removes_old_ones`: lookup returns placements in mailboxes `list-a` and `list-b`; store already has `list-a`, `list-b`, `list-c` for the same element; after apply, `list-c` row is gone and `list-a`/`list-b` keep their UIDs.
 - `mail_update_with_no_placements_removes_the_mail`.
 - `unreadable_mail_is_skipped_and_keeps_the_existing_row`: lookup returns `Ok(None)`; the stored row survives, `skipped == 1`, and the batch is persisted.
 - `mail_delete_removes_every_placement`.
@@ -451,17 +452,29 @@ Expected: FAIL because `EventProcessor` does not exist.
 
 - [ ] **Step 3: Implement `EventProcessor::apply`**
 
-Process events in order into a `Vec<StateChange>`:
+Process events in order. First upsert folders immediately, then coalesce all mail events per `element_id` so one batch never emits both a removal and an upsert for the same element. Use a map `element_id -> MailAction`, where:
+
+```text
+enum MailAction {
+    Placements(Vec<MailPlacement>), // authoritative placements for this element
+    Delete,                         // the Mail itself was deleted
+}
+```
 
 - `application == TUTANOTA_APP`, `type_id == MAIL_SET_TYPE_ID`, `Create|Update`: `lookup.folder(list_id, element_id)`; `Some(folder)` → `UpsertMailbox`; `None` or error → skip.
 - `MAIL_SET_TYPE_ID`, `Delete`: skip (folder deletion is reconciled by `sync`).
-- `MAIL_TYPE_ID`, `Create|Update`: `lookup.headers_for_mail(list_id, element_id)`. `Ok(Some(headers))` with headers → one `UpsertHeader` per header plus `RemoveOtherPlacements { element_id, keep_list_ids }`. `Ok(Some(empty))` → `RemoveHeaderEverywhere`. `Ok(None)` or `Err` → skip and keep the existing row.
-- `MAIL_TYPE_ID`, `Delete`: `RemoveHeaderEverywhere`.
-- `MAIL_SET_ENTRY_TYPE_ID`, `Create|Update`: `lookup.header_for_entry(list_id, element_id)`; `Some(header)` → `UpsertHeader`; `None` or error → skip.
+- `MAIL_TYPE_ID`, `Create|Update`: `lookup.headers_for_mail(list_id, element_id)`. `Ok(Some(placements))` replaces the element's action with `Placements(placements)`. `Ok(None)` or `Err` → skip and keep the existing action/row.
+- `MAIL_TYPE_ID`, `Delete`: set the element's action to `Delete`.
+- `MAIL_SET_ENTRY_TYPE_ID`, `Create|Update`: `lookup.header_for_entry(list_id, element_id)`; `Some(placement)` adds that placement to the element's `Placements` (create the entry if absent; keep existing placements; dedupe by `mailbox_list_id`); `None` or error → skip.
 - `MAIL_SET_ENTRY_TYPE_ID`, `Delete`: skip; the accompanying `Mail` update/sync reconciles placement.
 - anything else: skip.
 
-Call `store.apply_batch(account_id, &batch.owner_group_id, &batch.batch_id, &changes)` exactly once, even when `changes` is empty. Return `changes.len()` and the skipped count. Never log ids, subjects, or addresses.
+After the event loop, turn each `MailAction` into changes:
+- `Delete` → `RemoveHeaderEverywhere { element_id }`.
+- `Placements(empty)` → `RemoveHeaderEverywhere { element_id }`.
+- `Placements(placements)` → one `UpsertHeader { mailbox_list_id, header }` per placement plus one `RemoveOtherPlacements { element_id, keep_list_ids }` with the placements' mailbox list ids.
+
+Then call `store.apply_batch(account_id, &batch.owner_group_id, &batch.batch_id, &changes)` exactly once, even when `changes` is empty. Return `changes.len()` and the skipped count. Never log ids, subjects, or addresses.
 
 - [ ] **Step 4: Run tests and checks**
 
