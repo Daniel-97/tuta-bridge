@@ -9,6 +9,7 @@ mod support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tuta_bridge::adapters::tuta::generated_id::{timestamp_to_generated_id, BATCH_EXPIRY_MS};
 use tuta_bridge::app::watch::{BackoffPolicy, WatchUseCase};
@@ -423,6 +424,63 @@ async fn missing_marker_runs_a_baseline_sync() {
         session.markers_for_call(0).get("group1"),
         Some(&resume_id())
     );
+}
+
+#[tokio::test]
+async fn connect_failure_is_retried_with_backoff() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, _marker) = synced_account(&state).await;
+
+    // The first connect fails while the network is down; the second
+    // connects, delivers one batch, and stops with a fatal error.
+    let session = event_session();
+    session.push_connect_error(Error::Network("event stream connect failed".into()));
+    session.push_script(vec![
+        Ok(EventFrame::Batch(empty_batch("batch-4", "group1"))),
+        Err(Error::Login("stop".into())),
+    ]);
+
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+
+    // The failed connect was retried, not treated as fatal.
+    assert_eq!(session.events_calls(), 2);
+    assert!(matches!(error, Error::Login(_)));
+    // The second connection's batch was applied.
+    assert_eq!(
+        state
+            .last_batch(account, "group1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("batch-4")
+    );
+}
+
+#[tokio::test]
+async fn stop_future_is_honored() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let _ = synced_account(&state).await;
+
+    // The connection stays silent forever; only the stop future can end
+    // the watch loop.
+    let session = event_session();
+    session.push_pending();
+
+    let result = use_case(&session, credentials, config_path, state.clone())
+        .run_until(tokio::time::sleep(Duration::ZERO))
+        .await;
+    assert!(result.is_ok());
+
+    // The stream was opened once and no batch was applied.
+    assert_eq!(session.events_calls(), 1);
+    assert!(!state.calls().iter().any(|call| call == "apply_batch"));
 }
 
 #[tokio::test]

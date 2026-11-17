@@ -896,6 +896,10 @@ pub struct FakeEventSession {
     pub groups: Vec<String>,
     /// One script per `events()` call, consumed in order.
     pub scripts: Mutex<VecDeque<Vec<Result<EventFrame>>>>,
+    /// Errors the next `events()` calls return before replaying a script.
+    pub connect_errors: Mutex<VecDeque<Error>>,
+    /// Calls whose stream never resolves, consumed before scripts.
+    pub pending_calls: Mutex<VecDeque<()>>,
     /// Lookup handed out with every stream.
     pub lookup: Arc<FakeEventLookup>,
     /// Mail source used for baseline syncs.
@@ -910,6 +914,8 @@ impl FakeEventSession {
             account,
             groups,
             scripts: Mutex::new(VecDeque::new()),
+            connect_errors: Mutex::new(VecDeque::new()),
+            pending_calls: Mutex::new(VecDeque::new()),
             lookup: Arc::new(FakeEventLookup::new()),
             mail: Arc::new(FakeMailSource::new()),
             marker_calls: Mutex::new(Vec::new()),
@@ -919,6 +925,18 @@ impl FakeEventSession {
     /// Queue the frames the next `events()` call will replay.
     pub fn push_script(&self, frames: Vec<Result<EventFrame>>) {
         self.scripts.lock().unwrap().push_back(frames);
+    }
+
+    /// Make the next `events()` call fail with `error` before any frames
+    /// are replayed; scripts queued for that call stay untouched.
+    pub fn push_connect_error(&self, error: Error) {
+        self.connect_errors.lock().unwrap().push_back(error);
+    }
+
+    /// Make the next `events()` call hand out a stream that never
+    /// resolves; only a stop future can end such a watch loop.
+    pub fn push_pending(&self) {
+        self.pending_calls.lock().unwrap().push_back(());
     }
 
     /// Replace the lookup handed out by `events()`.
@@ -971,6 +989,15 @@ impl Session for FakeEventSessionHandle {
             .lock()
             .unwrap()
             .push(last_batches.clone());
+        if let Some(error) = self.0.connect_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if self.0.pending_calls.lock().unwrap().pop_front().is_some() {
+            return Ok(EventHandles {
+                stream: Box::new(PendingEventStream),
+                lookup: Arc::clone(&self.0.lookup) as Arc<dyn EventLookup>,
+            });
+        }
         let frames = self
             .0
             .scripts
@@ -1002,6 +1029,16 @@ impl EventStream for ScriptedEventStream {
         self.frames
             .pop_front()
             .expect("script ran out of frames; end every script with an error")
+    }
+}
+
+/// A stream that never yields a frame; only a stop future can end it.
+struct PendingEventStream;
+
+#[async_trait::async_trait]
+impl EventStream for PendingEventStream {
+    async fn next_frame(&mut self) -> Result<EventFrame> {
+        std::future::pending().await
     }
 }
 

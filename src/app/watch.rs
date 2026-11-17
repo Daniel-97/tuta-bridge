@@ -116,34 +116,43 @@ impl WatchUseCase {
         let mut stop = pin!(stop);
         let mut attempt: u32 = 0;
         loop {
-            let handles = session.events(&batches, self.clock.now_ms()).await?;
-            let lookup = handles.lookup;
-            let mut stream = handles.stream;
-            loop {
-                let frame = tokio::select! {
-                    () = &mut stop => return Ok(()),
-                    frame = stream.next_frame() => frame,
-                };
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(e) if is_fatal(&e) => return Err(e),
-                    // A network error is retried on a fresh connection.
-                    Err(_) => break,
-                };
-                // Any successful frame proves the connection works again.
-                attempt = 0;
-                match frame {
-                    EventFrame::Batch(batch) => {
-                        let report = processor
-                            .apply(account_id, lookup.as_ref(), event_uidvalidity, &batch)
-                            .await?;
-                        batches.insert(batch.owner_group_id.clone(), batch.batch_id.clone());
-                        if report.changes > 0 {
-                            println!("applied {} changes", report.changes);
+            // A failed connect is retried like a dropped connection: it
+            // shares the backoff below with frame errors.
+            let connected = match session.events(&batches, self.clock.now_ms()).await {
+                Ok(handles) => Some(handles),
+                Err(e) if is_fatal(&e) => return Err(e),
+                Err(_) => None,
+            };
+
+            if let Some(handles) = connected {
+                let lookup = handles.lookup;
+                let mut stream = handles.stream;
+                loop {
+                    let frame = tokio::select! {
+                        () = &mut stop => return Ok(()),
+                        frame = stream.next_frame() => frame,
+                    };
+                    let frame = match frame {
+                        Ok(frame) => frame,
+                        Err(e) if is_fatal(&e) => return Err(e),
+                        // A network error is retried on a fresh connection.
+                        Err(_) => break,
+                    };
+                    // Any successful frame proves the connection works again.
+                    attempt = 0;
+                    match frame {
+                        EventFrame::Batch(batch) => {
+                            let report = processor
+                                .apply(account_id, lookup.as_ref(), event_uidvalidity, &batch)
+                                .await?;
+                            batches.insert(batch.owner_group_id.clone(), batch.batch_id.clone());
+                            if report.changes > 0 {
+                                println!("applied {} changes", report.changes);
+                            }
                         }
+                        EventFrame::InitialSyncDone => println!("event stream caught up"),
+                        EventFrame::Ignored => continue,
                     }
-                    EventFrame::InitialSyncDone => println!("event stream caught up"),
-                    EventFrame::Ignored => continue,
                 }
             }
 
