@@ -20,8 +20,9 @@ use tuta_bridge::ports::event_stream::EventStream;
 type ServerSocket = WebSocketStream<tokio::net::TcpStream>;
 
 /// A valid `entityUpdate` batch with one Mail creation and one
-/// MailSetEntry deletion, in the SDK wire format.
-const BATCH_JSON: &str = r#"{"1484":0,"1485":"batch1","1486":"group1","2557":7,"2558":"hash","1487":[{"463":null,"464":"tutanota","466":"list1","467":"mail1","624":0,"2556":97,"2617":null,"2701":null,"2618":null},{"463":null,"464":"tutanota","466":"list1","467":"entry1","624":2,"2556":1450,"2617":null,"2701":null,"2618":null}]}"#;
+/// MailSetEntry deletion. The real server sends every `NumberString` field
+/// as a JSON string, so this mirrors the actual wire shape.
+const BATCH_JSON: &str = r#"{"1484":"0","1485":"batch1","1486":"group1","2557":"7","2558":"hash","1487":[{"463":"u1","464":"tutanota","466":"list1","467":"mail1","624":"0","2556":"97","2617":null,"2701":null,"2618":null},{"463":"u2","464":"tutanota","466":"list1","467":"entry1","624":"2","2556":"1450","2617":null,"2701":null,"2618":null}]}"#;
 
 /// Start a loopback websocket server on a random port that runs `script`
 /// on the first accepted connection, and return its base URL.
