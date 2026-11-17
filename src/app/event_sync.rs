@@ -99,8 +99,9 @@ impl EventProcessor {
                     None => skipped += 1,
                 },
                 MAIL_SET_ENTRY_TYPE_ID => match entry_placement(lookup, event).await {
-                    // An entry event adds one placement; a mail deleted in
-                    // the same batch stays deleted.
+                    // An entry event adds one placement; a mail deleted
+                    // in the same batch stays deleted, and a placement
+                    // the element already has changes nothing.
                     Some(placement) => {
                         if add_placement(&mut actions, &event.element_id, placement) {
                             applied += 1;
@@ -200,9 +201,10 @@ async fn entry_placement(lookup: &dyn EventLookup, event: &EntityEvent) -> Optio
 /// Record one entry placement for `element_id`.
 ///
 /// The placement joins the element's existing placements, deduplicated by
-/// `mailbox_list_id`; a missing entry starts one. Returns `false` when the
-/// element's mail was deleted in the same batch, in which case the delete
-/// stays authoritative and the event counts as skipped.
+/// `mailbox_list_id`; a missing entry starts one. Returns `false` when no
+/// placement was added — the element's mail was deleted in the same batch
+/// or the mailbox already has a placement — in which case the event
+/// counts as skipped.
 fn add_placement(
     actions: &mut HashMap<String, MailAction>,
     element_id: &str,
@@ -214,12 +216,12 @@ fn add_placement(
     }
     if let Some(MailAction::Placements(placements)) = actions.get_mut(element_id) {
         // The first placement per mailbox wins, like the lookup's own
-        // dedupe.
+        // dedupe; a repeat adds nothing and counts as skipped.
         if placements
             .iter()
             .any(|stored| stored.mailbox_list_id == placement.mailbox_list_id)
         {
-            return true;
+            return false;
         }
         placements.push(placement);
         return true;

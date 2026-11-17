@@ -446,6 +446,51 @@ async fn unknown_types_and_entry_deletes_are_skipped_but_persisted() {
 }
 
 #[tokio::test]
+async fn duplicate_entry_placement_counts_as_skipped() {
+    let store = Arc::new(FakeStateStore::new());
+    let account = account(&store).await;
+    store
+        .upsert_mailbox(account, &folder("list-a"), 7)
+        .await
+        .unwrap();
+    let lookup = FakeEventLookup::new().with_entry_placement(
+        "list-a",
+        "entry-1",
+        placement("list-a", "mail-list", "mail-1"),
+    );
+    // A create followed by an update for the same entry: both resolve
+    // to the same placement, so the update adds nothing new.
+    let batch = batch(vec![
+        event(
+            "tutanota",
+            MAIL_SET_ENTRY_TYPE_ID,
+            "list-a",
+            "entry-1",
+            EntityOperation::Create,
+        ),
+        event(
+            "tutanota",
+            MAIL_SET_ENTRY_TYPE_ID,
+            "list-a",
+            "entry-1",
+            EntityOperation::Update,
+        ),
+    ]);
+
+    let report = EventProcessor::new(store.clone())
+        .apply(account, &lookup, 7, &batch)
+        .await
+        .unwrap();
+
+    // Only the create added a placement; the duplicate counts as
+    // skipped, so the two events still sum to the batch size.
+    assert_eq!(report.changes, 1);
+    assert_eq!(report.skipped, 1);
+    let mailbox = store.mailbox_id(account, "list-a");
+    assert_eq!(store.uid_for(mailbox, "mail-list", "mail-1"), Some(1));
+}
+
+#[tokio::test]
 async fn reapplying_the_same_batch_does_not_change_uids() {
     let store = Arc::new(FakeStateStore::new());
     let account = account(&store).await;
