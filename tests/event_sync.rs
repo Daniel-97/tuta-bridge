@@ -164,7 +164,8 @@ async fn mail_set_create_upserts_a_folder() {
         report,
         EventReport {
             changes: 1,
-            skipped: 0
+            skipped: 0,
+            lookup_failures: 0
         }
     );
     let mailboxes = store.mailboxes(account).await.unwrap();
@@ -214,7 +215,8 @@ async fn mail_update_adds_every_placement_and_removes_old_ones() {
         report,
         EventReport {
             changes: 1,
-            skipped: 0
+            skipped: 0,
+            lookup_failures: 0
         }
     );
     let list_a = store.mailbox_id(account, "list-a");
@@ -250,7 +252,8 @@ async fn mail_update_with_no_placements_removes_the_mail() {
         report,
         EventReport {
             changes: 1,
-            skipped: 0
+            skipped: 0,
+            lookup_failures: 0
         }
     );
     assert_eq!(
@@ -287,7 +290,9 @@ async fn unreadable_mail_is_skipped_and_keeps_the_existing_row() {
         report,
         EventReport {
             changes: 0,
-            skipped: 1
+            skipped: 1,
+            // An unreadable mail (Ok(None)) is not a lookup failure.
+            lookup_failures: 0
         }
     );
     assert_eq!(
@@ -328,7 +333,8 @@ async fn mail_delete_removes_every_placement() {
         report,
         EventReport {
             changes: 1,
-            skipped: 0
+            skipped: 0,
+            lookup_failures: 0
         }
     );
     assert_eq!(
@@ -354,13 +360,31 @@ async fn lookup_failure_is_skipped_and_the_batch_is_still_persisted() {
     let account = account(&store).await;
     filed(&store, account, "list-a", "mail-list", "mail-1").await;
     let lookup = FakeEventLookup::new().with_failure();
-    let batch = batch(vec![event(
-        "tutanota",
-        MAIL_TYPE_ID,
-        "mail-list",
-        "mail-1",
-        EntityOperation::Update,
-    )]);
+    // Every lookup-using event kind fails: a mail-set create, a mail
+    // update, and an entry create.
+    let batch = batch(vec![
+        event(
+            "tutanota",
+            MAIL_SET_TYPE_ID,
+            "sets",
+            "set-1",
+            EntityOperation::Create,
+        ),
+        event(
+            "tutanota",
+            MAIL_TYPE_ID,
+            "mail-list",
+            "mail-1",
+            EntityOperation::Update,
+        ),
+        event(
+            "tutanota",
+            MAIL_SET_ENTRY_TYPE_ID,
+            "list-a",
+            "entry-1",
+            EntityOperation::Create,
+        ),
+    ]);
 
     let report = EventProcessor::new(store.clone())
         .apply(account, &lookup, 7, &batch)
@@ -371,7 +395,10 @@ async fn lookup_failure_is_skipped_and_the_batch_is_still_persisted() {
         report,
         EventReport {
             changes: 0,
-            skipped: 1
+            skipped: 3,
+            // Every skipped event was skipped because its lookup
+            // failed.
+            lookup_failures: 3
         }
     );
     assert_eq!(
@@ -423,7 +450,10 @@ async fn unknown_types_and_entry_deletes_are_skipped_but_persisted() {
         report,
         EventReport {
             changes: 0,
-            skipped: 3
+            skipped: 3,
+            // Unknown types, foreign applications, and entry deletes
+            // never reach a lookup, so none counts as a failure.
+            lookup_failures: 0
         }
     );
     assert_eq!(store.mailboxes(account).await.unwrap().len(), 0);

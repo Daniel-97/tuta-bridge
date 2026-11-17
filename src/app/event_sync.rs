@@ -26,7 +26,11 @@ use crate::ports::state_store::StateStore;
 /// persist several (one upsert per placement plus a guard that drops stale
 /// placements). `skipped` counts the events left untouched, so
 /// `changes + skipped` always equals the number of events in the batch.
-/// Both fields are fixed-size so a report never carries entity data.
+/// `lookup_failures` counts the skipped events whose entity lookup failed
+/// with an error — unreadable entities and unhandled events stay out of
+/// it — because a long run of them desyncs the index and the watch loop
+/// heals that with a resync. All fields are fixed-size so a report never
+/// carries entity data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventReport {
     /// Events that produced a state change.
@@ -34,6 +38,9 @@ pub struct EventReport {
     /// Events skipped because their entity was unreadable, could not be
     /// loaded, or is not handled by the bridge.
     pub skipped: usize,
+    /// Events skipped because their lookup failed with an error; a
+    /// subset of `skipped`.
+    pub lookup_failures: usize,
 }
 
 /// Coalesced effect of one element's mail events within a batch.
@@ -42,6 +49,20 @@ enum MailAction {
     Placements(Vec<MailPlacement>),
     /// The mail itself was deleted.
     Delete,
+}
+
+/// Result of one event's entity lookup.
+///
+/// `Absent` covers every deliberate skip — an unreadable entity
+/// (`Ok(None)`), an operation the bridge does not act on — while `Failed`
+/// marks a lookup error, which the report counts separately.
+enum LookupOutcome<T> {
+    /// The lookup answered and the event resolved to `value`.
+    Found(T),
+    /// The entity is unreadable or the operation needs no lookup.
+    Absent,
+    /// The lookup failed with an error.
+    Failed,
 }
 
 /// Applies entity events to the stored header index.
@@ -66,7 +87,8 @@ impl EventProcessor {
     /// entry create — and the delete wins because `apply_batch` applies
     /// removals after upserts and entry ids never collide with mail ids,
     /// so the two actions never overwrite each other. Unreadable or
-    /// failed lookups are skipped and keep the stored rows. Afterwards
+    /// failed lookups are skipped and keep the stored rows; failed ones
+    /// are counted in [`EventReport::lookup_failures`]. Afterwards
     /// every action becomes state changes and `apply_batch` runs exactly
     /// once, even when nothing changed, so the batch id always advances.
     pub async fn apply(
@@ -80,6 +102,7 @@ impl EventProcessor {
         let mut actions: HashMap<String, MailAction> = HashMap::new();
         let mut applied = 0;
         let mut skipped = 0;
+        let mut lookup_failures = 0;
 
         for event in &batch.events {
             if event.application != TUTANOTA_APP {
@@ -88,31 +111,43 @@ impl EventProcessor {
             }
             match event.type_id {
                 MAIL_SET_TYPE_ID => match mail_set_change(lookup, uidvalidity, event).await {
-                    Some(change) => {
+                    LookupOutcome::Found(change) => {
                         changes.push(change);
                         applied += 1;
                     }
-                    None => skipped += 1,
+                    LookupOutcome::Absent => skipped += 1,
+                    LookupOutcome::Failed => {
+                        skipped += 1;
+                        lookup_failures += 1;
+                    }
                 },
                 MAIL_TYPE_ID => match mail_action(lookup, event).await {
-                    Some(action) => {
+                    LookupOutcome::Found(action) => {
                         actions.insert(event.element_id.clone(), action);
                         applied += 1;
                     }
-                    None => skipped += 1,
+                    LookupOutcome::Absent => skipped += 1,
+                    LookupOutcome::Failed => {
+                        skipped += 1;
+                        lookup_failures += 1;
+                    }
                 },
                 MAIL_SET_ENTRY_TYPE_ID => match entry_placement(lookup, event).await {
                     // An entry event adds one placement; a mail deleted
                     // in the same batch stays deleted, and a placement
                     // the element already has changes nothing.
-                    Some(placement) => {
+                    LookupOutcome::Found(placement) => {
                         if add_placement(&mut actions, &event.element_id, placement) {
                             applied += 1;
                         } else {
                             skipped += 1;
                         }
                     }
-                    None => skipped += 1,
+                    LookupOutcome::Absent => skipped += 1,
+                    LookupOutcome::Failed => {
+                        skipped += 1;
+                        lookup_failures += 1;
+                    }
                 },
                 _ => skipped += 1,
             }
@@ -131,11 +166,12 @@ impl EventProcessor {
         Ok(EventReport {
             changes: applied,
             skipped,
+            lookup_failures,
         })
     }
 }
 
-/// Resolve a mail-set event into a folder upsert; `None` skips the event.
+/// Resolve a mail-set event into a folder upsert.
 ///
 /// A set the bridge does not store (for example the virtual "All" set)
 /// answers `Ok(None)` and is skipped, as is every failed load. Folder
@@ -144,60 +180,64 @@ async fn mail_set_change(
     lookup: &dyn EventLookup,
     uidvalidity: u32,
     event: &EntityEvent,
-) -> Option<StateChange> {
+) -> LookupOutcome<StateChange> {
     match event.operation {
         EntityOperation::Create | EntityOperation::Update => {
             match lookup.folder(&event.list_id, &event.element_id).await {
-                Ok(Some(folder)) => Some(StateChange::UpsertMailbox {
+                Ok(Some(folder)) => LookupOutcome::Found(StateChange::UpsertMailbox {
                     folder,
                     uidvalidity,
                 }),
-                Ok(None) | Err(_) => None,
+                Ok(None) => LookupOutcome::Absent,
+                Err(_) => LookupOutcome::Failed,
             }
         }
-        EntityOperation::Delete => None,
+        EntityOperation::Delete => LookupOutcome::Absent,
     }
 }
 
-/// Resolve a mail event into the element's new action; `None` skips the
-/// event and keeps the stored rows.
+/// Resolve a mail event into the element's new action.
 ///
 /// The placements reported by the lookup are authoritative for the whole
 /// mail, so they replace whatever earlier events in the same batch
 /// recorded. `Ok(None)` (an unreadable mail) and failed loads are skipped
 /// rather than treated as "no placements".
-async fn mail_action(lookup: &dyn EventLookup, event: &EntityEvent) -> Option<MailAction> {
+async fn mail_action(lookup: &dyn EventLookup, event: &EntityEvent) -> LookupOutcome<MailAction> {
     match event.operation {
         EntityOperation::Create | EntityOperation::Update => {
             match lookup
                 .headers_for_mail(&event.list_id, &event.element_id)
                 .await
             {
-                Ok(Some(placements)) => Some(MailAction::Placements(placements)),
-                Ok(None) | Err(_) => None,
+                Ok(Some(placements)) => LookupOutcome::Found(MailAction::Placements(placements)),
+                Ok(None) => LookupOutcome::Absent,
+                Err(_) => LookupOutcome::Failed,
             }
         }
-        EntityOperation::Delete => Some(MailAction::Delete),
+        EntityOperation::Delete => LookupOutcome::Found(MailAction::Delete),
     }
 }
 
-/// Resolve a mail-set-entry event into one placement; `None` skips the
-/// event.
+/// Resolve a mail-set-entry event into one placement.
 ///
 /// Entry deletes are skipped: the accompanying `Mail` update or a later
 /// sync reconciles the entry's placement.
-async fn entry_placement(lookup: &dyn EventLookup, event: &EntityEvent) -> Option<MailPlacement> {
+async fn entry_placement(
+    lookup: &dyn EventLookup,
+    event: &EntityEvent,
+) -> LookupOutcome<MailPlacement> {
     match event.operation {
         EntityOperation::Create | EntityOperation::Update => {
             match lookup
                 .header_for_entry(&event.list_id, &event.element_id)
                 .await
             {
-                Ok(Some(placement)) => Some(placement),
-                Ok(None) | Err(_) => None,
+                Ok(Some(placement)) => LookupOutcome::Found(placement),
+                Ok(None) => LookupOutcome::Absent,
+                Err(_) => LookupOutcome::Failed,
             }
         }
-        EntityOperation::Delete => None,
+        EntityOperation::Delete => LookupOutcome::Absent,
     }
 }
 
