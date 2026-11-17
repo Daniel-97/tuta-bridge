@@ -195,6 +195,19 @@ fn timestamps_roundtrip_through_generated_ids() {
         assert_eq!(generated_id_timestamp(&id), Some(ts));
     }
     assert_eq!(timestamp_to_generated_id(0), "------------");
+    assert_eq!(timestamp_to_generated_id(1), "------0-----");
+    assert_eq!(timestamp_to_generated_id(1_700_000_000_000), "NjEtLV------");
+}
+
+#[test]
+fn decodes_real_server_batch_ids() {
+    // Live batch id captured from the Tuta event bus (server bytes suffix is
+    // ignored by the decoder). It must decode to its capture time.
+    assert_eq!(generated_id_timestamp("P6f_Itx----9"), Some(1_794_953_789_053));
+    // Markers produced by the earlier wrong-shift encoder decode to 1973 and
+    // must be treated as expired so the next watch start resyncs.
+    assert_eq!(generated_id_timestamp("0cTi85rc----"), Some(112_184_562_103));
+    assert!(batch_is_expired("0cTi85rc----", 1_794_953_789_053));
 }
 
 #[test]
@@ -222,14 +235,14 @@ Expected: FAIL because the module does not exist.
 
 - [ ] **Step 3: Implement the base64ext codec**
 
-Tuta encodes a timestamp as `(timestamp_ms * 4) << 24` in 9 big-endian bytes, standard-base64 encodes them, then maps the standard alphabet onto the sortable base64ext alphabet:
+Tuta's `timestampToHexGeneratedId` builds the id as `(timestamp_ms * 4)` in hex followed by **seven** hex suffix digits (five zeros plus the two server digits) padded to 18 — a 72-bit value of `(timestamp_ms * 4) << 28`, standard-base64 encoded, then mapped onto the sortable base64ext alphabet:
 
 ```text
 std: ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
 ext: -0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz
 ```
 
-Decode by reversing the alphabet, padding to a multiple of four, and base64-decoding exactly nine bytes. Read the first six bytes as a big-endian `u64` and divide by four; ignore the remaining server bytes. `timestamp_to_generated_id` clamps negative timestamps to zero. `batch_is_expired` returns `true` when decoding fails.
+Encode: write `((timestamp_ms as u128) * 4) << 28` as nine big-endian bytes (server bytes zero; clamp negative timestamps to zero), standard-base64 encode, map the alphabet. Decode by reversing the alphabet, padding to a multiple of four, base64-decoding exactly nine bytes, then `n = first five bytes as a big-endian u40` and `timestamp = n * 4 + (byte5 >> 6)` — exactly the reference client's `generatedIdToTimestamp`. Ignore the trailing server bytes. `batch_is_expired` returns `true` when decoding fails.
 
 - [ ] **Step 4: Run tests and checks**
 
