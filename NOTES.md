@@ -55,6 +55,39 @@
 - State DB permissions: directory `0700`, database and WAL/SHM `0600`; pool recycling is disabled and the process umask is restricted.
 - Manual acceptance (2026-11-17): `sync` indexed 18 folders and 1,617 messages; later runs saw new mail arrive (1,620). A repeat sync compared 1,620 existing mappings with **0 UID changes**; `next_uid = max(uid)+1` held for every mailbox. `resync` changed `uidvalidity` for every mailbox and restarted UIDs at 1. The DB has no body/attachment/`.eml` columns; directory is `0700`, database/WAL/SHM `0600`. 1–2 individual messages could not be loaded and were skipped; reconciliation is disabled for incomplete pages so they are not deleted.
 
+## M4 event bus
+
+- `watch` opens one websocket at `/event` with the query parameters
+  `modelVersions` (the client model versions of `sys` and `tutanota`,
+  joined by a `.`), `clientVersion`, `userId`, `accessToken`,
+  `clientName=tuta-bridge`, and `groupsToLastEventBatchIds` as
+  `<group>=<batch>;` pairs. The URL embeds the access token, so it is
+  never logged or echoed: the stream type has no `Debug` impl and every
+  failure maps to a fixed error message.
+- Websocket text frames are `type;payload`. `entityUpdate` (a
+  `WebsocketEntityData` JSON carrying one event batch) and
+  `initialSyncDone` are handled; every other message type is ignored.
+- Only `tutanota` events with these type ids are applied: `Mail` `97`,
+  `MailSet` `429`, `MailSetEntry` `1450`; all other events are skipped and
+  counted. Subscribed groups are the user's memberships plus the user
+  group; the mailing-list group type (`2`) is not subscribed.
+- The server replays batches only for a limited window: a stored marker
+  older than 45 days triggers a resync, and a group without a marker
+  resumes from `timestamp_to_generated_id(now - 5000)`, a stamp that is
+  persisted so a restart does not replay from the beginning.
+- Close-code mapping: `4403`, `4440`, `4470`, `4471`, `4472` are fatal for
+  the session (the user must run `login` again); `4429` is rate limited;
+  every other close is a reconnectable network error. Network errors retry
+  with a 5 s / 20 s / 60 s-capped backoff; all other errors end `watch`.
+- `clientVersion` is `369.261113.0` and must be bumped together with the
+  SDK pin, otherwise the server rejects the connection as an outdated
+  client.
+- Placement model: `Mail.sets` (type-model field 1465) references
+  `MailSet` (`refTypeId: 429`), not `MailSetEntry`; the folder is resolved
+  through `MailSet.entries` (the folder's entries list id), while
+  `messages.tuta_list_id` stays the Mail's own list id so content reloads
+  can still find the mail.
+
 ## M1/M2 manual acceptance (2026-11-16)
 
 - Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.
@@ -62,4 +95,8 @@
 - `dump --folder inbox --limit 3 --out ./out` wrote 3 `.eml` files. The message with a PDF attachment produced a valid 3-page PDF, and the MIME parts included `text/plain` and `text/html`.
 - A second dump over the same folder produced identical filenames and SHA-256 hashes.
 - TOTP input is echoed on the terminal by request; the password remains hidden.
+
+## M4 manual acceptance
+
+Manual acceptance pending; record the results here when run.
 
