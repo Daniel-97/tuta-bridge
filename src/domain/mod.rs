@@ -11,4 +11,4 @@ pub use event::{
     MAIL_TYPE_ID, TUTANOTA_APP,
 };
 pub use mail::{Address, Attachment, Folder, FolderKind, MessageContent, MessageSummary};
-pub use state::{MailboxId, MessageHeader, MessagePage, StoredMailbox, StoredMessage};
+pub use state::{MailboxId, MessageHeader, MessagePage, StateChange, StoredMailbox, StoredMessage};

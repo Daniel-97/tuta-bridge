@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::SecretString;
 use tuta_bridge::domain::{
     AccountId, AccountInfo, Error, Folder, MailboxId, MessageContent, MessageHeader, MessagePage,
-    MessageSummary, Result, StoredCredentials, StoredMailbox, StoredMessage,
+    MessageSummary, Result, StateChange, StoredCredentials, StoredMailbox, StoredMessage,
 };
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::mail_source::MailSource;
@@ -156,6 +156,124 @@ impl FakeStateStore {
             .get(&(mailbox, list_id.to_string(), element_id.to_string()))
             .map(|message| message.uid)
     }
+
+    /// Upsert without recording a call, shared by `upsert_mailbox` and
+    /// `apply_batch`.
+    fn upsert_mailbox_entry(
+        &self,
+        account_id: i64,
+        folder: &Folder,
+        uidvalidity: u32,
+    ) -> MailboxId {
+        let key = (account_id, folder.list_id.clone());
+        let mut mailboxes = self.mailboxes.lock().unwrap();
+        if let Some(mailbox) = mailboxes.get_mut(&key) {
+            mailbox.name = folder.name.clone();
+            mailbox.kind = folder.kind.clone();
+            return mailbox.id;
+        }
+        let mut next_mailbox_id = self.next_mailbox_id.lock().unwrap();
+        let mailbox = StoredMailbox {
+            id: MailboxId(*next_mailbox_id),
+            account_id,
+            list_id: folder.list_id.clone(),
+            name: folder.name.clone(),
+            kind: folder.kind.clone(),
+            uidvalidity,
+            next_uid: 1,
+        };
+        *next_mailbox_id += 1;
+        let id = mailbox.id;
+        mailboxes.insert(key, mailbox);
+        id
+    }
+
+    /// Assign or refresh a header without recording a call.
+    fn assign_uid_entry(&self, mailbox: MailboxId, header: &MessageHeader) -> Result<u32> {
+        let key = (mailbox, header.list_id.clone(), header.element_id.clone());
+        let mut messages = self.messages.lock().unwrap();
+        if let Some(message) = messages.get_mut(&key) {
+            message.header = header.clone();
+            return Ok(message.uid);
+        }
+
+        let uid = {
+            let mut mailboxes = self.mailboxes.lock().unwrap();
+            let stored = mailboxes
+                .values_mut()
+                .find(|stored| stored.id == mailbox)
+                .ok_or_else(|| Error::Storage("mailbox not found".into()))?;
+            let uid = stored.next_uid;
+            stored.next_uid += 1;
+            uid
+        };
+        messages.insert(
+            key,
+            StoredMessage {
+                uid,
+                header: header.clone(),
+                rfc822_size: None,
+            },
+        );
+        Ok(uid)
+    }
+
+    fn remove_mailbox_entry(&self, account_id: i64, mailbox: MailboxId) {
+        self.mailboxes
+            .lock()
+            .unwrap()
+            .retain(|(stored_account_id, _), stored| {
+                !(*stored_account_id == account_id && stored.id == mailbox)
+            });
+        self.messages
+            .lock()
+            .unwrap()
+            .retain(|(stored_mailbox, _, _), _| *stored_mailbox != mailbox);
+    }
+
+    fn remove_element_headers(&self, account_id: i64, element_id: &str) {
+        let account_mailboxes: HashSet<MailboxId> = self
+            .mailboxes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|mailbox| mailbox.account_id == account_id)
+            .map(|mailbox| mailbox.id)
+            .collect();
+        self.messages
+            .lock()
+            .unwrap()
+            .retain(|(mailbox, _, element), _| {
+                !(account_mailboxes.contains(mailbox) && element == element_id)
+            });
+    }
+
+    fn remove_other_placements(&self, account_id: i64, element_id: &str, keep_list_ids: &[String]) {
+        let (account_mailboxes, kept): (HashSet<MailboxId>, HashSet<MailboxId>) = {
+            let mailboxes = self.mailboxes.lock().unwrap();
+            let account_mailboxes = mailboxes
+                .values()
+                .filter(|mailbox| mailbox.account_id == account_id)
+                .map(|mailbox| mailbox.id)
+                .collect();
+            let kept = mailboxes
+                .values()
+                .filter(|mailbox| {
+                    mailbox.account_id == account_id && keep_list_ids.contains(&mailbox.list_id)
+                })
+                .map(|mailbox| mailbox.id)
+                .collect();
+            (account_mailboxes, kept)
+        };
+        self.messages
+            .lock()
+            .unwrap()
+            .retain(|(mailbox, _, element), _| {
+                !(account_mailboxes.contains(mailbox)
+                    && !kept.contains(mailbox)
+                    && element == element_id)
+            });
+    }
 }
 
 impl Default for FakeStateStore {
@@ -186,25 +304,7 @@ impl StateStore for FakeStateStore {
         uidvalidity: u32,
     ) -> Result<MailboxId> {
         self.calls.lock().unwrap().push("upsert_mailbox".into());
-        let key = (account_id, folder.list_id.clone());
-        let mut mailboxes = self.mailboxes.lock().unwrap();
-        if let Some(mailbox) = mailboxes.get(&key) {
-            return Ok(mailbox.id);
-        }
-        let mut next_mailbox_id = self.next_mailbox_id.lock().unwrap();
-        let mailbox = StoredMailbox {
-            id: MailboxId(*next_mailbox_id),
-            account_id,
-            list_id: folder.list_id.clone(),
-            name: folder.name.clone(),
-            kind: folder.kind.clone(),
-            uidvalidity,
-            next_uid: 1,
-        };
-        *next_mailbox_id += 1;
-        let id = mailbox.id;
-        mailboxes.insert(key, mailbox);
-        Ok(id)
+        Ok(self.upsert_mailbox_entry(account_id, folder, uidvalidity))
     }
 
     async fn mailboxes(&self, account_id: i64) -> Result<Vec<StoredMailbox>> {
@@ -223,32 +323,77 @@ impl StateStore for FakeStateStore {
 
     async fn assign_uid(&self, mailbox: MailboxId, header: &MessageHeader) -> Result<u32> {
         self.calls.lock().unwrap().push("assign_uid".into());
-        let key = (mailbox, header.list_id.clone(), header.element_id.clone());
-        let mut messages = self.messages.lock().unwrap();
-        if let Some(message) = messages.get_mut(&key) {
-            message.header = header.clone();
-            return Ok(message.uid);
+        self.assign_uid_entry(mailbox, header)
+    }
+
+    async fn apply_batch(
+        &self,
+        account_id: i64,
+        group_id: &str,
+        batch_id: &str,
+        changes: &[StateChange],
+    ) -> Result<()> {
+        self.calls.lock().unwrap().push("apply_batch".into());
+
+        for change in changes {
+            if let StateChange::UpsertMailbox {
+                folder,
+                uidvalidity,
+            } = change
+            {
+                self.upsert_mailbox_entry(account_id, folder, *uidvalidity);
+            }
         }
 
-        let uid = {
-            let mut mailboxes = self.mailboxes.lock().unwrap();
-            let stored = mailboxes
-                .values_mut()
-                .find(|stored| stored.id == mailbox)
-                .ok_or_else(|| Error::Storage("mailbox not found".into()))?;
-            let uid = stored.next_uid;
-            stored.next_uid += 1;
-            uid
-        };
-        messages.insert(
-            key,
-            StoredMessage {
-                uid,
-                header: header.clone(),
-                rfc822_size: None,
-            },
-        );
-        Ok(uid)
+        let mut headers: Vec<&MessageHeader> = changes
+            .iter()
+            .filter_map(|change| match change {
+                StateChange::UpsertHeader { header } => Some(header),
+                _ => None,
+            })
+            .collect();
+        headers.sort_by(|a, b| {
+            a.list_id
+                .cmp(&b.list_id)
+                .then_with(|| a.received_at_ms.cmp(&b.received_at_ms))
+                .then_with(|| a.element_id.cmp(&b.element_id))
+        });
+        for header in headers {
+            let mailbox = self
+                .mailboxes
+                .lock()
+                .unwrap()
+                .get(&(account_id, header.list_id.clone()))
+                .map(|mailbox| mailbox.id);
+            if let Some(mailbox) = mailbox {
+                self.assign_uid_entry(mailbox, header)?;
+            }
+        }
+
+        for change in changes {
+            match change {
+                StateChange::RemoveHeaderEverywhere { element_id } => {
+                    self.remove_element_headers(account_id, element_id);
+                }
+                StateChange::RemoveOtherPlacements {
+                    element_id,
+                    keep_list_ids,
+                } => self.remove_other_placements(account_id, element_id, keep_list_ids),
+                StateChange::UpsertMailbox { .. } | StateChange::UpsertHeader { .. } => {}
+            }
+        }
+
+        self.last_batches
+            .lock()
+            .unwrap()
+            .insert((account_id, group_id.to_string()), batch_id.to_string());
+        Ok(())
+    }
+
+    async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {
+        self.calls.lock().unwrap().push("remove_mailbox".into());
+        self.remove_mailbox_entry(account_id, mailbox);
+        Ok(())
     }
 
     async fn update_metadata(

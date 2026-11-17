@@ -5,11 +5,11 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, Sqlite, SqlitePool};
+use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::domain::{
-    Address, Error, Folder, FolderKind, MailboxId, MessageHeader, Result, StoredMailbox,
-    StoredMessage,
+    Address, Error, Folder, FolderKind, MailboxId, MessageHeader, Result, StateChange,
+    StoredMailbox, StoredMessage,
 };
 use crate::ports::StateStore;
 
@@ -124,6 +124,76 @@ impl SqliteStateStore {
             .await?;
         Ok(())
     }
+
+    /// Assign a stable UID or refresh an existing header on `executor`.
+    ///
+    /// Callers own the transaction and its commit, which lets
+    /// `apply_batch` reuse the same code path without nesting transactions.
+    async fn assign_uid_in(
+        &self,
+        executor: &mut SqliteConnection,
+        mailbox: MailboxId,
+        header: &MessageHeader,
+    ) -> Result<u32> {
+        let existing: Option<i64> = sqlx::query_scalar(SELECT_UID_BY_ELEMENT_SQL)
+            .bind(mailbox.0)
+            .bind(&header.list_id)
+            .bind(&header.element_id)
+            .fetch_optional(&mut *executor)
+            .await
+            .map_err(storage_error)?;
+
+        match existing {
+            Some(uid) => {
+                let uid = u32_from_i64(uid)?;
+                if header.envelope_complete {
+                    write_message_metadata(&mut *executor, mailbox, uid, header, None).await?;
+                } else {
+                    write_partial_metadata(&mut *executor, mailbox, uid, header).await?;
+                }
+                Ok(uid)
+            }
+            None => {
+                let next_uid: Option<i64> = sqlx::query_scalar(SELECT_NEXT_UID_SQL)
+                    .bind(mailbox.0)
+                    .fetch_optional(&mut *executor)
+                    .await
+                    .map_err(storage_error)?;
+                let next_uid = next_uid
+                    .ok_or_else(|| Error::Storage("mailbox not found in state database".into()))?;
+                let uid = u32_from_i64(next_uid)?;
+
+                let (recipients_json, references_json) = serialize_header(header)?;
+                sqlx::query(INSERT_MESSAGE_SQL)
+                    .bind(mailbox.0)
+                    .bind(i64::from(uid))
+                    .bind(&header.list_id)
+                    .bind(&header.element_id)
+                    .bind(header.received_at_ms)
+                    .bind(header.sent_at_ms)
+                    .bind(&header.subject)
+                    .bind(header.from.name.as_deref())
+                    .bind(&header.from.address)
+                    .bind(recipients_json)
+                    .bind(bool_to_int(header.unread))
+                    .bind(header.message_id.as_deref())
+                    .bind(header.in_reply_to.as_deref())
+                    .bind(references_json)
+                    .bind(bool_to_int(header.envelope_complete))
+                    .execute(&mut *executor)
+                    .await
+                    .map_err(storage_error)?;
+
+                sqlx::query(INCREMENT_NEXT_UID_SQL)
+                    .bind(mailbox.0)
+                    .execute(&mut *executor)
+                    .await
+                    .map_err(storage_error)?;
+
+                Ok(uid)
+            }
+        }
+    }
 }
 
 const UPSERT_ACCOUNT_SQL: &str = "\
@@ -135,11 +205,15 @@ const SELECT_ACCOUNT_ID_SQL: &str = "SELECT id FROM accounts WHERE mail_address 
 const INSERT_MAILBOX_SQL: &str = "\
 INSERT INTO mailboxes (account_id, list_id, name, kind, uidvalidity, next_uid)
 VALUES (?, ?, ?, ?, ?, 1)
-ON CONFLICT(account_id, list_id) DO NOTHING";
+ON CONFLICT(account_id, list_id) DO UPDATE SET
+    name = excluded.name,
+    kind = excluded.kind";
 
 const SELECT_MAILBOX_SQL: &str = "\
 SELECT id, account_id, list_id, name, kind, uidvalidity, next_uid
 FROM mailboxes WHERE account_id = ? AND list_id = ?";
+
+const SELECT_MAILBOX_ID_SQL: &str = "SELECT id FROM mailboxes WHERE account_id = ? AND list_id = ?";
 
 const LIST_MAILBOXES_SQL: &str = "\
 SELECT id, account_id, list_id, name, kind, uidvalidity, next_uid
@@ -195,6 +269,18 @@ DELETE FROM messages WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account
 const DELETE_ACCOUNT_MAILBOXES_SQL: &str = "DELETE FROM mailboxes WHERE account_id = ?";
 
 const DELETE_ACCOUNT_SYNC_STATE_SQL: &str = "DELETE FROM sync_state WHERE account_id = ?";
+
+const DELETE_ELEMENT_HEADERS_SQL: &str = "\
+DELETE FROM messages
+WHERE tuta_element_id = ?
+  AND mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = ?)";
+
+const DELETE_MAILBOX_MESSAGES_SQL: &str = "\
+DELETE FROM messages
+WHERE mailbox_id = ?
+  AND mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = ?)";
+
+const DELETE_MAILBOX_SQL: &str = "DELETE FROM mailboxes WHERE id = ? AND account_id = ?";
 
 #[derive(Serialize, Deserialize)]
 struct AddressJson {
@@ -412,68 +498,146 @@ impl StateStore for SqliteStateStore {
 
     async fn assign_uid(&self, mailbox: MailboxId, header: &MessageHeader) -> Result<u32> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let uid = self
+            .assign_uid_in(&mut transaction, mailbox, header)
+            .await?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(uid)
+    }
 
-        let existing: Option<i64> = sqlx::query_scalar(SELECT_UID_BY_ELEMENT_SQL)
-            .bind(mailbox.0)
-            .bind(&header.list_id)
-            .bind(&header.element_id)
-            .fetch_optional(&mut *transaction)
+    async fn apply_batch(
+        &self,
+        account_id: i64,
+        group_id: &str,
+        batch_id: &str,
+        changes: &[StateChange],
+    ) -> Result<()> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+
+        // Folders go first so a new folder and its mail can arrive in the same
+        // batch regardless of the order the events were produced in.
+        for change in changes {
+            if let StateChange::UpsertMailbox {
+                folder,
+                uidvalidity,
+            } = change
+            {
+                sqlx::query(INSERT_MAILBOX_SQL)
+                    .bind(account_id)
+                    .bind(&folder.list_id)
+                    .bind(&folder.name)
+                    .bind(folder.kind.as_db_str())
+                    .bind(i64::from(*uidvalidity))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+            }
+        }
+
+        // New UIDs must follow arrival time, not event order, so headers are
+        // applied oldest-first. Existing UIDs are never reassigned.
+        let mut headers: Vec<&MessageHeader> = changes
+            .iter()
+            .filter_map(|change| match change {
+                StateChange::UpsertHeader { header } => Some(header),
+                _ => None,
+            })
+            .collect();
+        headers.sort_by(|a, b| {
+            a.list_id
+                .cmp(&b.list_id)
+                .then_with(|| a.received_at_ms.cmp(&b.received_at_ms))
+                .then_with(|| a.element_id.cmp(&b.element_id))
+        });
+
+        for header in headers {
+            let mailbox: Option<i64> = sqlx::query_scalar(SELECT_MAILBOX_ID_SQL)
+                .bind(account_id)
+                .bind(&header.list_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            if let Some(mailbox) = mailbox {
+                self.assign_uid_in(&mut transaction, MailboxId(mailbox), header)
+                    .await?;
+            }
+        }
+
+        // Removals run after header refreshes so a placement that is kept by
+        // the same batch is written before stale placements are pruned.
+        for change in changes {
+            match change {
+                StateChange::RemoveHeaderEverywhere { element_id } => {
+                    sqlx::query(DELETE_ELEMENT_HEADERS_SQL)
+                        .bind(element_id)
+                        .bind(account_id)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(storage_error)?;
+                }
+                StateChange::RemoveOtherPlacements {
+                    element_id,
+                    keep_list_ids,
+                } => {
+                    if keep_list_ids.is_empty() {
+                        sqlx::query(DELETE_ELEMENT_HEADERS_SQL)
+                            .bind(element_id)
+                            .bind(account_id)
+                            .execute(&mut *transaction)
+                            .await
+                            .map_err(storage_error)?;
+                        continue;
+                    }
+                    let placeholders = vec!["?"; keep_list_ids.len()].join(", ");
+                    let sql = format!(
+                        "DELETE FROM messages \
+                         WHERE tuta_element_id = ? \
+                         AND mailbox_id IN ( \
+                             SELECT id FROM mailboxes \
+                             WHERE account_id = ? AND list_id NOT IN ({placeholders}) \
+                         )"
+                    );
+                    let mut query = sqlx::query(&sql).bind(element_id).bind(account_id);
+                    for list_id in keep_list_ids {
+                        query = query.bind(list_id);
+                    }
+                    query
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(storage_error)?;
+                }
+                StateChange::UpsertMailbox { .. } | StateChange::UpsertHeader { .. } => {}
+            }
+        }
+
+        sqlx::query(UPSERT_LAST_BATCH_SQL)
+            .bind(account_id)
+            .bind(group_id)
+            .bind(batch_id)
+            .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
 
-        let uid = match existing {
-            Some(uid) => {
-                let uid = u32_from_i64(uid)?;
-                if header.envelope_complete {
-                    write_message_metadata(&mut *transaction, mailbox, uid, header, None).await?;
-                } else {
-                    write_partial_metadata(&mut *transaction, mailbox, uid, header).await?;
-                }
-                uid
-            }
-            None => {
-                let next_uid: Option<i64> = sqlx::query_scalar(SELECT_NEXT_UID_SQL)
-                    .bind(mailbox.0)
-                    .fetch_optional(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
-                let next_uid = next_uid
-                    .ok_or_else(|| Error::Storage("mailbox not found in state database".into()))?;
-                let uid = u32_from_i64(next_uid)?;
-
-                let (recipients_json, references_json) = serialize_header(header)?;
-                sqlx::query(INSERT_MESSAGE_SQL)
-                    .bind(mailbox.0)
-                    .bind(i64::from(uid))
-                    .bind(&header.list_id)
-                    .bind(&header.element_id)
-                    .bind(header.received_at_ms)
-                    .bind(header.sent_at_ms)
-                    .bind(&header.subject)
-                    .bind(header.from.name.as_deref())
-                    .bind(&header.from.address)
-                    .bind(recipients_json)
-                    .bind(bool_to_int(header.unread))
-                    .bind(header.message_id.as_deref())
-                    .bind(header.in_reply_to.as_deref())
-                    .bind(references_json)
-                    .bind(bool_to_int(header.envelope_complete))
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
-
-                sqlx::query(INCREMENT_NEXT_UID_SQL)
-                    .bind(mailbox.0)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
-
-                uid
-            }
-        };
-
         transaction.commit().await.map_err(storage_error)?;
-        Ok(uid)
+        Ok(())
+    }
+
+    async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        sqlx::query(DELETE_MAILBOX_MESSAGES_SQL)
+            .bind(mailbox.0)
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query(DELETE_MAILBOX_SQL)
+            .bind(mailbox.0)
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(())
     }
 
     async fn update_metadata(
@@ -732,7 +896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_mailbox_preserves_existing_uid_state() {
+    async fn upsert_mailbox_updates_name_and_kind_without_touching_uid_state() {
         let store = SqliteStateStore::open_in_memory().await.unwrap();
         let (account, mailbox) = account_and_mailbox(&store).await;
         assert_eq!(
@@ -756,10 +920,273 @@ mod tests {
         let boxes = store.mailboxes(account).await.unwrap();
         assert_eq!(boxes.len(), 1);
         assert_eq!(boxes[0].id, mailbox);
-        assert_eq!(boxes[0].name, "Inbox");
-        assert_eq!(boxes[0].kind, FolderKind::Inbox);
+        assert_eq!(boxes[0].name, "Renamed");
+        assert_eq!(boxes[0].kind, FolderKind::Archive);
         assert_eq!(boxes[0].uidvalidity, 100);
         assert_eq!(boxes[0].next_uid, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_writes_changes_and_last_batch_in_one_transaction() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let folder = Folder {
+            list_id: "list".into(),
+            name: "Inbox".into(),
+            kind: FolderKind::Inbox,
+        };
+        store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[
+                    StateChange::UpsertMailbox {
+                        folder,
+                        uidvalidity: 7,
+                    },
+                    StateChange::UpsertHeader {
+                        header: header("list", "e1"),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mailbox = store.mailboxes(account).await.unwrap().remove(0);
+        assert_eq!(mailbox.uidvalidity, 7);
+        assert_eq!(store.messages(mailbox.id).await.unwrap()[0].uid, 1);
+        assert_eq!(
+            store.last_batch(account, "group").await.unwrap().as_deref(),
+            Some("batch-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_batch_rolls_back_updates_when_a_later_change_fails() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_insert BEFORE INSERT ON messages
+             BEGIN SELECT RAISE(ABORT, 'forced'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let folder = Folder {
+            list_id: "list".into(),
+            name: "Inbox".into(),
+            kind: FolderKind::Inbox,
+        };
+        let error = store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[
+                    StateChange::UpsertMailbox {
+                        folder,
+                        uidvalidity: 7,
+                    },
+                    StateChange::UpsertHeader {
+                        header: header("list", "e1"),
+                    },
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Storage(_)));
+        assert!(store.mailboxes(account).await.unwrap().is_empty());
+        assert_eq!(store.last_batch(account, "group").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_persists_empty_batches() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+
+        store
+            .apply_batch(account, "group", "batch-1", &[])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.last_batch(account, "group").await.unwrap().as_deref(),
+            Some("batch-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_batch_assigns_new_uids_in_received_order() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let mailbox = store
+            .upsert_mailbox(account, &folder("list", "Inbox", FolderKind::Inbox), 7)
+            .await
+            .unwrap();
+
+        let mut newer = header("list", "newer");
+        newer.received_at_ms = 1_700_000_002_000;
+        let mut older = header("list", "older");
+        older.received_at_ms = 1_700_000_001_000;
+
+        store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[
+                    StateChange::UpsertHeader { header: newer },
+                    StateChange::UpsertHeader { header: older },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let messages = store.messages(mailbox).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        let uid = |element_id: &str| {
+            messages
+                .iter()
+                .find(|message| message.header.element_id == element_id)
+                .map(|message| message.uid)
+                .unwrap()
+        };
+        assert_eq!(uid("older"), 1);
+        assert_eq!(uid("newer"), 2);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_removes_header_everywhere() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (account, mailbox) = account_and_mailbox(&store).await;
+        let other_account = store.upsert_account("other@example.invalid").await.unwrap();
+        let other_mailbox = store
+            .upsert_mailbox(
+                other_account,
+                &folder("entries", "Inbox", FolderKind::Inbox),
+                200,
+            )
+            .await
+            .unwrap();
+        store
+            .assign_uid(mailbox, &header("entries", "shared"))
+            .await
+            .unwrap();
+        store
+            .assign_uid(other_mailbox, &header("entries", "shared"))
+            .await
+            .unwrap();
+
+        store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[StateChange::RemoveHeaderEverywhere {
+                    element_id: "shared".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.messages(mailbox).await.unwrap().is_empty());
+        // The same element in another account is untouched.
+        assert_eq!(store.messages(other_mailbox).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_removes_other_placements() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let first = store
+            .upsert_mailbox(account, &folder("first", "First", FolderKind::Inbox), 1)
+            .await
+            .unwrap();
+        let second = store
+            .upsert_mailbox(account, &folder("second", "Second", FolderKind::Archive), 1)
+            .await
+            .unwrap();
+        store
+            .assign_uid(first, &header("first", "shared"))
+            .await
+            .unwrap();
+        store
+            .assign_uid(second, &header("second", "shared"))
+            .await
+            .unwrap();
+
+        store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[StateChange::RemoveOtherPlacements {
+                    element_id: "shared".into(),
+                    keep_list_ids: vec!["first".into()],
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.messages(first).await.unwrap().len(), 1);
+        assert!(store.messages(second).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_batch_removes_a_mailbox_and_its_messages() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let removed = store
+            .upsert_mailbox(
+                account,
+                &folder("removed", "Removed", FolderKind::Archive),
+                1,
+            )
+            .await
+            .unwrap();
+        let kept = store
+            .upsert_mailbox(account, &folder("kept", "Kept", FolderKind::Inbox), 1)
+            .await
+            .unwrap();
+        store
+            .assign_uid(removed, &header("removed", "e1"))
+            .await
+            .unwrap();
+        store.assign_uid(kept, &header("kept", "e2")).await.unwrap();
+
+        store.remove_mailbox(account, removed).await.unwrap();
+
+        let mailboxes = store.mailboxes(account).await.unwrap();
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].id, kept);
+        assert!(store.messages(removed).await.unwrap().is_empty());
+        assert_eq!(store.messages(kept).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_skips_unknown_mailbox() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+
+        store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[StateChange::UpsertHeader {
+                    header: header("missing", "e1"),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.mailboxes(account).await.unwrap().is_empty());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

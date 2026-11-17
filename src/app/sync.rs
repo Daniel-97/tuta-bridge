@@ -37,7 +37,9 @@ impl SyncEngine {
     /// id. Headers are processed oldest-first so new UIDs grow with arrival
     /// time. Stored messages missing from a complete page are removed, which
     /// reconciles deletions and moves out of the folder. Repeating a sync with
-    /// the same `uidvalidity` keeps existing UIDs.
+    /// the same `uidvalidity` keeps existing UIDs. After the folder loop,
+    /// stored mailboxes missing from the source are removed together with
+    /// their headers.
     ///
     /// A folder whose headers cannot be loaded is skipped and counted. If
     /// every folder is skipped the sync fails instead of reporting success.
@@ -97,6 +99,19 @@ impl SyncEngine {
                         removed += 1;
                     }
                 }
+            }
+        }
+
+        // Folders absent from a successful source listing were deleted on the
+        // server, so their headers are dropped too. A failed `folders()` call
+        // returns earlier and never reconciles.
+        let source_lists: HashSet<&str> = folders
+            .iter()
+            .map(|folder| folder.list_id.as_str())
+            .collect();
+        for mailbox in self.store.mailboxes(account_id).await? {
+            if !source_lists.contains(mailbox.list_id.as_str()) {
+                self.store.remove_mailbox(account_id, mailbox.id).await?;
             }
         }
 

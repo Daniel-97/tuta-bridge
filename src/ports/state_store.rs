@@ -1,4 +1,6 @@
-use crate::domain::{Folder, MailboxId, MessageHeader, Result, StoredMailbox, StoredMessage};
+use crate::domain::{
+    Folder, MailboxId, MessageHeader, Result, StateChange, StoredMailbox, StoredMessage,
+};
 
 #[async_trait::async_trait]
 pub trait StateStore: Send + Sync {
@@ -11,6 +13,15 @@ pub trait StateStore: Send + Sync {
     ) -> Result<MailboxId>;
     async fn mailboxes(&self, account_id: i64) -> Result<Vec<StoredMailbox>>;
     async fn assign_uid(&self, mailbox: MailboxId, header: &MessageHeader) -> Result<u32>;
+    /// Apply every change and record `batch_id` in one transaction.
+    async fn apply_batch(
+        &self,
+        account_id: i64,
+        group_id: &str,
+        batch_id: &str,
+        changes: &[StateChange],
+    ) -> Result<()>;
+    async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()>;
     async fn update_metadata(
         &self,
         mailbox: MailboxId,

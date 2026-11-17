@@ -1,7 +1,32 @@
-use super::mail::{Address, FolderKind};
+use super::mail::{Address, Folder, FolderKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MailboxId(pub i64);
+
+/// A single mutation produced from one or more Tuta events.
+///
+/// Changes are applied as one transaction by
+/// [`StateStore::apply_batch`](crate::ports::state_store::StateStore::apply_batch),
+/// so the batch marker and every row change become visible together. The type
+/// deliberately does not implement `Debug`: headers carry personal data that
+/// must not be logged.
+#[derive(Clone)]
+// The header variant is large, but the interface keeps headers inline so
+// building and replaying a batch allocates nothing extra per change.
+#[allow(clippy::large_enum_variant)]
+pub enum StateChange {
+    /// Create or update a folder, preserving the existing UID sequence.
+    UpsertMailbox { folder: Folder, uidvalidity: u32 },
+    /// Add or refresh the header of a single mail placement.
+    UpsertHeader { header: MessageHeader },
+    /// Remove every stored placement of a mail.
+    RemoveHeaderEverywhere { element_id: String },
+    /// Remove placements of a mail except those in `keep_list_ids`.
+    RemoveOtherPlacements {
+        element_id: String,
+        keep_list_ids: Vec<String>,
+    },
+}
 
 #[derive(Clone)]
 pub struct StoredMailbox {

@@ -359,6 +359,46 @@ async fn sync_fetches_headers_only() {
 }
 
 #[tokio::test]
+async fn sync_removes_mailboxes_missing_from_source() {
+    let store = Arc::new(support::FakeStateStore::new());
+    let engine = SyncEngine::new(store.clone());
+    let inbox = folder("inbox-list", "Inbox", FolderKind::Inbox);
+    let archive = folder("archive-list", "Archive", FolderKind::Archive);
+
+    // Two folders with mail are stored before a sync that no longer reports
+    // the archive folder.
+    let inbox_id = store
+        .upsert_mailbox(ACCOUNT_ID, &inbox, UIDVALIDITY)
+        .await
+        .unwrap();
+    store
+        .assign_uid(inbox_id, &header(&inbox.list_id, "e1"))
+        .await
+        .unwrap();
+    let archive_id = store
+        .upsert_mailbox(ACCOUNT_ID, &archive, UIDVALIDITY)
+        .await
+        .unwrap();
+    store
+        .assign_uid(archive_id, &header(&archive.list_id, "a1"))
+        .await
+        .unwrap();
+
+    let mut source = support::FakeMailSource::new();
+    source.folders = vec![inbox.clone()];
+    source.set_headers(&inbox.list_id, vec![header(&inbox.list_id, "e1")]);
+
+    let sync_report = engine.sync(ACCOUNT_ID, &source, UIDVALIDITY).await.unwrap();
+    assert_eq!(sync_report, report(1, 1, 0));
+
+    let mailboxes = store.mailboxes(ACCOUNT_ID).await.unwrap();
+    assert_eq!(mailboxes.len(), 1);
+    assert_eq!(mailboxes[0].list_id, inbox.list_id);
+    assert_eq!(store.uid_for(inbox_id, &inbox.list_id, "e1"), Some(1));
+    assert!(store.messages(archive_id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn mailboxes_have_independent_uid_sequences() {
     let store = Arc::new(support::FakeStateStore::new());
     let engine = SyncEngine::new(store.clone());
