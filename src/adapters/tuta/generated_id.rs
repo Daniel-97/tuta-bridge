@@ -1,10 +1,14 @@
 //! Timestamps embedded in Tuta generated ids.
 //!
-//! Tuta prefixes every generated id with the creation time. The wire string is
-//! the sortable base64ext encoding of `(timestamp_ms * 4) << 24` written as
-//! nine big-endian bytes: six bytes of payload followed by three zero bytes of
-//! server-side padding. This module only encodes and decodes that prefix; the
-//! remaining bits of a real id belong to the server.
+//! Tuta prefixes every generated id with the creation time. The reference
+//! client writes `timestamp_ms * 4` in hex and appends seven hex digits (five
+//! zeros plus two server digits), so the id is the sortable base64ext encoding
+//! of the 72-bit value `(timestamp_ms * 4) << 28` written as nine big-endian
+//! bytes. This module encodes that value with the server digits left at zero
+//! and decodes it back exactly like the reference client's
+//! `generatedIdToTimestamp`: the first five bytes are a big-endian `u40` `n`
+//! and the timestamp is `n * 4 + (byte5 >> 6)`; the trailing server bytes are
+//! ignored.
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
@@ -15,8 +19,8 @@ pub const BATCH_EXPIRY_MS: i64 = 45 * 24 * 60 * 60 * 1000;
 const GENERATED_ID_LEN: usize = 12;
 /// Number of bytes a generated-id timestamp decodes to.
 const GENERATED_ID_BYTES: usize = 9;
-/// Number of leading bytes that carry `timestamp_ms * 4`.
-const PAYLOAD_BYTES: usize = 6;
+/// Number of leading bytes that carry `timestamp_ms >> 2` as a big-endian u40.
+const TIMESTAMP_BYTES: usize = 5;
 
 const STANDARD_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -25,13 +29,15 @@ const BASE64EXT_ALPHABET: &[u8; 64] =
 
 /// Encode a Unix timestamp as the timestamp prefix of a generated id.
 ///
-/// Negative timestamps are clamped to the Unix epoch.
+/// Negative timestamps are clamped to the Unix epoch and the server-suffix
+/// bytes stay zero. Timestamps at or above 2^42 ms (past year 2109) overflow
+/// the 72-bit layout and keep only their low bits.
 pub fn timestamp_to_generated_id(timestamp_ms: i64) -> String {
-    let scaled = (timestamp_ms.max(0) as u64).saturating_mul(4);
+    let value = ((timestamp_ms.max(0) as u128) * 4) << 28;
     let mut bytes = [0_u8; GENERATED_ID_BYTES];
-    for (index, byte) in bytes.iter_mut().take(PAYLOAD_BYTES).enumerate() {
-        let shift = 8 * (PAYLOAD_BYTES - 1 - index);
-        *byte = (scaled >> shift) as u8;
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let shift = 8 * (GENERATED_ID_BYTES - 1 - index);
+        *byte = (value >> shift) as u8;
     }
 
     let standard = BASE64_STANDARD.encode(bytes);
@@ -50,15 +56,14 @@ pub fn timestamp_to_generated_id(timestamp_ms: i64) -> String {
 /// Extract the Unix timestamp encoded in a generated id.
 ///
 /// Returns `None` when the id is not a twelve-character base64ext string that
-/// decodes to nine bytes.
+/// decodes to nine bytes. The trailing server bytes are ignored.
 pub fn generated_id_timestamp(id: &str) -> Option<i64> {
     let bytes = decode_base64ext(id)?;
-    let payload = bytes.get(..PAYLOAD_BYTES)?;
-    let mut scaled = [0_u8; PAYLOAD_BYTES];
-    scaled.copy_from_slice(payload);
+    let head = bytes.get(..TIMESTAMP_BYTES)?;
+    let sixth = *bytes.get(TIMESTAMP_BYTES)?;
     let mut value = [0_u8; 8];
-    value[8 - PAYLOAD_BYTES..].copy_from_slice(&scaled);
-    let timestamp = u64::from_be_bytes(value) / 4;
+    value[8 - TIMESTAMP_BYTES..].copy_from_slice(head);
+    let timestamp = u64::from_be_bytes(value) * 4 + u64::from(sixth >> 6);
     i64::try_from(timestamp).ok()
 }
 
@@ -105,16 +110,25 @@ mod tests {
             assert_eq!(generated_id_timestamp(&id), Some(ts));
         }
         assert_eq!(timestamp_to_generated_id(0), "------------");
+        assert_eq!(timestamp_to_generated_id(1), "------0-----");
+        assert_eq!(timestamp_to_generated_id(1_700_000_000_000), "NjEtLV------");
     }
 
     #[test]
-    fn encodes_sortable_base64ext_vectors() {
-        assert_eq!(timestamp_to_generated_id(1), "-------3----");
-        assert_eq!(timestamp_to_generated_id(2_000_000_000_000), "0oP_97------");
+    fn decodes_real_server_batch_ids() {
+        // Live batch id captured from the Tuta event bus (server bytes suffix
+        // is ignored by the decoder). It must decode to its capture time.
         assert_eq!(
-            generated_id_timestamp("0oP_97------"),
-            Some(2_000_000_000_000)
+            generated_id_timestamp("P6f_Itx----9"),
+            Some(1_794_953_789_053)
         );
+        // Markers produced by the earlier wrong-shift encoder decode to 1973
+        // and must be treated as expired so the next watch start resyncs.
+        assert_eq!(
+            generated_id_timestamp("0cTi85rc----"),
+            Some(112_184_562_103)
+        );
+        assert!(batch_is_expired("0cTi85rc----", 1_794_953_789_053));
     }
 
     #[test]
