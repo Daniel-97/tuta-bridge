@@ -2,7 +2,7 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M3 code complete; M3 manual acceptance pending. IMAP/SMTP are not implemented yet.
+Status: M0–M3 complete for a single account (login, status/logout, dump, minimal state and sync). IMAP/SMTP are not implemented yet.
 
 ## Credentials
 
