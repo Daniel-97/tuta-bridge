@@ -112,6 +112,7 @@ impl Session for TutaSession {
         for membership in user
             .memberships
             .iter()
+            // The TS client chains userGroup unconditionally and a user group is never type 2, so filtering it here is equivalent.
             .chain(std::iter::once(&user.userGroup))
         {
             if !is_event_group(membership.groupType) {
