@@ -2,9 +2,11 @@
 //!
 //! Event frames only carry ids and operations; the processor needs the
 //! current metadata behind them. This adapter reloads the affected `Mail`,
-//! `MailSetEntry`, and `MailSet` through the SDK's decryption path and maps
-//! them to domain headers and folders. It is metadata-only: `MailDetails`,
-//! blobs, attachments, and bodies are never loaded.
+//! the `MailSet`s the mail belongs to (for its placements), the
+//! `MailSetEntry` and its `Mail`, and `MailSet` folders through the SDK's
+//! decryption path and maps them to domain placements and folders. It is
+//! metadata-only: `MailDetails`, blobs, attachments, and bodies are never
+//! loaded.
 //!
 //! Every SDK failure maps to one fixed [`Error::Network`] message: ids,
 //! subjects, and addresses never appear in errors or logs.
@@ -17,20 +19,20 @@ use tutasdk::{CustomId, GeneratedId, IdTupleCustom, IdTupleGenerated, LoggedInSd
 
 use super::content::mail_is_intact;
 use super::mail_source::{folder_from_parts, header_from_parts};
-use crate::domain::{Error, Folder, MessageHeader, Result};
+use crate::domain::{Error, Folder, MailPlacement, Result};
 use crate::ports::event_lookup::EventLookup;
 
-/// Keep the first header per `list_id`.
+/// Keep the first placement per `mailbox_list_id`.
 ///
-/// Tuta can report the same mailbox placement twice when several
-/// `MailSetEntry` rows resolve to one folder; the processor treats each
-/// `list_id` as one placement.
-fn dedupe_placements(headers: Vec<MessageHeader>) -> Vec<MessageHeader> {
-    let mut seen: HashSet<String> = HashSet::with_capacity(headers.len());
-    let mut deduped = Vec::with_capacity(headers.len());
-    for header in headers {
-        if seen.insert(header.list_id.clone()) {
-            deduped.push(header);
+/// Tuta can report the same mailbox placement twice when the mail is
+/// associated with several sets resolving to one folder; the processor
+/// treats each `mailbox_list_id` as one placement.
+fn dedupe_placements(placements: Vec<MailPlacement>) -> Vec<MailPlacement> {
+    let mut seen: HashSet<String> = HashSet::with_capacity(placements.len());
+    let mut deduped = Vec::with_capacity(placements.len());
+    for placement in placements {
+        if seen.insert(placement.mailbox_list_id.clone()) {
+            deduped.push(placement);
         }
     }
     deduped
@@ -58,7 +60,7 @@ impl EventLookup for TutaEventLookup {
         &self,
         mail_list_id: &str,
         mail_element_id: &str,
-    ) -> Result<Option<Vec<MessageHeader>>> {
+    ) -> Result<Option<Vec<MailPlacement>>> {
         let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
         let mail_id = IdTupleGenerated::new(
             GeneratedId(mail_list_id.to_string()),
@@ -70,24 +72,34 @@ impl EventLookup for TutaEventLookup {
             .map_err(|_| entity_unavailable())?;
 
         // An unreadable mail must keep its existing rows: report it as
-        // unreadable instead of as "no placements".
+        // unreadable instead of as "no placements". Without its own id the
+        // header could not be keyed for later content reloads either.
         if !mail_is_intact(&mail) {
             return Ok(None);
         }
+        let Some(mail_id) = mail._id.as_ref() else {
+            return Ok(None);
+        };
 
-        // One failed placement entry fails the whole mail: a partial list
+        // One failed placement set fails the whole mail: a partial list
         // could make the caller delete a placement that still exists.
-        let mut headers = Vec::with_capacity(mail.sets.len());
-        for entry_id in &mail.sets {
-            let entry: MailSetEntry = crypto_client
-                .load(entry_id)
+        //
+        // `Mail.sets` (field 1465) is a `ListElementAssociationGenerated`
+        // to `MailSet` (refTypeId 429), NOT to `MailSetEntry`: each tuple
+        // addresses a MailSet, whose `entries` value is the folder's
+        // entries list id that resolves the mailbox row.
+        let mut placements = Vec::with_capacity(mail.sets.len());
+        for set_id in &mail.sets {
+            let set: MailSet = crypto_client
+                .load(set_id)
                 .await
                 .map_err(|_| entity_unavailable())?;
-            let Some(entry_id) = entry._id.as_ref() else {
+            let mailbox_list_id = set.entries.as_str();
+            if mailbox_list_id.is_empty() {
                 continue;
-            };
+            }
             if let Some(header) = header_from_parts(
-                entry_id.list_id.as_str(),
+                mail_id.list_id.as_str(),
                 mail_element_id,
                 mail.receivedDate.as_millis() as i64,
                 &mail.subject,
@@ -95,19 +107,22 @@ impl EventLookup for TutaEventLookup {
                 mail.firstRecipient.as_ref(),
                 mail.unread,
             ) {
-                headers.push(header);
+                placements.push(MailPlacement {
+                    mailbox_list_id: mailbox_list_id.to_string(),
+                    header,
+                });
             }
         }
 
         // An empty result means the mail genuinely has no placements.
-        Ok(Some(dedupe_placements(headers)))
+        Ok(Some(dedupe_placements(placements)))
     }
 
     async fn header_for_entry(
         &self,
         entry_list_id: &str,
         entry_element_id: &str,
-    ) -> Result<Option<MessageHeader>> {
+    ) -> Result<Option<MailPlacement>> {
         let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
         let entry_id = IdTupleCustom::new(
             GeneratedId(entry_list_id.to_string()),
@@ -129,17 +144,22 @@ impl EventLookup for TutaEventLookup {
             return Ok(None);
         };
 
-        // The entry's list id is the mailbox (folder.entries list), not the
-        // mail's own list id.
+        // The mailbox is the entry's list (the folder.entries list); the
+        // header's ids are the Mail's own ids, never the entry's, so later
+        // content reloads can find the mail by `messages.tuta_list_id`.
         Ok(header_from_parts(
-            entry_list_id,
+            mail_id.list_id.as_str(),
             mail_id.element_id.as_str(),
             mail.receivedDate.as_millis() as i64,
             &mail.subject,
             &mail.sender,
             mail.firstRecipient.as_ref(),
             mail.unread,
-        ))
+        )
+        .map(|header| MailPlacement {
+            mailbox_list_id: entry_list_id.to_string(),
+            header,
+        }))
     }
 
     async fn folder(&self, set_list_id: &str, set_element_id: &str) -> Result<Option<Folder>> {
@@ -163,7 +183,7 @@ impl EventLookup for TutaEventLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Address;
+    use crate::domain::{Address, MessageHeader};
 
     fn header(list_id: &str, element_id: &str) -> MessageHeader {
         MessageHeader {
@@ -188,24 +208,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deduplicates_headers_for_the_same_mailbox() {
-        let headers = dedupe_placements(vec![
-            header("list-a", "m1"),
-            header("list-a", "m1"),
-            header("list-b", "m1"),
-        ]);
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0].list_id, "list-a");
-        assert_eq!(headers[1].list_id, "list-b");
+    /// Build a placement: `mailbox_list_id` resolves the mailbox (the
+    /// folder's entries list), while the header keeps the Mail's own ids.
+    fn placement(mailbox_list_id: &str, mail_list_id: &str, element_id: &str) -> MailPlacement {
+        MailPlacement {
+            mailbox_list_id: mailbox_list_id.to_string(),
+            header: header(mail_list_id, element_id),
+        }
     }
 
     #[test]
-    fn dedupe_keeps_the_first_header_of_each_mailbox() {
-        let headers =
-            dedupe_placements(vec![header("list-a", "first"), header("list-a", "second")]);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0].element_id, "first");
+    fn deduplicates_placements_for_the_same_mailbox() {
+        let placements = dedupe_placements(vec![
+            placement("list-a", "mail-list", "m1"),
+            placement("list-a", "mail-list", "m1"),
+            placement("list-b", "mail-list", "m1"),
+        ]);
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].mailbox_list_id, "list-a");
+        assert_eq!(placements[1].mailbox_list_id, "list-b");
+    }
+
+    #[test]
+    fn dedupe_keeps_the_first_placement_of_each_mailbox() {
+        let placements = dedupe_placements(vec![
+            placement("list-a", "mail-list", "first"),
+            placement("list-a", "mail-list", "second"),
+        ]);
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].header.element_id, "first");
     }
 
     #[test]

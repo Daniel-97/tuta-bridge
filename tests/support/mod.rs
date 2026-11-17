@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use secrecy::SecretString;
 use tuta_bridge::domain::{
-    AccountId, AccountInfo, Error, Folder, MailboxId, MessageContent, MessageHeader, MessagePage,
-    MessageSummary, Result, StateChange, StoredCredentials, StoredMailbox, StoredMessage,
+    AccountId, AccountInfo, Error, Folder, MailPlacement, MailboxId, MessageContent, MessageHeader,
+    MessagePage, MessageSummary, Result, StateChange, StoredCredentials, StoredMailbox,
+    StoredMessage,
 };
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::event_lookup::EventLookup;
@@ -287,25 +288,25 @@ impl Default for FakeStateStore {
 // FakeEventLookup
 // ---------------------------------------------------------------------------
 
-/// Placement headers per mail keyed by the mail's `(list_id, element_id)`;
+/// Placements per mail keyed by the mail's `(list_id, element_id)`;
 /// `None` marks the mail unreadable so the caller keeps its rows.
-type MailHeaderMap = Mutex<HashMap<(String, String), Option<Vec<MessageHeader>>>>;
-/// Header per mail-set entry keyed by the entry's `(list_id, element_id)`;
-/// `None` means no readable header.
-type EntryHeaderMap = Mutex<HashMap<(String, String), Option<MessageHeader>>>;
+type MailPlacementMap = Mutex<HashMap<(String, String), Option<Vec<MailPlacement>>>>;
+/// Placement per mail-set entry keyed by the entry's `(list_id, element_id)`;
+/// `None` means no readable placement.
+type EntryPlacementMap = Mutex<HashMap<(String, String), Option<MailPlacement>>>;
 /// Folder per mail set keyed by the set's `(list_id, element_id)`.
 type FolderMap = Mutex<HashMap<(String, String), Option<Folder>>>;
 
 /// In-memory [`EventLookup`] for processor tests.
 ///
-/// Placement headers, entry headers, and folders are keyed by their
+/// Placements, entry placements, and folders are keyed by their
 /// `(list_id, element_id)` pairs. A missing key answers `Ok(None)` so an
 /// unconfigured entity never causes a deletion, and a `None` value
 /// reproduces the unreadable/absent case. `with_failure` makes every lookup
 /// fail with the fixed network error.
 pub struct FakeEventLookup {
-    pub mail_headers: MailHeaderMap,
-    pub entry_headers: EntryHeaderMap,
+    pub mail_placements: MailPlacementMap,
+    pub entry_placements: EntryPlacementMap,
     pub folders: FolderMap,
     /// When set, every lookup fails with a network error.
     pub fail: Mutex<bool>,
@@ -315,8 +316,8 @@ pub struct FakeEventLookup {
 impl FakeEventLookup {
     pub fn new() -> Self {
         Self {
-            mail_headers: Mutex::new(HashMap::new()),
-            entry_headers: Mutex::new(HashMap::new()),
+            mail_placements: Mutex::new(HashMap::new()),
+            entry_placements: Mutex::new(HashMap::new()),
             folders: Mutex::new(HashMap::new()),
             fail: Mutex::new(false),
             calls: Mutex::new(Vec::new()),
@@ -325,29 +326,29 @@ impl FakeEventLookup {
 
     /// Configure the placements of one mail; `None` marks the mail
     /// unreadable so the caller keeps its existing rows.
-    pub fn with_mail_headers(
+    pub fn with_mail_placements(
         self,
         mail_list_id: &str,
         mail_element_id: &str,
-        headers: Option<Vec<MessageHeader>>,
+        placements: Option<Vec<MailPlacement>>,
     ) -> Self {
-        self.mail_headers.lock().unwrap().insert(
+        self.mail_placements.lock().unwrap().insert(
             (mail_list_id.to_string(), mail_element_id.to_string()),
-            headers,
+            placements,
         );
         self
     }
 
-    /// Configure the header of one mail-set entry.
-    pub fn with_entry_header(
+    /// Configure the placement of one mail-set entry.
+    pub fn with_entry_placement(
         self,
         entry_list_id: &str,
         entry_element_id: &str,
-        header: MessageHeader,
+        placement: MailPlacement,
     ) -> Self {
-        self.entry_headers.lock().unwrap().insert(
+        self.entry_placements.lock().unwrap().insert(
             (entry_list_id.to_string(), entry_element_id.to_string()),
-            Some(header),
+            Some(placement),
         );
         self
     }
@@ -384,13 +385,13 @@ impl EventLookup for FakeEventLookup {
         &self,
         mail_list_id: &str,
         mail_element_id: &str,
-    ) -> Result<Option<Vec<MessageHeader>>> {
+    ) -> Result<Option<Vec<MailPlacement>>> {
         self.calls.lock().unwrap().push("headers_for_mail".into());
         if *self.fail.lock().unwrap() {
             return Err(Error::Network("event entity unavailable".into()));
         }
         Ok(self
-            .mail_headers
+            .mail_placements
             .lock()
             .unwrap()
             .get(&(mail_list_id.to_string(), mail_element_id.to_string()))
@@ -402,13 +403,13 @@ impl EventLookup for FakeEventLookup {
         &self,
         entry_list_id: &str,
         entry_element_id: &str,
-    ) -> Result<Option<MessageHeader>> {
+    ) -> Result<Option<MailPlacement>> {
         self.calls.lock().unwrap().push("header_for_entry".into());
         if *self.fail.lock().unwrap() {
             return Err(Error::Network("event entity unavailable".into()));
         }
         Ok(self
-            .entry_headers
+            .entry_placements
             .lock()
             .unwrap()
             .get(&(entry_list_id.to_string(), entry_element_id.to_string()))
@@ -494,25 +495,31 @@ impl StateStore for FakeStateStore {
             }
         }
 
-        let mut headers: Vec<&MessageHeader> = changes
+        let mut headers: Vec<(&str, &MessageHeader)> = changes
             .iter()
             .filter_map(|change| match change {
-                StateChange::UpsertHeader { header } => Some(header),
+                StateChange::UpsertHeader {
+                    mailbox_list_id,
+                    header,
+                } => Some((mailbox_list_id.as_str(), header)),
                 _ => None,
             })
             .collect();
-        headers.sort_by(|a, b| {
-            a.list_id
-                .cmp(&b.list_id)
-                .then_with(|| a.received_at_ms.cmp(&b.received_at_ms))
-                .then_with(|| a.element_id.cmp(&b.element_id))
+        headers.sort_by(|(mailbox_a, header_a), (mailbox_b, header_b)| {
+            mailbox_a
+                .cmp(mailbox_b)
+                .then_with(|| header_a.received_at_ms.cmp(&header_b.received_at_ms))
+                .then_with(|| header_a.element_id.cmp(&header_b.element_id))
         });
-        for header in headers {
+        for (mailbox_list_id, header) in headers {
+            // The mailbox is resolved by the placement's `mailbox_list_id`;
+            // `header.list_id` is the Mail's own list id and only keys the
+            // stored message row.
             let mailbox = self
                 .mailboxes
                 .lock()
                 .unwrap()
-                .get(&(account_id, header.list_id.clone()))
+                .get(&(account_id, mailbox_list_id.to_string()))
                 .map(|mailbox| mailbox.id);
             if let Some(mailbox) = mailbox {
                 self.assign_uid_entry(mailbox, header)?;

@@ -536,24 +536,31 @@ impl StateStore for SqliteStateStore {
 
         // New UIDs must follow arrival time, not event order, so headers are
         // applied oldest-first. Existing UIDs are never reassigned.
-        let mut headers: Vec<&MessageHeader> = changes
+        let mut headers: Vec<(&str, &MessageHeader)> = changes
             .iter()
             .filter_map(|change| match change {
-                StateChange::UpsertHeader { header } => Some(header),
+                StateChange::UpsertHeader {
+                    mailbox_list_id,
+                    header,
+                } => Some((mailbox_list_id.as_str(), header)),
                 _ => None,
             })
             .collect();
-        headers.sort_by(|a, b| {
-            a.list_id
-                .cmp(&b.list_id)
-                .then_with(|| a.received_at_ms.cmp(&b.received_at_ms))
-                .then_with(|| a.element_id.cmp(&b.element_id))
+        headers.sort_by(|(mailbox_a, header_a), (mailbox_b, header_b)| {
+            mailbox_a
+                .cmp(mailbox_b)
+                .then_with(|| header_a.received_at_ms.cmp(&header_b.received_at_ms))
+                .then_with(|| header_a.element_id.cmp(&header_b.element_id))
         });
 
-        for header in headers {
+        for (mailbox_list_id, header) in headers {
+            // `header.list_id` is the Mail's own list id, stored in
+            // `messages.tuta_list_id` for later content reloads; the mailbox
+            // is resolved by the placement's `mailbox_list_id`, never by the
+            // header's list id.
             let mailbox: Option<i64> = sqlx::query_scalar(SELECT_MAILBOX_ID_SQL)
                 .bind(account_id)
-                .bind(&header.list_id)
+                .bind(mailbox_list_id)
                 .fetch_optional(&mut *transaction)
                 .await
                 .map_err(storage_error)?;
@@ -946,7 +953,8 @@ mod tests {
                         uidvalidity: 7,
                     },
                     StateChange::UpsertHeader {
-                        header: header("list", "e1"),
+                        mailbox_list_id: "list".into(),
+                        header: header("mail-list", "e1"),
                     },
                 ],
             )
@@ -989,7 +997,8 @@ mod tests {
                         uidvalidity: 7,
                     },
                     StateChange::UpsertHeader {
-                        header: header("list", "e1"),
+                        mailbox_list_id: "list".into(),
+                        header: header("mail-list", "e1"),
                     },
                 ],
             )
@@ -1025,9 +1034,9 @@ mod tests {
             .await
             .unwrap();
 
-        let mut newer = header("list", "newer");
+        let mut newer = header("mail-list", "newer");
         newer.received_at_ms = 1_700_000_002_000;
-        let mut older = header("list", "older");
+        let mut older = header("mail-list", "older");
         older.received_at_ms = 1_700_000_001_000;
 
         store
@@ -1036,8 +1045,14 @@ mod tests {
                 "group",
                 "batch-1",
                 &[
-                    StateChange::UpsertHeader { header: newer },
-                    StateChange::UpsertHeader { header: older },
+                    StateChange::UpsertHeader {
+                        mailbox_list_id: "list".into(),
+                        header: newer,
+                    },
+                    StateChange::UpsertHeader {
+                        mailbox_list_id: "list".into(),
+                        header: older,
+                    },
                 ],
             )
             .await
@@ -1175,7 +1190,8 @@ mod tests {
                 "group",
                 "batch-1",
                 &[StateChange::UpsertHeader {
-                    header: header("missing", "e1"),
+                    mailbox_list_id: "missing".into(),
+                    header: header("mail-list", "e1"),
                 }],
             )
             .await
@@ -1187,6 +1203,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_resolves_the_mailbox_by_placement_list_id() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let mailbox = store
+            .upsert_mailbox(
+                account,
+                &folder("folder-list", "Inbox", FolderKind::Inbox),
+                7,
+            )
+            .await
+            .unwrap();
+        let changes = [StateChange::UpsertHeader {
+            mailbox_list_id: "folder-list".into(),
+            header: header("mail-list", "mail-1"),
+        }];
+
+        store
+            .apply_batch(account, "group", "batch-1", &changes)
+            .await
+            .unwrap();
+
+        // The row lives in the mailbox resolved by `mailbox_list_id`...
+        let messages = store.messages(mailbox).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].uid, 1);
+        // ...while the stored header keeps the Mail's own list id, never
+        // the folder's entries list id.
+        assert_eq!(messages[0].header.list_id, "mail-list");
+        assert_eq!(messages[0].header.element_id, "mail-1");
+        let tuta_list_id: String = sqlx::query_scalar("SELECT tuta_list_id FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(tuta_list_id, "mail-list");
+
+        // Reapplying the same batch neither duplicates nor reassigns.
+        store
+            .apply_batch(account, "group", "batch-1", &changes)
+            .await
+            .unwrap();
+        let messages = store.messages(mailbox).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].uid, 1);
     }
 
     #[tokio::test]

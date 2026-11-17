@@ -3,6 +3,19 @@ use super::mail::{Address, Folder, FolderKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MailboxId(pub i64);
 
+/// One stored placement of a mail: the mailbox it belongs to and its header.
+///
+/// `mailbox_list_id` is the folder's entries list id and resolves the
+/// mailbox row. `header.list_id` is the Mail's own list id, stored in
+/// `messages.tuta_list_id` for later content reloads, and must never be used
+/// to resolve the mailbox. Like headers, this type deliberately does not
+/// implement `Debug` so personal data cannot end up in logs.
+#[derive(Clone)]
+pub struct MailPlacement {
+    pub mailbox_list_id: String,
+    pub header: MessageHeader,
+}
+
 /// A single mutation produced from one or more Tuta events.
 ///
 /// Changes are applied as one transaction by
@@ -17,8 +30,13 @@ pub struct MailboxId(pub i64);
 pub enum StateChange {
     /// Create or update a folder, preserving the existing UID sequence.
     UpsertMailbox { folder: Folder, uidvalidity: u32 },
-    /// Add or refresh the header of a single mail placement.
-    UpsertHeader { header: MessageHeader },
+    /// Add or refresh a mail's placement in the mailbox named by
+    /// `mailbox_list_id` (the folder's entries list id). The header's own
+    /// `list_id` is the Mail's list id and is stored for content reloads.
+    UpsertHeader {
+        mailbox_list_id: String,
+        header: MessageHeader,
+    },
     /// Remove every stored placement of a mail.
     RemoveHeaderEverywhere { element_id: String },
     /// Remove placements of a mail except those in `keep_list_ids`.
