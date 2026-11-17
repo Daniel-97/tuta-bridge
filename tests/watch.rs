@@ -17,7 +17,7 @@ use tuta_bridge::config::Config;
 use tuta_bridge::domain::{
     AccountInfo, Address, EntityEvent, EntityOperation, Error, EventBatch, EventFrame, Folder,
     FolderKind, MailPlacement, MessageHeader, Result, StoredCredentials, MAIL_SET_ENTRY_TYPE_ID,
-    TUTANOTA_APP,
+    MAIL_TYPE_ID, TUTANOTA_APP,
 };
 use tuta_bridge::ports::clock::Clock;
 use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
@@ -123,6 +123,8 @@ fn use_case(
             second_ms: 0,
             max_ms: 0,
         },
+        connect_timeout: Duration::from_secs(5),
+        lookup_failure_threshold: 10,
     }
 }
 
@@ -171,7 +173,7 @@ fn placement(mailbox_list_id: &str, header_list_id: &str, element_id: &str) -> M
 }
 
 /// One mail-set-entry creation inside `list-a`, owned by `group`.
-fn entry_batch(batch_id: &str, group: &str) -> EventBatch {
+fn entry_batch(batch_id: &str, group: &str, entry_id: &str) -> EventBatch {
     EventBatch {
         batch_id: batch_id.to_string(),
         owner_group_id: group.to_string(),
@@ -180,8 +182,24 @@ fn entry_batch(batch_id: &str, group: &str) -> EventBatch {
             application: TUTANOTA_APP.to_string(),
             type_id: MAIL_SET_ENTRY_TYPE_ID,
             list_id: "list-a".to_string(),
-            element_id: "entry-1".to_string(),
+            element_id: entry_id.to_string(),
             operation: EntityOperation::Create,
+        }],
+    }
+}
+
+/// One mail update inside `mail-list`, owned by `group`.
+fn mail_update_batch(batch_id: &str, group: &str) -> EventBatch {
+    EventBatch {
+        batch_id: batch_id.to_string(),
+        owner_group_id: group.to_string(),
+        application_types_hash: "types-hash".to_string(),
+        events: vec![EntityEvent {
+            application: TUTANOTA_APP.to_string(),
+            type_id: MAIL_TYPE_ID,
+            list_id: "mail-list".to_string(),
+            element_id: "mail-1".to_string(),
+            operation: EntityOperation::Update,
         }],
     }
 }
@@ -229,7 +247,9 @@ async fn applies_batches_and_persists_the_batch_id() {
         )),
     );
     session.push_script(vec![
-        Ok(EventFrame::Batch(entry_batch("batch-2", "group1"))),
+        Ok(EventFrame::Batch(entry_batch(
+            "batch-2", "group1", "entry-1",
+        ))),
         Ok(EventFrame::InitialSyncDone),
         Err(Error::Login("stop".into())),
     ]);
@@ -501,4 +521,85 @@ async fn auth_failure_stops_without_retrying() {
 
     // Auth errors are fatal: the session is never reconnected.
     assert_eq!(session.events_calls(), 1);
+}
+
+#[tokio::test]
+async fn consecutive_lookup_failures_resync_once_and_continue() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, _marker) = synced_account(&state).await;
+
+    // The resync replays the mail source: one folder with one header.
+    let mut mail = FakeMailSource::new();
+    mail.folders = vec![folder("list-a")];
+    let lookup = Arc::new(FakeEventLookup::new().fail_next(2).with_entry_placement(
+        "list-a",
+        "entry-9",
+        placement("list-a", "mail-list", "mail-9"),
+    ));
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()])
+            .with_mail(Arc::new(mail))
+            .with_lookup(lookup),
+    );
+    session
+        .mail
+        .set_headers("list-a", vec![header("list-a", "e1")]);
+    // Two batches fail their only lookup; the third resolves one entry
+    // and the stream ends on a fatal error.
+    session.push_script(vec![
+        Ok(EventFrame::Batch(mail_update_batch("batch-1", "group1"))),
+        Ok(EventFrame::Batch(mail_update_batch("batch-2", "group1"))),
+        Ok(EventFrame::Batch(entry_batch(
+            "batch-3", "group1", "entry-9",
+        ))),
+        Err(Error::Login("stop".into())),
+    ]);
+
+    let mut watch = use_case(&session, credentials, config_path, state.clone());
+    watch.lookup_failure_threshold = 2;
+
+    let error = watch.run_until(std::future::pending()).await.unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+
+    // The valve fired exactly once and the stream was never
+    // reconnected.
+    let calls = state.calls();
+    assert_eq!(
+        calls.iter().filter(|call| *call == "reset_account").count(),
+        1
+    );
+    assert_eq!(
+        session
+            .mail
+            .calls()
+            .iter()
+            .filter(|call| *call == "headers_page")
+            .count(),
+        1,
+        "only the valve resync may fetch headers"
+    );
+    assert_eq!(session.events_calls(), 1);
+
+    // The resync filed the source's header under a fresh UIDVALIDITY...
+    let mailboxes = state.mailboxes(account).await.unwrap();
+    assert_eq!(mailboxes.len(), 1);
+    assert_ne!(mailboxes[0].uidvalidity, 100);
+    assert_eq!(state.uid_for(mailboxes[0].id, "list-a", "e1"), Some(1));
+
+    // ...the good batch applied on top of it, and its id became the
+    // persisted marker.
+    assert_eq!(
+        state.uid_for(mailboxes[0].id, "mail-list", "mail-9"),
+        Some(2)
+    );
+    assert_eq!(
+        state
+            .last_batch(account, "group1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("batch-3")
+    );
 }

@@ -14,7 +14,9 @@ use tuta_bridge::app::logout::LogoutUseCase;
 use tuta_bridge::app::state_sync::{open_state_store, StateSyncUseCase};
 use tuta_bridge::app::status::StatusUseCase;
 use tuta_bridge::app::sync::SyncReport;
-use tuta_bridge::app::watch::{BackoffPolicy, WatchUseCase};
+use tuta_bridge::app::watch::{
+    BackoffPolicy, WatchUseCase, CONNECT_TIMEOUT, LOOKUP_FAILURE_THRESHOLD,
+};
 use tuta_bridge::config::{config_path, data_dir, resolve_base_url, validate_base_url, Config};
 use tuta_bridge::domain::Error;
 use tuta_bridge::ports::clock::Clock;
@@ -175,6 +177,8 @@ fn main() {
                     state,
                     clock: Arc::new(SystemClock),
                     backoff: BackoffPolicy::production(),
+                    connect_timeout: CONNECT_TIMEOUT,
+                    lookup_failure_threshold: LOOKUP_FAILURE_THRESHOLD,
                 };
                 uc.run().await?;
                 Ok(())

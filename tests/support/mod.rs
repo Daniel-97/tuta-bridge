@@ -322,6 +322,9 @@ pub struct FakeEventLookup {
     pub folders: FolderMap,
     /// When set, every lookup fails with a network error.
     pub fail: Mutex<bool>,
+    /// When nonzero, the next this many lookups fail with a network
+    /// error; consumed before the `fail` flag is consulted.
+    pub failing_calls: Mutex<usize>,
     pub calls: Mutex<Vec<String>>,
 }
 
@@ -332,6 +335,7 @@ impl FakeEventLookup {
             entry_placements: Mutex::new(HashMap::new()),
             folders: Mutex::new(HashMap::new()),
             fail: Mutex::new(false),
+            failing_calls: Mutex::new(0),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -380,6 +384,22 @@ impl FakeEventLookup {
         self
     }
 
+    /// Make the next `count` lookups fail with a network error.
+    pub fn fail_next(self, count: usize) -> Self {
+        *self.failing_calls.lock().unwrap() = count;
+        self
+    }
+
+    /// Consume one scripted failing call, if any are left.
+    fn consume_failing_call(&self) -> bool {
+        let mut failing_calls = self.failing_calls.lock().unwrap();
+        if *failing_calls == 0 {
+            return false;
+        }
+        *failing_calls -= 1;
+        true
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
@@ -399,7 +419,7 @@ impl EventLookup for FakeEventLookup {
         mail_element_id: &str,
     ) -> Result<Option<Vec<MailPlacement>>> {
         self.calls.lock().unwrap().push("headers_for_mail".into());
-        if *self.fail.lock().unwrap() {
+        if *self.fail.lock().unwrap() || self.consume_failing_call() {
             return Err(Error::Network("event entity unavailable".into()));
         }
         Ok(self
@@ -417,7 +437,7 @@ impl EventLookup for FakeEventLookup {
         entry_element_id: &str,
     ) -> Result<Option<MailPlacement>> {
         self.calls.lock().unwrap().push("header_for_entry".into());
-        if *self.fail.lock().unwrap() {
+        if *self.fail.lock().unwrap() || self.consume_failing_call() {
             return Err(Error::Network("event entity unavailable".into()));
         }
         Ok(self
@@ -431,7 +451,7 @@ impl EventLookup for FakeEventLookup {
 
     async fn folder(&self, set_list_id: &str, set_element_id: &str) -> Result<Option<Folder>> {
         self.calls.lock().unwrap().push("folder".into());
-        if *self.fail.lock().unwrap() {
+        if *self.fail.lock().unwrap() || self.consume_failing_call() {
             return Err(Error::Network("event entity unavailable".into()));
         }
         Ok(self
