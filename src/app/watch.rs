@@ -256,5 +256,6 @@ mod tests {
         assert!(is_fatal(&Error::Login("x".into())));
         assert!(is_fatal(&Error::Storage("x".into())));
         assert!(is_fatal(&Error::MissingCredentials));
+        assert!(is_fatal(&Error::Unsupported("x".into())));
     }
 }

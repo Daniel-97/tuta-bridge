@@ -107,13 +107,18 @@ pub fn is_event_group(group_type: Option<i64>) -> bool {
 /// Map a websocket close code to the error the processor must act on.
 ///
 /// Authentication and session close codes are fatal for the session: the
-/// caller must run login again. Rate limiting and every other close are
-/// reconnectable network errors. `None` is a close without a code.
+/// caller must run login again. A rejected client version is fatal too,
+/// but needs an SDK update instead of a login. Rate limiting and every
+/// other close are reconnectable network errors. `None` is a close
+/// without a code.
 pub fn close_error(code: Option<u16>) -> Error {
     match code {
         Some(4403 | 4440 | 4470 | 4471 | 4472) => {
             Error::Login("event stream not authorized; run login again".into())
         }
+        Some(4474) => Error::Unsupported(
+            "event stream client version rejected; update the bridge SDK pin".into(),
+        ),
         Some(4429) => Error::Network("event stream rate limited".into()),
         _ => Error::Network("event stream closed".into()),
     }
@@ -282,6 +287,17 @@ mod tests {
         assert!(matches!(close_error(Some(4471)), Error::Login(_)));
         assert!(matches!(close_error(Some(4472)), Error::Login(_)));
         assert!(matches!(close_error(Some(1000)), Error::Network(_)));
+    }
+
+    #[test]
+    fn rejected_client_version_is_fatal_unsupported() {
+        match close_error(Some(4474)) {
+            Error::Unsupported(message) => assert_eq!(
+                message,
+                "event stream client version rejected; update the bridge SDK pin"
+            ),
+            other => panic!("expected an unsupported error, got {other:?}"),
+        }
     }
 
     #[test]
