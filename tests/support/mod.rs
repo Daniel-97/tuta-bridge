@@ -159,6 +159,17 @@ impl FakeStateStore {
             .map(|message| message.uid)
     }
 
+    /// Group id to the batch id last persisted for one account.
+    pub fn last_batches_for(&self, account_id: i64) -> HashMap<String, String> {
+        self.last_batches
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((stored_account_id, _), _)| *stored_account_id == account_id)
+            .map(|((_, group_id), batch_id)| (group_id.clone(), batch_id.clone()))
+            .collect()
+    }
+
     /// Upsert without recording a call, shared by `upsert_mailbox` and
     /// `apply_batch`.
     fn upsert_mailbox_entry(
