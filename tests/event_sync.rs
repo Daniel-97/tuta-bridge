@@ -446,6 +446,51 @@ async fn unknown_types_and_entry_deletes_are_skipped_but_persisted() {
 }
 
 #[tokio::test]
+async fn delete_then_entry_create_in_one_batch_removes_the_mail() {
+    let store = Arc::new(FakeStateStore::new());
+    let account = account(&store).await;
+    // The mail is already filed in two folders.
+    filed(&store, account, "list-a", "mail-list", "mail-1").await;
+    filed(&store, account, "list-b", "mail-list", "mail-1").await;
+    let lookup = FakeEventLookup::new().with_entry_placement(
+        "list-a",
+        "entry-1",
+        placement("list-a", "mail-list", "mail-1"),
+    );
+    // A Mail delete followed by a late MailSetEntry create that files
+    // the same mail again: the delete must win.
+    let batch = batch(vec![
+        event(
+            "tutanota",
+            MAIL_TYPE_ID,
+            "mail-list",
+            "mail-1",
+            EntityOperation::Delete,
+        ),
+        event(
+            "tutanota",
+            MAIL_SET_ENTRY_TYPE_ID,
+            "list-a",
+            "entry-1",
+            EntityOperation::Create,
+        ),
+    ]);
+
+    let report = EventProcessor::new(store.clone())
+        .apply(account, &lookup, 7, &batch)
+        .await
+        .unwrap();
+
+    // The delete and the entry create each produced an action.
+    assert_eq!(report.changes, 2);
+    assert_eq!(report.skipped, 0);
+    // The mail has no UID left in any mailbox.
+    for mailbox in store.mailboxes(account).await.unwrap() {
+        assert_eq!(store.uid_for(mailbox.id, "mail-list", "mail-1"), None);
+    }
+}
+
+#[tokio::test]
 async fn duplicate_entry_placement_counts_as_skipped() {
     let store = Arc::new(FakeStateStore::new());
     let account = account(&store).await;

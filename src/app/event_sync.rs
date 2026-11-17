@@ -61,11 +61,14 @@ impl EventProcessor {
     /// are coalesced per element id — a `Mail` create/update replaces the
     /// element's action with the lookup's authoritative placements, a
     /// `Mail` delete sets `Delete`, and a `MailSetEntry` create/update adds
-    /// a single placement — so one batch never emits both a removal and an
-    /// upsert for the same element. Unreadable or failed lookups are
-    /// skipped and keep the stored rows. Afterwards every action becomes
-    /// state changes and `apply_batch` runs exactly once, even when nothing
-    /// changed, so the batch id always advances.
+    /// a single placement. A batch can therefore still emit both a removal
+    /// and an upsert for one mail — a `Mail` delete followed by a late
+    /// entry create — and the delete wins because `apply_batch` applies
+    /// removals after upserts and entry ids never collide with mail ids,
+    /// so the two actions never overwrite each other. Unreadable or
+    /// failed lookups are skipped and keep the stored rows. Afterwards
+    /// every action becomes state changes and `apply_batch` runs exactly
+    /// once, even when nothing changed, so the batch id always advances.
     pub async fn apply(
         &self,
         account_id: i64,
@@ -238,9 +241,10 @@ fn add_placement(
 ///
 /// A deleted mail, or one the lookup reports without any placement, loses
 /// every stored row. A placed mail is upserted once per placement and
-/// every placement outside the reported mailboxes is removed; the two
-/// outcomes never mix for one element, so a batch cannot remove and upsert
-/// the same mail at once.
+/// every placement outside the reported mailboxes is removed. One action
+/// never mixes the two outcomes; a removal and an upsert for the same
+/// mail from different actions (a delete plus a late entry create) is
+/// settled by `apply_batch`, which runs removals after upserts.
 fn action_changes(element_id: String, action: MailAction) -> Vec<StateChange> {
     match action {
         MailAction::Delete => vec![StateChange::RemoveHeaderEverywhere { element_id }],
