@@ -10,6 +10,7 @@ use tuta_bridge::domain::{
     MessageSummary, Result, StateChange, StoredCredentials, StoredMailbox, StoredMessage,
 };
 use tuta_bridge::ports::credentials::CredentialStore;
+use tuta_bridge::ports::event_lookup::EventLookup;
 use tuta_bridge::ports::mail_source::MailSource;
 use tuta_bridge::ports::prompt::LoginPrompt;
 use tuta_bridge::ports::renderer::MessageRenderer;
@@ -279,6 +280,154 @@ impl FakeStateStore {
 impl Default for FakeStateStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeEventLookup
+// ---------------------------------------------------------------------------
+
+/// Placement headers per mail keyed by the mail's `(list_id, element_id)`;
+/// `None` marks the mail unreadable so the caller keeps its rows.
+type MailHeaderMap = Mutex<HashMap<(String, String), Option<Vec<MessageHeader>>>>;
+/// Header per mail-set entry keyed by the entry's `(list_id, element_id)`;
+/// `None` means no readable header.
+type EntryHeaderMap = Mutex<HashMap<(String, String), Option<MessageHeader>>>;
+/// Folder per mail set keyed by the set's `(list_id, element_id)`.
+type FolderMap = Mutex<HashMap<(String, String), Option<Folder>>>;
+
+/// In-memory [`EventLookup`] for processor tests.
+///
+/// Placement headers, entry headers, and folders are keyed by their
+/// `(list_id, element_id)` pairs. A missing key answers `Ok(None)` so an
+/// unconfigured entity never causes a deletion, and a `None` value
+/// reproduces the unreadable/absent case. `with_failure` makes every lookup
+/// fail with the fixed network error.
+pub struct FakeEventLookup {
+    pub mail_headers: MailHeaderMap,
+    pub entry_headers: EntryHeaderMap,
+    pub folders: FolderMap,
+    /// When set, every lookup fails with a network error.
+    pub fail: Mutex<bool>,
+    pub calls: Mutex<Vec<String>>,
+}
+
+impl FakeEventLookup {
+    pub fn new() -> Self {
+        Self {
+            mail_headers: Mutex::new(HashMap::new()),
+            entry_headers: Mutex::new(HashMap::new()),
+            folders: Mutex::new(HashMap::new()),
+            fail: Mutex::new(false),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Configure the placements of one mail; `None` marks the mail
+    /// unreadable so the caller keeps its existing rows.
+    pub fn with_mail_headers(
+        self,
+        mail_list_id: &str,
+        mail_element_id: &str,
+        headers: Option<Vec<MessageHeader>>,
+    ) -> Self {
+        self.mail_headers.lock().unwrap().insert(
+            (mail_list_id.to_string(), mail_element_id.to_string()),
+            headers,
+        );
+        self
+    }
+
+    /// Configure the header of one mail-set entry.
+    pub fn with_entry_header(
+        self,
+        entry_list_id: &str,
+        entry_element_id: &str,
+        header: MessageHeader,
+    ) -> Self {
+        self.entry_headers.lock().unwrap().insert(
+            (entry_list_id.to_string(), entry_element_id.to_string()),
+            Some(header),
+        );
+        self
+    }
+
+    /// Configure the folder of one mail set.
+    pub fn with_folder(self, set_list_id: &str, set_element_id: &str, folder: Folder) -> Self {
+        self.folders.lock().unwrap().insert(
+            (set_list_id.to_string(), set_element_id.to_string()),
+            Some(folder),
+        );
+        self
+    }
+
+    /// Make every lookup fail with a network error.
+    pub fn with_failure(self) -> Self {
+        *self.fail.lock().unwrap() = true;
+        self
+    }
+
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Default for FakeEventLookup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl EventLookup for FakeEventLookup {
+    async fn headers_for_mail(
+        &self,
+        mail_list_id: &str,
+        mail_element_id: &str,
+    ) -> Result<Option<Vec<MessageHeader>>> {
+        self.calls.lock().unwrap().push("headers_for_mail".into());
+        if *self.fail.lock().unwrap() {
+            return Err(Error::Network("event entity unavailable".into()));
+        }
+        Ok(self
+            .mail_headers
+            .lock()
+            .unwrap()
+            .get(&(mail_list_id.to_string(), mail_element_id.to_string()))
+            .cloned()
+            .unwrap_or(None))
+    }
+
+    async fn header_for_entry(
+        &self,
+        entry_list_id: &str,
+        entry_element_id: &str,
+    ) -> Result<Option<MessageHeader>> {
+        self.calls.lock().unwrap().push("header_for_entry".into());
+        if *self.fail.lock().unwrap() {
+            return Err(Error::Network("event entity unavailable".into()));
+        }
+        Ok(self
+            .entry_headers
+            .lock()
+            .unwrap()
+            .get(&(entry_list_id.to_string(), entry_element_id.to_string()))
+            .cloned()
+            .unwrap_or(None))
+    }
+
+    async fn folder(&self, set_list_id: &str, set_element_id: &str) -> Result<Option<Folder>> {
+        self.calls.lock().unwrap().push("folder".into());
+        if *self.fail.lock().unwrap() {
+            return Err(Error::Network("event entity unavailable".into()));
+        }
+        Ok(self
+            .folders
+            .lock()
+            .unwrap()
+            .get(&(set_list_id.to_string(), set_element_id.to_string()))
+            .cloned()
+            .unwrap_or(None))
     }
 }
 
