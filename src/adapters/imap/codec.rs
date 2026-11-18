@@ -281,13 +281,12 @@ pub enum ImapString {
     Literal(Vec<u8>),
 }
 
-/// Encode `value` as a quoted string only when it is non-empty printable
-/// ASCII without CR/LF, `"`, or `\`; every other value becomes a literal
-/// byte string.
+/// Encode `value` as a quoted string when it is printable ASCII — the
+/// empty string included, which renders as `""` — without CR/LF, `"`,
+/// or `\`; every other value becomes a literal byte string.
 pub fn encode_string(value: &str) -> ImapString {
-    let quotable = !value.is_empty()
-        && value.bytes().all(|b| (0x20..=0x7e).contains(&b))
-        && !value.contains(['"', '\\']);
+    let quotable =
+        value.bytes().all(|b| (0x20..=0x7e).contains(&b)) && !value.contains(['"', '\\']);
     if quotable {
         ImapString::Quoted(value.to_string())
     } else {
@@ -586,7 +585,8 @@ mod tests {
         assert!(
             matches!(encode_string("Caffè"), ImapString::Literal(bytes) if bytes == "Caffè".as_bytes().to_vec())
         );
-        assert!(matches!(encode_string(""), ImapString::Literal(_)));
+        // An empty string renders as "" — never a `{0}` literal.
+        assert_eq!(encode_string(""), ImapString::Quoted(String::new()));
         assert!(matches!(
             encode_string("line\nbreak"),
             ImapString::Literal(_)

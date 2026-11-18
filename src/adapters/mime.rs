@@ -66,7 +66,10 @@ fn is_token(s: &str) -> bool {
 ///
 /// Anything else — including values that carry a CR/LF or a separator and could
 /// inject a header line — falls back to `application/octet-stream`.
-fn sanitize_media_type(mime: &str) -> String {
+///
+/// Crate-shared: the IMAP BODYSTRUCTURE renderer calls this so its
+/// reported media types always match the headers `build_message` writes.
+pub(crate) fn sanitize_media_type(mime: &str) -> String {
     let (ty, sub) = match mime.split_once('/') {
         Some((t, s)) if !t.is_empty() && !s.is_empty() && !s.contains('/') => (t, s),
         _ => return "application/octet-stream".to_string(),
@@ -82,7 +85,10 @@ fn sanitize_media_type(mime: &str) -> String {
 ///
 /// Returns `None` when the value contains CR/LF, whitespace, or `<`/`>` and so
 /// could inject a header line; the caller then treats it as a normal attachment.
-fn sanitize_cid(cid: &str) -> Option<String> {
+///
+/// Crate-shared: the IMAP BODYSTRUCTURE renderer calls this to split
+/// inline from regular attachments exactly like `build_message` does.
+pub(crate) fn sanitize_cid(cid: &str) -> Option<String> {
     let trimmed = cid.trim();
     let inner = if trimmed.len() >= 2 && trimmed.starts_with('<') && trimmed.ends_with('>') {
         &trimmed[1..trimmed.len() - 1]
