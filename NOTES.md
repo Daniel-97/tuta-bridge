@@ -107,15 +107,22 @@
     `<tag> OK [READ-WRITE] SELECT completed`. RFC 3501 mandates
     presence, not order; `[READ-WRITE]` with `PERMANENTFLAGS ()` keeps
     clients working while every write answers NO.
+  - `* OK [UNSEEN <n>]` carries the unseen COUNT, not the
+    first-unseen message number RFC 3501 §6.3.1 describes — a
+    conformance deviation every tested client tolerates.
   - Server-sent literals are inline `{n}\r\n<bytes>` — no continuation
     round-trip; bodies stream in 64 KiB chunks with at most one
     rendered message in memory. Client literals get a `+ ` continuation
     and are capped at 16 MiB (an oversized announcement answers NO and
-    ends the connection); command lines are capped at 64 KiB.
+    ends the connection); command lines are capped at 64 KiB, and a
+    longer line is answered BAD and discarded while being read, never
+    buffered whole.
   - `ID` is answered with `* ID ("name" "tuta-bridge")` without
     interpreting the client payload.
   - A FETCH for an expunged uid answers nothing and the rest of the
-    FETCH continues.
+    FETCH continues; a message whose details cannot be loaded is
+    skipped in the FETCH response exactly like an expunged one, and
+    its row disappears on the next sync or event.
 - IDLE reset rules: a `Selected` session re-validates its snapshot
   before every command except `SELECT`/`EXAMINE` (which replace it)
   and `CLOSE`/`LOGOUT` (which drop or end it), and on every drained
@@ -125,6 +132,11 @@
   untagged `EXISTS`; a `RecvError::Lagged` broadcast receiver means
   "everything may have changed" and forces the same re-check, both in
   and out of IDLE.
+- IDLE literal edge: a tagged BAD during IDLE never answers a literal
+  continuation, and RFC 3501 obliges the client not to send the octets
+  its `{n}` token announced — the session reads none of them, and
+  octets a misbehaving client sends anyway surface as rejected command
+  lines.
 - Password and certificate locations and modes: the bridge password is
   stored verbatim (no JSON, nothing to version) in the Secret Service
   under service `tuta-bridge`, account `imap-bridge` — readable with
