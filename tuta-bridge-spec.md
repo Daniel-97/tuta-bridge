@@ -445,6 +445,18 @@ Ogni milestone ha un criterio di accettazione verificabile. Procedere in ordine 
 - Servizio `systemd --user`, log senza contenuti, gestione errori utente (sessione scaduta, 2FA, modello server cambiato), documentazione di setup per Thunderbird e per gli altri client testati (con matrice di compatibilità), test di regressione.
 - **Facoltativo:** calendario/contatti (le facade esistono già nell'SDK), più account.
 
+### M9: Notifiche di stato IMAP (progress)
+
+- Inviare `* OK [ALERT]` non taggati prima delle operazioni on-demand costose (es. primo FETCH di massa: "scarico i dettagli da Tuta, la prima lettura è più lenta") e, dove il protocollo lo consente, anticipare il conteggio (`EXISTS`/`STATUS` sono già disponibili) perché il client possa stimare il progresso.
+- Verificare empiricamente cosa Thunderbird e mbsync mostrano: il conteggio/progress bar è comunque una stima **lato client**; ALERT è l'unico canale standard per testo leggibile (RFC 3501 §7.1), `NOTIFY` (RFC 5435) riguarda gli eventi, non il progresso.
+- **Accettazione:** durante il primo FETCH di massa Thunderbird mostra un messaggio di stato del bridge invece di un indicatore indeterminato muto; i log restano senza PII.
+
+### M10: POP3 (facoltativo)
+
+- Bridge POP3 in sola lettura su TLS loopback (porta dedicata, es. 9950): `USER/PASS`, `STAT`, `LIST`, `UIDL` (derivato dagli UID stabili per cartella), `TOP`, `RETR` con rendering MIME on demand (riuso di `EnvelopeEnricher`/`MimeRenderer`), `NOOP`, `RST`, `QUIT`; `DELE` rifiutato (le scritture restano in M6).
+- Solo Inbox (POP3 non ha cartelle); leave-on-server sempre attivo; documentato che flag/IDLE/ricerca server-side non esistono in POP3.
+- **Accettazione:** un client POP3 (es. `fetchmail` o Thunderbird in modalità POP3) scarica l'Inbox, una seconda sessione non riscarica nulla (UIDL stabili), il corpo e gli allegati si aprono.
+
 ---
 
 ## 9. Registro delle verifiche (da compilare durante il lavoro)
