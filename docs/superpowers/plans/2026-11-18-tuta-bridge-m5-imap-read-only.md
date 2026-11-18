@@ -228,9 +228,9 @@ git commit -m "feat: add imap request codec"
 **Interfaces:**
 - Consumes: `codec::encode_string`, `MessageHeader`, `MessageContent`, `FolderKind`.
 - Produces:
-  - `pub fn internal_date(ms: i64) -> String` → `"18-Nov-2026 10:11:12 +0000"` (UTC)
+  - `pub fn internal_date(ms: i64) -> String` → `"14-Nov-2023 22:13:20 +0000"` (UTC, dashes per RFC 3501, single-digit days SPACE-padded)
   - `pub fn flags(unread: bool) -> String` → `""` or `"\\Seen"`
-  - `pub fn special_use(kind: &FolderKind) -> &'static str` (Inbox/Sent/Drafts/Trash/Junk/Archive → `\\Inbox`/`\\Sent`/`\\Drafts`/`\\Trash`/`\\Junk`/`\\Archive`; Custom → `""`)
+  - `pub fn special_use(kind: &FolderKind) -> &'static str` (Sent/Drafts/Trash/Junk/Archive → `\\Sent`/`\\Drafts`/`\\Trash`/`\\Junk`/`\\Archive`; Inbox and Custom → `""` — INBOX is identified by name, not by an attribute)
   - `pub fn envelope(header: &MessageHeader) -> String`
   - `pub fn bodystructure(content: &MessageContent) -> String`
 
@@ -239,32 +239,48 @@ git commit -m "feat: add imap request codec"
 ```rust
 #[test]
 fn envelope_renders_nils_and_addresses() {
-    let header = complete_header(); // fixture helper: from "Alice <alice@x.y>", to "Bob <bob@x.y>", subject "Hi", message_id "<m1@x.y>", sent_at_ms 1_700_000_000_000, empty cc/bcc/reply-to
+    let header = complete_header(); // fixture helper: from "Alice <alice@x.y>", to "Bob <bob@x.y>", subject "Hi", message_id "<m1@x.y>", sent_at_ms 1_700_000_000_000, empty cc/bcc, no in-reply-to
     let rendered = envelope(&header);
-    assert!(rendered.starts_with("(\"Tue, 14 Nov 2023 22:13:20 +0000\""));
-    assert!(rendered.contains("((NIL NIL \"alice\" \"x.y\"))"));
-    assert!(rendered.contains("((\"Bob\" NIL \"bob\" \"x.y\"))"));
-    assert!(rendered.contains("\"Hi\""));
-    assert!(rendered.ends_with("NIL \"<m1@x.y>\")"));
-    assert!(rendered.contains("(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)")); // empty cc/bcc/reply-to
+    // Pin the COMPLETE byte-exact string; empty cc/bcc and a missing
+    // in-reply-to are bare NIL tokens (RFC 3501 env-cc/env-bcc = "(" 1*address
+    // ")" / nil — never a parenthesized group of NILs), and sender/reply-to
+    // default to the from value.
+    assert_eq!(
+        rendered,
+        "(\"Tue, 14 Nov 2023 22:13:20 +0000\" \"Hi\" \
+          ((\"Alice\" NIL \"alice\" \"x.y\")) \
+          ((\"Alice\" NIL \"alice\" \"x.y\")) \
+          ((\"Alice\" NIL \"alice\" \"x.y\")) \
+          ((\"Bob\" NIL \"bob\" \"x.y\")) \
+          NIL NIL NIL \"<m1@x.y>\")"
+    );
 }
 
 #[test]
-fn bodystructure_matches_the_mime_renderer_shape() {
-    // content with html body + one attachment named "doc.pdf"
-    let rendered = bodystructure(&content);
-    assert!(rendered.starts_with("(\"mixed\""));
-    assert!(rendered.contains("(\"alternative\""));
-    assert!(rendered.contains("(\"application\" \"pdf\" (\"NAME\" \"doc.pdf\")"));
-    // single-part plain body renders as ("TEXT" "PLAIN" ...).
+fn bodystructure_mirrors_the_mime_renderer_tree() {
+    // read src/adapters/mime.rs first: the renderer ALWAYS writes
+    // multipart/mixed( multipart/alternative( text/plain [multipart/related(
+    // text/html + inline attachments)] ) + regular attachments ) with
+    // deterministic boundaries. RFC 3501 body-type-mpart = 1*body SP
+    // media-subtype SP body-fld-param: the PARTS come first, then the
+    // subtype, then ("BOUNDARY" <boundary>).
+    let rendered = bodystructure(&content_with_html_and_attachment_named("doc.pdf"));
+    assert!(rendered.starts_with("((\"TEXT\" \"PLAIN\""));
+    assert!(rendered.contains("\"ALTERNATIVE\" (\"BOUNDARY\""));
+    assert!(rendered.contains("\"RELATED\" (\"BOUNDARY\""));
+    assert!(rendered.contains("\"MIXED\" (\"BOUNDARY\""));
+    assert!(rendered.contains("(\"APPLICATION\" \"PDF\" (\"NAME\" \"doc.pdf\")"));
 }
 
 #[test]
 fn internal_date_and_flags_are_fixed_format() {
-    assert_eq!(internal_date(1_700_000_000_000), "\"14 Nov 2023 22:13:20 +0000\"");
+    assert_eq!(internal_date(1_700_000_000_000), "\"14-Nov-2023 22:13:20 +0000\"");
+    // RFC 3501 date-day-fixed: single-digit days are SPACE-padded, not zero-padded.
+    assert_eq!(internal_date(millis_of_day(4)), "\" 4-Nov-2023 00:00:00 +0000\"");
     assert_eq!(flags(true), "");
     assert_eq!(flags(false), "\\Seen");
-    assert_eq!(special_use(&FolderKind::Inbox), "\\Inbox");
+    assert_eq!(special_use(&FolderKind::Inbox), "", "INBOX needs no special-use attribute");
+    assert_eq!(special_use(&FolderKind::Archive), "\\Archive");
 }
 ```
 
@@ -276,7 +292,7 @@ Expected: FAIL.
 - [ ] **Step 3: Implement**
 
 - `envelope` order per RFC 3501: `(date subject from sender reply-to to cc bcc in-reply-to message-id)`; `sender`/`reply-to` default to the from value when absent (standard practice); every address is `(name adl mailbox host)` with `NIL` adl and mailbox/host split at the last `@`. All strings go through `codec::encode_string`; a `sent_at_ms <= 0` renders a `NIL` date (pre-epoch dates are never fabricated — Proton sanitizes them for Apple Mail; we simply omit until enrichment).
-- `bodystructure` mirrors what `MimeRenderer::render` produces (read `src/adapters/mime.rs` first): text-only → single `("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" <len> <lines>)`; html present → `("alternative" ("TEXT" "PLAIN" ...) ("TEXT" "HTML" ...))`; attachments → `("mixed" ... ("application" <lowercased-ext> ("NAME" <name>) NIL NIL "BASE64" <len> NIL))`. Non-multipart extension data is omitted.
+- `bodystructure` mirrors what `MimeRenderer::render` actually writes — read `src/adapters/mime.rs` first and replicate its tree exactly: the root is **always** `multipart/mixed` containing `multipart/alternative( text/plain [multipart/related( text/html + inline attachments )] )` followed by root-level inline attachments (when there is no html) and regular attachments. Per RFC 3501 the parts come first, then the subtype, then `("BOUNDARY" <boundary>)`; boundaries come from `deterministic_boundary(seed, label)` with the same seed derivation as `build_message` (`message_id` or `list_id/element_id`). Media types come from `sanitize_media_type(attachment.mime_type)` (upper-cased major/subtype), falling back to `("APPLICATION" "OCTET-STREAM")` when invalid; attachment parts are `("NAME" <name>)` + `"BASE64" <decoded len> NIL NIL NIL NIL` (complete body-ext). Text parts are `("TEXT" "PLAIN"/"HTML" ("CHARSET" "UTF-8") NIL NIL "8BIT" <len> <lines>)`. Empty address lists in `envelope` are bare `NIL`; a `sent_at_ms <= 0` renders a `NIL` date.
 
 - [ ] **Step 4: Run tests and checks**
 
