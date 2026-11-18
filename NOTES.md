@@ -199,7 +199,12 @@
 - The event path never fetched or stored bodies: `messages` still has no body/attachment/`.eml` column; `watch` output is fixed strings and counts only.
 - Two live-only defects were found and fixed during this acceptance, each with a regression test: the server sends `NumberString` fields as JSON strings (the SDK models them as `i64`, so every `entityUpdate` failed to parse), and marker ids encoded the timestamp with a 24-bit instead of 28-bit suffix (the server read them as ancient and replayed the whole retained backlog).
 
-## M5 manual acceptance
+## M5 manual acceptance (2026-11-18)
 
-- Pending: the M5 checklist (terminal `imaplib` client, `mbsync` second-sync stability, Thunderbird folders/attachment/read-only NO, IDLE push and restart, DB schema, log hygiene) has not been run against the real account yet; results will be recorded here.
+- Terminal client (Python `imaplib` over TLS loopback, unverified cert): `LOGIN`, `LIST` shows 18 named mailboxes with the right SPECIAL-USE attributes (INBOX carries none), `SELECT INBOX` reports EXISTS 255 / RECENT 0 / UIDVALIDITY / UIDNEXT / UNSEEN / `FLAGS (\Seen)` / `PERMANENTFLAGS ()`, `STATUS` matches, and `UID FETCH` returns an ENVELOPE whose subject matches the index. `BODY.PEEK[]` serves bytes without any store write; `BODY[]` persists `rfc822_size`; `BODY[HEADER.FIELDS (…)]` works.
+- `mbsync` (isync 1.5.1) with the bridge certificate as `CertificateFile`: first sync pulled 255 messages; an immediate second sync reported **+0** — no body re-downloads, stable UIDs; no warnings after the folder-name fix.
+- Thunderbird (manual account, IMAP `127.0.0.1:9930`, SSL/TLS, certificate exception): folders and headers visible with correct dates and flags; a mail **with an attachment opens correctly**; new mail arrived via **IDLE without any user action** (serve log: event applied → `* n EXISTS` → Thunderbird `UID FETCH`); write commands answer the read-only NO.
+- Acceptance found and fixed three live defects, each with a regression test and a scoped re-review: (a) Tuta system MailSets carry an **empty name** — display names are now derived from the folder kind, custom folders keep theirs; (b) `sent_at` came from `MailDetails.sentDate`, which is **0 for external mail** (M2-era root cause) — it is now parsed from the real `Date:` header, falling back to `sentDate` and then the received time; (c) four genuinely undated mails now show the received time, mirroring the web client. After a `resync` and a client re-download every date displays correctly.
+- The state database is still metadata-only (17 columns); `rfc822_size` and `mime_structure` are populated only for fetched mails; `serve` logs carry only fixed strings and counts.
+- A `resync` run during acceptance changed UIDVALIDITY as designed and Thunderbird rebuilt its cache without errors (the session-reset path exercised in production).
 
