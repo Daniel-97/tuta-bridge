@@ -471,7 +471,8 @@ async fn greets_authenticates_and_lists() {
     // "* OK [CAPABILITY IMAP4rev1] tuta-bridge ready"
     // "a1 LOGIN user@example.invalid hunter2" -> "a1 OK [CAPABILITY IMAP4rev1] LOGIN completed"
     // "a1 LOGIN user@example.invalid wrong"   -> "a1 NO authentication failed"
-    // "a2 LIST \"\" \"*\"" -> '* LIST (\\Inbox) "/" "Inbox"' for every view + "a2 OK LIST completed"
+    // "a2 LIST \"\" \"*\"" -> '* LIST () "/" "Inbox"' for the Inbox (no special-use
+    // attribute) and '* LIST (\\Archive) "/" "Archive"' etc. for the others + "a2 OK LIST completed"
 }
 ```
 
