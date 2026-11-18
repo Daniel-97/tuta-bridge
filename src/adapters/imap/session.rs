@@ -5,17 +5,23 @@
 //! [`ImapBackend`] seam, and writes responses with CRLF line endings.
 //! The state machine is `NotAuthenticated` → LOGIN → `Authenticated` →
 //! SELECT/EXAMINE → `Selected`; CAPABILITY, NOOP, ID, and LOGOUT are
-//! valid everywhere, commands outside their state answer BAD.
+//! valid everywhere, commands outside their state answer BAD, and IDLE
+//! is a `Selected`-state command.
 //!
 //! Two disciplines shape the flow:
 //!
 //! * **Snapshot validity** (the Proton Bridge lesson): a `Selected`
 //!   session compares its UIDVALIDITY with the store's before every
 //!   command that could act on it and, on mismatch, sends one fixed
-//!   untagged BYE and closes — the client must reconnect. NOOP also
-//!   drains the mailbox-change broadcast, so polling clients see
-//!   `* <n> EXISTS` updates without IDLE, and a lagged receiver treats
-//!   "everything may have changed" literally.
+//!   untagged BYE and closes — the client must reconnect. NOOP drains
+//!   the mailbox-change broadcast, so polling clients see `* <n>`
+//!   EXISTS updates without IDLE, and a lagged receiver treats
+//!   "everything may have changed" literally. IDLE (RFC 2177) pushes
+//!   the same drain live: it answers `+ idling`, flushes whatever
+//!   queued at the boundary so no update is lost, and waits on the
+//!   command reader and the watcher at once — `DONE` ends it with the
+//!   tagged OK, LOGOUT behaves as always, and any other command
+//!   answers BAD and returns to normal dispatch.
 //!
 //! * **Log hygiene**: the session logs with `tracing::debug!` only, with
 //!   tag, command, and count fields. Mailbox names, subjects, bodies,
@@ -139,7 +145,7 @@ where
                 break;
             }
             Incoming::Request(request) => {
-                let flow = session.dispatch(&mut writer, request).await?;
+                let flow = session.dispatch(&mut reader, &mut writer, request).await?;
                 if matches!(flow, Flow::Close) {
                     break;
                 }
@@ -183,7 +189,8 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut line = match read_line(reader).await? {
+    let mut bytes = Vec::new();
+    let mut line = match read_line(reader, &mut bytes).await? {
         Some(line) => line,
         None => return Ok(Incoming::Eof),
     };
@@ -218,7 +225,7 @@ where
         }
 
         // The rest of the line follows the literal bytes.
-        line = match read_line(reader).await? {
+        line = match read_line(reader, &mut bytes).await? {
             Some(line) => line,
             None => return Ok(Incoming::Eof),
         };
@@ -234,12 +241,16 @@ where
 
 /// Read one CRLF-terminated line. Invalid UTF-8 degrades to replacement
 /// characters, which the parser rejects with its fixed error.
-async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<String>> {
-    let mut bytes = Vec::new();
-    let read = reader
-        .read_until(b'\n', &mut bytes)
-        .await
-        .map_err(io_failed)?;
+///
+/// `bytes` is the caller's buffer: whatever a partially-completed read
+/// consumed stays in it, so a read that is abandoned mid-line (the IDLE
+/// select drops one) resumes where it stopped instead of losing stream
+/// bytes. On a completed line the buffer is emptied for the next read.
+async fn read_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    bytes: &mut Vec<u8>,
+) -> Result<Option<String>> {
+    let read = reader.read_until(b'\n', bytes).await.map_err(io_failed)?;
     if read == 0 {
         return Ok(None);
     }
@@ -249,17 +260,21 @@ async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Str
     if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    let line = String::from_utf8_lossy(bytes).into_owned();
+    bytes.clear();
+    Ok(Some(line))
 }
 
 /// The tag to answer a BAD with when the line did not parse: the first
-/// token when it is printable ASCII without response-code brackets,
-/// `*` otherwise. Control characters must never enter a response line.
+/// token when it is printable ASCII without response-code brackets or a
+/// literal-opening brace, `*` otherwise. Control characters must never
+/// enter a response line, and neither may a garbage `{5}` token — the
+/// client could misread its echo as a continuation announcement.
 fn bad_tag(line: &str) -> String {
     let token = line.split_whitespace().next().unwrap_or("*");
     let safe = !token.is_empty()
         && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
-        && !token.contains(['[', ']']);
+        && !token.contains(['[', ']', '{']);
     if safe {
         token.to_string()
     } else {
@@ -280,6 +295,15 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, text: &str) -> Result
     Ok(())
 }
 
+/// The fixed LOGOUT response: one untagged BYE, the tagged OK, and the
+/// end of the session. Shared by the normal dispatch and by LOGOUT
+/// arriving during IDLE, which behaves exactly as it always does.
+async fn respond_logout<W: AsyncWrite + Unpin>(writer: &mut W, tag: &str) -> Result<()> {
+    write_line(writer, "* BYE tuta-bridge signing off").await?;
+    write_line(writer, &format!("{tag} OK LOGOUT completed")).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -287,11 +311,16 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, text: &str) -> Result
 impl Session {
     /// Dispatch one command, catching backend errors into a tagged NO
     /// with the error's fixed text.
-    async fn dispatch<W: AsyncWrite + Unpin>(
+    async fn dispatch<R, W>(
         &mut self,
+        reader: &mut R,
         writer: &mut W,
         request: Request,
-    ) -> Result<Flow> {
+    ) -> Result<Flow>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
         let Request { tag, command, args } = request;
         let command = command.to_ascii_uppercase();
         tracing::debug!(tag = %tag, command = %command, "imap command");
@@ -308,6 +337,19 @@ impl Session {
         }
 
         let verb = normalize(&command, &args);
+        // IDLE is served here rather than in dispatch_command because
+        // its DONE loop reads from the connection.
+        if verb == "IDLE" {
+            if self.state.selected() {
+                return self.handle_idle(reader, writer, &tag).await;
+            }
+            write_line(
+                writer,
+                &format!("{tag} BAD command not valid in this state"),
+            )
+            .await?;
+            return Ok(Flow::Continue);
+        }
         let flow = self.dispatch_command(writer, &tag, &verb, &args).await;
         match flow {
             Ok(flow) => Ok(flow),
@@ -350,8 +392,7 @@ impl Session {
                 write_line(writer, &format!("{tag} OK ID completed")).await?;
             }
             "LOGOUT" => {
-                write_line(writer, "* BYE tuta-bridge signing off").await?;
-                write_line(writer, &format!("{tag} OK LOGOUT completed")).await?;
+                respond_logout(writer, tag).await?;
                 return Ok(Flow::Close);
             }
             "LOGIN" => {
@@ -454,19 +495,6 @@ impl Session {
                 if self.state.selected() {
                     self.state = State::Authenticated;
                     write_line(writer, &format!("{tag} OK CLOSE completed")).await?;
-                } else {
-                    write_line(
-                        writer,
-                        &format!("{tag} BAD command not valid in this state"),
-                    )
-                    .await?;
-                }
-            }
-            "IDLE" => {
-                // The watch receiver is already wired; Task 7 activates
-                // the push loop. Until then IDLE is a tagged NO.
-                if self.state.authenticated() {
-                    write_line(writer, &format!("{tag} NO not supported")).await?;
                 } else {
                     write_line(
                         writer,
@@ -755,10 +783,10 @@ impl Session {
             // An expunged uid answers nothing; the rest of the FETCH
             // continues (the Proton Bridge lesson for mid-session
             // expunges).
-            let Some(response) = self.backend.fetch(mailbox, *uid, &items).await? else {
+            let Some(mut response) = self.backend.fetch(mailbox, *uid, &items).await? else {
                 continue;
             };
-            for piece in render_fetch(msn, &response, &items) {
+            for piece in render_fetch(msn, &mut response, &items) {
                 match piece {
                     Piece::Text(text) => {
                         writer.write_all(text.as_bytes()).await.map_err(io_failed)?
@@ -848,16 +876,11 @@ impl Session {
 
     /// Drain pending mailbox notifications. When one concerns the
     /// selected mailbox — or the receiver lagged, which means everything
-    /// may have changed — refresh the snapshot, report a changed count as
-    /// `* <n> EXISTS`, and close the session if the UIDVALIDITY moved.
+    /// may have changed — the snapshot is re-checked with
+    /// [`Session::refresh_selected_snapshot`].
     async fn flush_notifications<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<Flow> {
-        let (mailbox, name, previous_exists, session_uidvalidity) = match &self.state {
-            State::Selected {
-                view,
-                exists,
-                uidvalidity,
-                ..
-            } => (view.id, view.name.clone(), *exists, *uidvalidity),
+        let mailbox = match &self.state {
+            State::Selected { view, .. } => view.id,
             _ => return Ok(Flow::Continue),
         };
 
@@ -873,9 +896,27 @@ impl Session {
         if !relevant {
             return Ok(Flow::Continue);
         }
+        self.refresh_selected_snapshot(writer).await
+    }
 
-        // Everything may have changed: re-check the count and the
-        // UIDVALIDITY in one round-trip.
+    /// Re-check the selected snapshot against the store in one
+    /// round-trip: a vanished mailbox or a moved UIDVALIDITY sends the
+    /// resync BYE and ends the session; a changed count is reported as
+    /// `* <n> EXISTS`; the session's counts refresh either way.
+    async fn refresh_selected_snapshot<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+    ) -> Result<Flow> {
+        let (name, previous_exists, session_uidvalidity) = match &self.state {
+            State::Selected {
+                view,
+                exists,
+                uidvalidity,
+                ..
+            } => (view.name.clone(), *exists, *uidvalidity),
+            _ => return Ok(Flow::Continue),
+        };
+
         let Some(current) = self.backend.select(&name).await? else {
             write_line(writer, RESYNC_BYE).await?;
             return Ok(Flow::Close);
@@ -904,6 +945,106 @@ impl Session {
             "mailbox refreshed"
         );
         Ok(Flow::Continue)
+    }
+
+    // -- IDLE -------------------------------------------------------------
+
+    /// Serve IDLE (RFC 2177) in the `Selected` state: answer `+ idling`,
+    /// flush the notifications that queued while the session was not
+    /// idling — never lose an update at the IDLE boundary — then wait on
+    /// the command reader and the watcher at once. `DONE` ends IDLE with
+    /// the tagged OK; LOGOUT behaves as it always does; any other
+    /// command answers BAD and returns to normal dispatch. A change for
+    /// the selected mailbox re-checks the snapshot; changes for other
+    /// mailboxes emit nothing; a lagged receiver means everything may
+    /// have changed and re-checks too.
+    async fn handle_idle<R, W>(&mut self, reader: &mut R, writer: &mut W, tag: &str) -> Result<Flow>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mailbox = match &self.state {
+            State::Selected { view, .. } => view.id,
+            _ => return Ok(Flow::Continue),
+        };
+
+        write_line(writer, "+ idling").await?;
+        writer.flush().await.map_err(io_failed)?;
+
+        // The boundary flush: a change that queued while the session
+        // was not idling is reported before the first wait.
+        let flow = self.flush_notifications(writer).await?;
+        writer.flush().await.map_err(io_failed)?;
+        if matches!(flow, Flow::Close) {
+            return Ok(Flow::Close);
+        }
+
+        // Carries a partially-read command across select iterations, so
+        // an abandoned read resumes instead of losing stream bytes.
+        let mut fragment = Vec::new();
+        // Whether the watcher can still fire; once every sender is gone
+        // only the command reader is left to wait on.
+        let mut watching = true;
+        loop {
+            tokio::select! {
+                changed = self.watch.recv(), if watching => {
+                    match changed {
+                        Ok(MailboxChanged(changed)) if changed == mailbox => {
+                            if matches!(self.idle_recheck(writer).await?, Flow::Close) {
+                                return Ok(Flow::Close);
+                            }
+                        }
+                        // Other mailboxes emit nothing here.
+                        Ok(_) => {}
+                        // Everything may have changed: full re-check.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if matches!(self.idle_recheck(writer).await?, Flow::Close) {
+                                return Ok(Flow::Close);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => watching = false,
+                    }
+                }
+                line = read_line(reader, &mut fragment) => {
+                    let Some(line) = line? else {
+                        // The client is gone; the main loop's next read
+                        // observes the EOF and ends the session.
+                        return Ok(Flow::Continue);
+                    };
+                    if line.len() > MAX_LINE_BYTES {
+                        write_line(writer, "* BAD invalid command").await?;
+                        return Ok(Flow::Continue);
+                    }
+                    if line.trim().eq_ignore_ascii_case("done") {
+                        write_line(writer, &format!("{tag} OK IDLE completed")).await?;
+                        return Ok(Flow::Continue);
+                    }
+                    if let Ok(request) = codec::parse_line(&line) {
+                        if request.command.eq_ignore_ascii_case("LOGOUT") {
+                            // LOGOUT behaves as it always does.
+                            respond_logout(writer, &request.tag).await?;
+                            return Ok(Flow::Close);
+                        }
+                    }
+                    write_line(
+                        writer,
+                        &format!("{} BAD only DONE ends IDLE", bad_tag(&line)),
+                    )
+                    .await?;
+                    return Ok(Flow::Continue);
+                }
+            }
+        }
+    }
+
+    /// One live re-check while idling. Unlike NOOP's post-command flush,
+    /// nobody will flush after this: the client is waiting on the
+    /// connection, so the response — or the BYE that ends it — must not
+    /// sit in the writer's buffer.
+    async fn idle_recheck<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<Flow> {
+        let flow = self.refresh_selected_snapshot(writer).await?;
+        writer.flush().await.map_err(io_failed)?;
+        Ok(flow)
     }
 }
 
@@ -1042,11 +1183,12 @@ enum Piece {
 /// `FetchItem::Uid` for a UID command when the client did not list it.
 /// ENVELOPE and BODYSTRUCTURE use the backend's strings verbatim (they
 /// already carry their own literal framing). The body — at most one per
-/// response, per the port model — renders at the last body item as
-/// `{n}\r\n` framing followed by the raw bytes: the client never
-/// round-trips a continuation. Items the backend left unfilled are
-/// skipped, which the real backend never produces.
-fn render_fetch(msn: u32, response: &FetchResponse, items: &[FetchItem]) -> Vec<Piece> {
+/// response, per the port model — is taken out of the response and
+/// rendered at the last body item as `{n}\r\n` framing followed by the
+/// raw bytes: the client never round-trips a continuation, and only one
+/// copy of the message is ever in memory. Items the backend left
+/// unfilled are skipped, which the real backend never produces.
+fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> Vec<Piece> {
     let mut pieces: Vec<Piece> = Vec::new();
     let mut text = format!("* {msn} FETCH (");
     let body_at = items.iter().rposition(|item| {
@@ -1106,12 +1248,12 @@ fn render_fetch(msn: u32, response: &FetchResponse, items: &[FetchItem]) -> Vec<
         let Some(name) = body_name else {
             continue;
         };
-        let Some(body) = response.body.as_ref() else {
+        let Some(body) = response.body.take() else {
             continue;
         };
         pieces.push(Piece::Text(std::mem::take(&mut text)));
         pieces.push(Piece::Text(format!("{name} {{{}}}\r\n", body.len())));
-        pieces.push(Piece::Body(body.clone()));
+        pieces.push(Piece::Body(body));
         // The literal bytes end an item run; the next item needs its
         // separator space back.
         text.push(' ');
@@ -1164,6 +1306,19 @@ mod tests {
         items
     }
 
+    /// One backend answer to render.
+    fn sample_response() -> FetchResponse {
+        FetchResponse {
+            uid: 5,
+            flags: "\\Seen".into(),
+            internal_date: "\"14-Nov-2023 22:13:20 +0000\"".into(),
+            envelope: Some("(NIL \"Hi\" NIL NIL NIL NIL NIL NIL NIL NIL)".into()),
+            bodystructure: Some("(\"STRUCTURE\")".into()),
+            rfc822_size: Some(1234),
+            body: Some(b"hello\r\nworld".to_vec()),
+        }
+    }
+
     #[test]
     fn star_resolution_follows_rfc_3501() {
         // A lone `*` selects exactly the last message.
@@ -1190,34 +1345,31 @@ mod tests {
 
     #[test]
     fn fetch_responses_render_with_inline_literals() {
-        let response = FetchResponse {
-            uid: 5,
-            flags: "\\Seen".into(),
-            internal_date: "\"14-Nov-2023 22:13:20 +0000\"".into(),
-            envelope: Some("(NIL \"Hi\" NIL NIL NIL NIL NIL NIL NIL NIL)".into()),
-            bodystructure: Some("(\"STRUCTURE\")".into()),
-            rfc822_size: Some(1234),
-            body: Some(b"hello\r\nworld".to_vec()),
-        };
-
-        // UID auto-appends after the body literal.
+        // UID auto-appends after the body literal. The body moves into
+        // the response stream — peak memory is one copy per message —
+        // so the response is left without one.
+        let mut response = sample_response();
         let items = uid_items(&parse_fetch_items("(FLAGS BODY[])").unwrap());
-        let wire = wire_of(render_fetch(3, &response, &items));
+        let wire = wire_of(render_fetch(3, &mut response, &items));
         assert_eq!(
             wire,
             "* 3 FETCH (FLAGS (\\Seen) BODY[] {12}\r\nhello\r\nworld UID 5)\r\n"
         );
+        assert!(response.body.is_none());
 
         // An explicit UID renders at its requested position; the RFC822
         // aliases frame their body the same way.
+        let mut response = sample_response();
         let items = parse_fetch_items("(UID RFC822)").unwrap();
-        let wire = wire_of(render_fetch(3, &response, &items));
+        let wire = wire_of(render_fetch(3, &mut response, &items));
         assert_eq!(wire, "* 3 FETCH (UID 5 RFC822 {12}\r\nhello\r\nworld)\r\n");
 
-        // Without a body item nothing frames a literal.
+        // Without a body item nothing frames a literal — and the body
+        // the request never read stays in the response.
+        let mut response = sample_response();
         let items =
             parse_fetch_items("(FLAGS ENVELOPE BODYSTRUCTURE RFC822.SIZE INTERNALDATE)").unwrap();
-        let wire = wire_of(render_fetch(1, &response, &items));
+        let wire = wire_of(render_fetch(1, &mut response, &items));
         assert_eq!(
             wire,
             "* 1 FETCH (FLAGS (\\Seen) \
@@ -1226,6 +1378,7 @@ mod tests {
               RFC822.SIZE 1234 \
               INTERNALDATE \"14-Nov-2023 22:13:20 +0000\")\r\n"
         );
+        assert!(response.body.is_some());
     }
 
     #[test]
@@ -1256,6 +1409,10 @@ mod tests {
         assert_eq!(bad_tag("garbage"), "garbage");
         assert_eq!(bad_tag("   "), "*");
         assert_eq!(bad_tag("\u{7f}weird\u{1b}"), "*");
+        // A literal-looking first token must never be echoed as a tag:
+        // the client could misread `{5} BAD …` as a continuation
+        // announcement.
+        assert_eq!(bad_tag("{5} NOOP"), "*");
     }
 
     #[test]

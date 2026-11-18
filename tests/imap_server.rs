@@ -468,13 +468,165 @@ async fn writes_are_refused() {
 }
 
 #[tokio::test]
-async fn idle_answers_a_tagged_no_in_this_task() {
-    let (mut wire, session, _) = spawn_session(backend(), 16).await;
+async fn idle_emits_exists_on_changes_and_done_ends_it() {
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
     login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // IDLE answers the continuation and starts waiting.
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+
+    // The store gains a message and the notifier fires: the idling
+    // session pushes the new count without being asked.
+    scripted.add_message("Inbox", 4);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* 3 EXISTS").await;
+
+    // DONE ends IDLE with the tagged OK, and dispatch is normal again.
+    wire.send("DONE").await;
+    wire.expect("i1 OK IDLE completed").await;
+    wire.send("i2 NOOP").await;
+    wire.expect("i2 OK NOOP completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn uidvalidity_change_resets_the_session_with_bye() {
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
 
     wire.send("i1 IDLE").await;
-    wire.expect("i1 NO not supported").await;
+    wire.expect("+ idling").await;
 
+    // The store resyncs under the idling session: the UIDVALIDITY
+    // moved, the snapshot is stale — one fixed BYE, no tagged response,
+    // and the stream closes.
+    scripted.resync("Inbox", 42);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* BYE mailbox state was resynced; reconnect")
+        .await;
+    wire.expect_eof().await;
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn idle_ignores_changes_to_other_mailboxes() {
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // A change for another mailbox queued before IDLE: the entry flush
+    // stays quiet.
+    scripted.add_message("Archive", 5);
+    sender.send(MailboxChanged(MailboxId(2))).unwrap();
+
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+
+    // In-idle, another mailbox's change emits nothing: the selected
+    // mailbox's change — queued after it, in channel order — is the
+    // first thing the wire sees.
+    scripted.add_message("Archive", 6);
+    sender.send(MailboxChanged(MailboxId(2))).unwrap();
+    scripted.add_message("Inbox", 4);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* 3 EXISTS").await;
+
+    wire.send("DONE").await;
+    wire.expect("i1 OK IDLE completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn idle_outside_selected_answers_bad() {
+    let (mut wire, session, _) = spawn_session(backend(), 16).await;
+    wire.expect(GREETING).await;
+
+    // IDLE is a Selected-state command: pre-auth...
+    wire.send("i0 IDLE").await;
+    wire.expect("i0 BAD command not valid in this state").await;
+
+    // ...and authenticated without a selected mailbox both refuse it,
+    // and the session stays usable.
+    wire.send("a1 LOGIN user@example.invalid hunter2").await;
+    wire.expect(LOGIN_OK).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("i1 BAD command not valid in this state").await;
+    wire.send("a2 NOOP").await;
+    wire.expect("a2 OK NOOP completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn idle_flushes_pending_notifications_on_entry() {
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // The change queued while the session was not idling: IDLE reports
+    // it immediately after the continuation — nothing is lost at the
+    // boundary (the Proton Bridge lesson).
+    scripted.add_message("Inbox", 4);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    wire.expect("* 3 EXISTS").await;
+
+    // The boundary flush already reported the change: DONE ends IDLE
+    // and a later NOOP stays quiet.
+    wire.send("DONE").await;
+    wire.expect("i1 OK IDLE completed").await;
+    wire.send("i2 NOOP").await;
+    wire.expect("i2 OK NOOP completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn idle_rejects_other_commands_and_ends() {
+    let (mut wire, session, _) = spawn_session(backend(), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // A command during IDLE answers BAD and ends the idling state...
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    wire.send("i2 NOOP").await;
+    wire.expect("i2 BAD only DONE ends IDLE").await;
+
+    // ...and the session dispatches normally again.
+    wire.send("i3 NOOP").await;
+    wire.expect("i3 OK NOOP completed").await;
+
+    // Garbage fares the same; the `{` polish keeps a literal-looking
+    // token out of the echoed tag.
+    wire.send("i4 IDLE").await;
+    wire.expect("+ idling").await;
+    wire.send("{5}").await;
+    wire.expect("* BAD only DONE ends IDLE").await;
+
+    // LOGOUT during IDLE behaves as it always does.
+    wire.send("i5 IDLE").await;
+    wire.expect("+ idling").await;
+    wire.send("a9 LOGOUT").await;
+    wire.expect("* BYE tuta-bridge signing off").await;
+    wire.expect("a9 OK LOGOUT completed").await;
+    wire.expect_eof().await;
     drop(wire);
     session.await.unwrap().unwrap();
 }
