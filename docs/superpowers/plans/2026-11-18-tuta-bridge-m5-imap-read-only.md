@@ -37,6 +37,22 @@ These are the failure modes most likely to corrupt a client's view or leak data:
 
 ---
 
+## Findings From the Proton Bridge Study
+
+We studied Proton Mail Bridge (GPL-3, `/tmp/opencode/proton-bridge`, concepts only — no code copied) before finalizing this plan. Adopted:
+
+1. **Snapshot validity before every command** (their Gluon invalidates the session state and sends `* BYE`): a `Selected` session re-checks UIDVALIDITY in the store before every command, not only during IDLE.
+2. **Precomputed BODYSTRUCTURE** (Gluon serves ENVELOPE/BODYSTRUCTURE from DB columns): the first content load persists `rfc822_size` and a new metadata-only `mime_structure` column, so structure requests never re-download bodies.
+3. **`ID` (RFC 2971) supported**, `NOOP` flushes pending notifications (untagged EXISTS outside IDLE), IDLE flushes pending responses on entry and answers `BAD` to anything but `DONE`.
+4. **Certificate SANs** cover `localhost`, `127.0.0.1`, `::1` (clients bind to a specific name).
+5. **Confirmation of our own design**: markers are set *after* a rebuild (their "bookmark + rewind" property holds implicitly — events during a resync are replayed because they postdate the marker); UID problems are solved by reset-and-rebuild, never by in-band renumbering; a tiny backend trait mirrors their connector seam.
+
+Ruling: `ENVELOPE` is served from the stored header only — it never triggers a network load. The partial M3 header already carries subject/from/date/first-recipient; cc/bcc/message-id appear after the first BODYSTRUCTURE/BODY fetch enriches the row. This deviates from a literal reading of design §8 ("se envelope_complete = 0 … carica i dettagli") to avoid a content download per message on folder listing; the design's convergence goal is unchanged. Cost if wrong: cc/bcc stay blank in a listing until the first body open.
+
+Explicitly not copied from Proton Bridge: pre-downloading all bodies (violates the no-content-cache foundation), remote kill switches for core protocol behavior, read-write semantics with per-client patches. Their test with a Tuta-originated message carrying an RFC-invalid MIME boundary confirms our renderer's choice of regenerating boundaries instead of echoing originals.
+
+---
+
 ## File Structure
 
 Create:
@@ -259,7 +275,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-- `envelope` order per RFC 3501: `(date subject from sender reply-to to cc bcc in-reply-to message-id)`; `sender`/`reply-to` default to the from value when absent (standard practice); every address is `(name adl mailbox host)` with `NIL` adl and mailbox/host split at the last `@`. All strings go through `codec::encode_string`; the date is `time`'s RFC 5322-ish rendering of `sent_at_ms`.
+- `envelope` order per RFC 3501: `(date subject from sender reply-to to cc bcc in-reply-to message-id)`; `sender`/`reply-to` default to the from value when absent (standard practice); every address is `(name adl mailbox host)` with `NIL` adl and mailbox/host split at the last `@`. All strings go through `codec::encode_string`; a `sent_at_ms <= 0` renders a `NIL` date (pre-epoch dates are never fabricated — Proton sanitizes them for Apple Mail; we simply omit until enrichment).
 - `bodystructure` mirrors what `MimeRenderer::render` produces (read `src/adapters/mime.rs` first): text-only → single `("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" <len> <lines>)`; html present → `("alternative" ("TEXT" "PLAIN" ...) ("TEXT" "HTML" ...))`; attachments → `("mixed" ... ("application" <lowercased-ext> ("NAME" <name>) NIL NIL "BASE64" <len> NIL))`. Non-multipart extension data is omitted.
 
 - [ ] **Step 4: Run tests and checks**
@@ -279,37 +295,40 @@ git commit -m "feat: render imap envelopes and bodystructure"
 ### Task 4: Envelope enrichment and `message_by_uid`
 
 **Files:**
-- Modify: `src/ports/state_store.rs`, `src/adapters/sqlite_state.rs`, `tests/support/mod.rs`
+- Modify: `src/ports/state_store.rs`, `src/adapters/sqlite_state.rs`, `tests/support/mod.rs`, `src/domain/state.rs`
 - Create: `src/app/enrich.rs`, modify `src/app/mod.rs`
 - Test: inline modules, `tests/enrich.rs`
 
 **Interfaces:**
-- Consumes: `StateStore`, `MailSource::content(&MessageSummary) -> Result<MessageContent>`.
+- Consumes: `StateStore`, `MailSource::content(&MessageSummary) -> Result<MessageContent>`, `MessageRenderer::render`, `render::bodystructure`.
 - Produces:
   - `StateStore::message_by_uid(&self, mailbox: MailboxId, uid: u32) -> Result<Option<StoredMessage>>`
-  - `pub struct EnvelopeEnricher { pub store: Arc<dyn StateStore> }`
+  - `StateStore::set_mime_structure(&self, mailbox: MailboxId, uid: u32, structure: &str) -> Result<()>`
+  - `StoredMessage` gains `pub mime_structure: Option<String>`
+  - SQLite schema migration to `PRAGMA user_version = 2`: `ALTER TABLE messages ADD COLUMN mime_structure TEXT;` (metadata only; existing rows stay `NULL`)
+  - `pub struct EnvelopeEnricher { pub store: Arc<dyn StateStore>, pub renderer: Arc<dyn MessageRenderer> }`
   - `EnvelopeEnricher::enrich(&self, mailbox: MailboxId, stored: &StoredMessage, source: &dyn MailSource) -> Result<StoredMessage>`
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test]
-async fn enriches_partial_envelopes_once_and_never_persists_bodies() {
-    // FakeMailSource returns a full MessageContent (to/cc/reply_to/message_id/
-    // in_reply_to/references/sent_at). The stored header is partial
-    // (envelope_complete = false).
+async fn enriches_partial_envelopes_once_persisting_only_metadata() {
+    // FakeMailSource returns a full MessageContent; the stored header is
+    // partial (envelope_complete = false, rfc822_size = None).
     let enriched = enricher.enrich(mailbox, &stored, &source).await.unwrap();
     assert!(enriched.header.envelope_complete);
     assert_eq!(enriched.header.message_id.as_deref(), Some("<m1@x.y>"));
-    assert_eq!(enriched.rfc822_size, None, "enrichment never computes or stores sizes or bodies");
-    // Second call must not hit the source.
+    assert!(enriched.rfc822_size.is_some(), "size computed from the rendered literal");
+    assert!(enriched.mime_structure.as_deref().is_some_and(|s| s.contains("TEXT")));
+    // Second call must not hit the source or the renderer.
     enricher.enrich(mailbox, &enriched, &source).await.unwrap();
     assert_eq!(source.content_calls(), 1);
-    // The store received update_metadata with envelope_complete = true.
+    // The DB gained exactly the mime_structure column and no content column.
 }
 ```
 
-Add: `message_by_uid` returns exactly one row and `None` for unknown uids (SQLite + fake); the DB still has no body/attachment columns after enrichment.
+Add: `message_by_uid` returns exactly one row and `None` for unknown uids (SQLite + fake); the schema migration runs on an existing M4 database (open, set, reopen); the no-content guard still rejects any new column containing `body`, `attachment`, `eml`, `blob`, or `content` while allowing `mime_structure`; `set_mime_structure` round-trips.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -319,7 +338,8 @@ Expected: FAIL.
 - [ ] **Step 3: Implement**
 
 - `message_by_uid`: single-row SQL `SELECT` in the SQLite adapter; a scan in the fake.
-- `enrich`: if `header.envelope_complete` return the input unchanged. Otherwise build `MessageSummary { list_id: header.list_id, element_id: header.element_id, received_at_ms: header.received_at_ms, subject: header.subject, unread: header.unread }`, call `source.content`, map the `MessageContent` into a complete `MessageHeader` (keep `list_id`/`element_id`/`received_at_ms`/`unread` from the stored header; take subject/from/to/cc/bcc/reply_to/sent_at/message_id/in_reply_to/references from the content; `envelope_complete = true`), then `store.update_metadata(mailbox, uid, &complete, None)`. Nothing else is persisted.
+- Schema migration: bump `user_version` to 2 and `ALTER TABLE messages ADD COLUMN mime_structure TEXT`; existing databases migrate on open.
+- `enrich`: if `header.envelope_complete` and `rfc822_size`/`mime_structure` are present, return the input unchanged. Otherwise build `MessageSummary { list_id: header.list_id, element_id: header.element_id, received_at_ms: header.received_at_ms, subject: header.subject, unread: header.unread }`, call `source.content`, render once through the injected `MessageRenderer` for the byte length, map the content into a complete `MessageHeader` (keep `list_id`/`element_id`/`received_at_ms`/`unread` from the stored header; take subject/from/to/cc/bcc/reply_to/sent_at/message_id/in_reply_to/references from the content; `envelope_complete = true`), persist via `store.update_metadata(mailbox, uid, &complete, Some(len))` and `store.set_mime_structure(mailbox, uid, &render::bodystructure(&content))`, and return the enriched `StoredMessage`. The rendered bytes are dropped immediately — nothing but envelope metadata, the size, and the structure string is persisted.
 
 - [ ] **Step 4: Run tests and checks**
 
@@ -329,8 +349,8 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/ports/state_store.rs src/adapters/sqlite_state.rs src/app/enrich.rs src/app/mod.rs tests/support/mod.rs tests/enrich.rs
-git commit -m "feat: enrich envelopes on demand"
+git add src/domain/state.rs src/ports/state_store.rs src/adapters/sqlite_state.rs src/app/enrich.rs src/app/mod.rs tests/support/mod.rs tests/enrich.rs
+git commit -m "feat: enrich envelopes and mime structure on demand"
 ```
 
 ---
@@ -372,7 +392,7 @@ async fn login_is_case_insensitive_inbox_and_constant_time() {
 
 Add:
 - `mailboxes_list_special_use`: kinds map to flags; `select("inbox")` (lowercase) finds the Inbox mailbox with `exists`, `unseen`, `uidnext`, `uidvalidity` from the store.
-- `fetch_envelopes_enrich_once_and_body_fetch_persists_size`: FETCH `(ENVELOPE UID)` on a partial header calls the source once and returns an ENVELOPE string; FETCH `(BODY[] RFC822.SIZE)` renders through `MimeRenderer`, returns the exact bytes, and persists `rfc822_size` via `update_metadata`; a following FETCH `(RFC822.SIZE)` alone answers from the store without another render (by design bodies are always re-rendered on demand — the second `BODY[]` fetch does call the source again).
+- `fetch_serves_envelopes_from_the_index_and_enriches_structure_once`: FETCH `(ENVELOPE UID FLAGS INTERNALDATE)` never calls the source (partial header renders with NIL cc/message-id); FETCH `(BODYSTRUCTURE)` calls the source once, returns the persisted structure, and a second identical fetch answers from the store; FETCH `(BODY[] RFC822.SIZE)` renders through `MimeRenderer`, returns the exact bytes, and persists `rfc822_size`; a following FETCH `(RFC822.SIZE)` answers from the store without another render (by design bodies are always re-rendered on demand — the second `BODY[]` fetch does call the source again).
 - `body_peek_does_not_persist_anything`: `BODY.PEEK[]` returns bytes but writes no size (PEEK semantics).
 - `search_covers_index_keys`: `ALL`, `UNSEEN`, `SEEN`, `UID 1:2`, `SINCE <date>`, `SUBJECT <text>`, `LARGER <n>`, `NOT SEEN`, `OR UNSEEN SUBJECT x`; `BODY foo` and `TEXT foo` return `Error::Unsupported`; unknown key likewise.
 - `fetch_unknown_uid_returns_none`.
@@ -387,7 +407,12 @@ Expected: FAIL.
 - `TutaImapBackend { account_id, expected_user: String, passwords: Arc<dyn LocalPasswordStore>, store: Arc<dyn StateStore>, enricher: Arc<EnvelopeEnricher>, source: Arc<dyn MailSource>, renderer: Arc<dyn MessageRenderer> }` — no session lives inside the backend; `serve` (Task 8) injects the owned `Arc<dyn MailSource>` obtained from the session.
 - `login`: load the stored password, compare user and password with `constant_time_eq` (compare lengths first only via XOR-fold over `max(len)`; document why timing is uniform).
 - `select`: `store.mailboxes(account_id)`, resolve the name (INBOX alias), then `store.messages(id)` for `exists`/`unseen` counts; `uidnext`/`uidvalidity` from the `StoredMailbox`.
-- `fetch`: `message_by_uid`; build `FetchResponse` per item list — ENVELOPE via `enricher` (only when the stored header is partial) then `render::envelope`; BODYSTRUCTURE by loading the content once and calling `render::bodystructure`; `Body { peek: false }`/`Rfc822`/`Rfc822Text` render via the injected `Arc<dyn MessageRenderer>` and persist `rfc822_size` through `update_metadata` when it was `None`; `Body { peek: true }` renders but never persists; `BodySection::Header`/`HeaderFields` slice the rendered bytes between the blank-line separator; `BodySection::Part` returns `Error::Unsupported("message part sections are not supported".into())`; `Rfc822Size` answers from the store, falling back to a render when `None`.
+- `fetch`: `message_by_uid`; build `FetchResponse` per item list:
+  - `Envelope` renders from the stored header as-is (partial or complete) — **never a network load**; unknown fields are `NIL` until enrichment.
+  - `BodyStructure` answers from the stored `mime_structure`; when missing it runs the enricher (one content load, persisted) and returns the stored structure.
+  - `Body { peek: false }`/`Rfc822`/`Rfc822Text` always re-render through the injected `Arc<dyn MessageRenderer>` (no body cache by design) and persist `rfc822_size` via `update_metadata` when it was `None`; `Body { peek: true }` renders but never persists.
+  - `BodySection::Header`/`HeaderFields` slice the rendered bytes between the blank-line separator; `BodySection::Part` returns `Error::Unsupported("message part sections are not supported".into())`.
+  - `Rfc822Size` answers from the store; when `None` it enriches once and returns the persisted value without re-rendering.
 - `search`: load `store.messages(mailbox)`, filter in memory; parse keys per the test list; dates compare `received_at_ms` against the parsed day boundaries (UTC); `SUBJECT`/`FROM`/`TO`/`CC`/`HEADER` are case-insensitive substring matches on the enriched-or-partial header fields; `BODY`/`TEXT`/`KEYWORD`/flag keys other than SEEN/UNSEEN → `Error::Unsupported`.
 - `Passwd` command in `cli.rs` with parser test (implementation lands in Task 8's `main` wiring; the store itself is fully implemented here with an `#[ignore]`-style manual keyring test matching the existing pattern plus a serde/format unit test).
 
@@ -416,7 +441,7 @@ git commit -m "feat: add the imap backend"
 - Consumes: `ImapBackend`, codec, renderers, `MailboxChanged` receiver.
 - Produces:
   - `pub async fn run_session<S>(stream: S, backend: Arc<dyn ImapBackend>, watch: broadcast::Receiver<MailboxChanged>) -> Result<()> where S: AsyncRead + AsyncWrite + Unpin`
-  - `pub fn ensure_certificate(dir: &Path) -> Result<(String, String)>` — generates and persists `imap-cert.pem`/`imap-key.pem` (`0600`, reuse existing) via `rcgen` with CN `localhost`
+  - `pub fn ensure_certificate(dir: &Path) -> Result<(String, String)>` — generates and persists `imap-cert.pem`/`imap-key.pem` (`0600`, reuse existing) via `rcgen`, CN `localhost` with SANs `DNS:localhost`, `IP:127.0.0.1`, `IP:::1`
   - `pub fn tls_acceptor(cert_pem: &str, key_pem: &str) -> Result<TlsAcceptor>`
   - `pub async fn serve(listener: TcpListener, tls: TlsAcceptor, backend: Arc<dyn ImapBackend>, watch: MailboxEventSender) -> Result<()>` — subscribes one receiver per connection
 
@@ -439,6 +464,9 @@ Add:
 - `fetch_streams_bodies_and_skips_expunged_uids`: UID FETCH `1,3 (FLAGS BODY[])` where uid 3 vanished: exactly one `* 1 FETCH ...` line whose body is a server-sent literal (`{n}\r\n` immediately followed by the raw bytes — no continuation round-trip), no entry for 3, then the tagged OK. Body literals are written in 64 KiB chunks (assert with a >128 KiB fake body).
 - `status_reports_requested_items`; `close_and_check`; `logout_sends_bye`.
 - `writes_are_refused`: `STORE`, `APPEND`, `EXPUNGE`, `CREATE`, `DELETE`, `RENAME`, `COPY`, `MOVE`, `SUBSCRIBE`, `UNSUBSCRIBE` each answer `NO not supported by this read-only bridge`; unknown commands answer `BAD`.
+- `uidvalidity_drift_resets_sessions_before_every_command`: after the store's UIDVALIDITY changes under a `Selected` session (simulated resync), the *next* command — FETCH, NOOP, anything — answers `* BYE mailbox state was resynced; reconnect` and closes the stream, regardless of IDLE (Proton Bridge lesson: validate the snapshot before every command, not only during push).
+- `id_command_answers_and_noop_flushes_notifications`: `ID ("name" "test")` → `* ID ("name" "tuta-bridge")` + tagged OK; with a pending `MailboxChanged` in the watch receiver, `NOOP` emits `* <n> EXISTS` even outside IDLE.
+- `capability_advertises_the_subset`: greeting and LOGIN responses carry `CAPABILITY IMAP4rev1 IDLE ID`.
 - `search_returns_uids`: `* SEARCH 2 5` shape for UID SEARCH.
 - Log hygiene: the session uses `tracing::debug!` with only tag/command/count fields; no subjects, names, or bodies.
 
@@ -449,7 +477,9 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-- Session state machine: `NotAuthenticated` → LOGIN (also accept a client literal via `pending_literal` + `+ `) → `Authenticated` → SELECT/EXAMINE → `Selected { view, exists, unseen }`. CAPABILITY/NOOP/LOGOUT valid in all states; state-inappropriate commands → `BAD`.
+- Session state machine: `NotAuthenticated` → LOGIN (also accept a client literal via `pending_literal` + `+ `) → `Authenticated` → SELECT/EXAMINE → `Selected { view, exists, unseen, uidvalidity }`. CAPABILITY/NOOP/ID/LOGOUT valid in all states; state-inappropriate commands → `BAD`.
+- Snapshot validity: in `Selected`, before dispatching any command, compare the session's `uidvalidity` with `backend.select(...)`'s current value; on mismatch send `* BYE mailbox state was resynced; reconnect` and close.
+- `NOOP` in `Selected` drains pending `MailboxChanged` notifications (try_recv loop) and emits `* <n> EXISTS` when the count changed — clients that poll instead of idling still see updates.
 - Response writing: one `BufWriter`, CRLF line endings, literal framing `{n}\r\n` followed by raw bytes for `encode_string` literals and bodies; flush after each command.
 - LIST/LSUB: single wildcard match (`*`) returns every `MailboxView` as `* LIST (<flags>) "/" <name>`; mailbox names use `encode_string`.
 - FETCH: resolve the sequence set against the selected mailbox's uid list (msn = 1-based index; `*` = last); ask the backend per uid; skip `None`.
@@ -501,7 +531,7 @@ async fn uidvalidity_change_resets_the_session_with_bye() {
 }
 ```
 
-Add: changes to other mailboxes emit nothing; IDLE outside `Selected` answers `BAD`.
+Add: changes to other mailboxes emit nothing; IDLE outside `Selected` answers `BAD`; pending notifications queued before IDLE are flushed on entry (`* <n> EXISTS` immediately after `+ idling`); any command other than `DONE` during IDLE answers `BAD` and ends the idling state.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -511,7 +541,7 @@ Expected: FAIL.
 - [ ] **Step 3: Implement**
 
 - On `SELECT`, the session stores the mailbox id, `uidvalidity`, and current `exists`.
-- IDLE answers `+ idling`, then `tokio::select!` over: the command reader (DONE ends IDLE with the tagged OK; LOGOUT behaves normally), and the watcher receiver. On `MailboxChanged(id)` for the selected mailbox: re-run `backend.select`; if `uidvalidity` differs from the session's → `* BYE ...` and close; otherwise emit `* <exists> EXISTS` when the count changed.
+- IDLE answers `+ idling`, **flushes any notifications that queued while not idling** (Proton Bridge lesson: never lose an update at the IDLE boundary), then `tokio::select!` over: the command reader (`DONE` ends IDLE with the tagged OK; anything else answers `BAD` and leaves the idling loop; LOGOUT behaves normally), and the watcher receiver. On `MailboxChanged(id)` for the selected mailbox: re-run `backend.select`; if `uidvalidity` differs from the session's → `* BYE ...` and close; otherwise emit `* <exists> EXISTS` when the count changed.
 - Expunges are not itemized (v1 documents EXISTS-only updates; clients re-sync).
 
 - [ ] **Step 4: Run tests and checks**
@@ -610,7 +640,7 @@ README:
 - Client setup: Thunderbird (manual account, IMAP `127.0.0.1:9930`, SSL/TLS, accept the certificate exception, username = Tuta address, password = bridge password) and an `mbsync` sample channel config.
 - Limits of v1: read-only (writes answer NO, coming in M6); `SEARCH BODY`/`TEXT` unsupported; numeric `BODY[n]` part sections unsupported (whole-message `BODY[]`, `HEADER`, `TEXT`, `HEADER.FIELDS` only); EXISTS-only IDLE updates; no multi-account.
 
-NOTES: the served subset, response shapes worth remembering (SELECT untagged block, PERMANENTFLAGS () with READ-WRITE, literal strategy), the IDLE reset rule, and the password/certificate locations.
+NOTES: the served subset, response shapes worth remembering (SELECT untagged block, PERMANENTFLAGS () with READ-WRITE, literal strategy), the IDLE reset rule, the password/certificate locations, and the Proton Bridge study conclusions that shaped the server: snapshot re-validation before every command, ENVELOPE served index-only, `mime_structure` persisted at first enrichment, and the confirmation that setting batch markers *after* a rebuild gives Proton's bookmark-and-rewind property (events during a resync postdate the marker and are replayed).
 
 - [ ] **Step 2: Verify formatting and the full suite**
 
@@ -650,6 +680,7 @@ git commit -m "docs: record M5 manual acceptance"
 ## Self-Review Notes
 
 - **Spec coverage:** §8 LIST/LSUB (Task 6), SELECT/EXAMINE (Tasks 5/6), FETCH items incl. on-demand details and persisted `rfc822_SIZE` (Tasks 4/5), BODYSTRUCTURE/BODY[]/PEEK (Tasks 3/5/6), SEARCH limits (Task 5), IDLE watchers without new tables (Tasks 1/7), streaming literals (Task 6), TLS loopback + local password (Tasks 5/6/8). §9 constraints are in Global Constraints. §11 acceptance maps to Task 9.
-- **Type consistency:** `BatchOutcome`, `MailboxChanged`, `ImapArg`, `SeqSet`, `FetchItem`, `MailboxView`, `SelectedMailbox`, `FetchResponse`, `ImapBackend`, `LocalPasswordStore` are each defined once and consumed by the same names later.
-- **Review Focus coverage:** UIDVALIDITY reset (Task 7), expunged-uid FETCH (Task 6), no body persistence (Tasks 4/5), constant-time login (Task 5), byte-pinned shapes (Tasks 2/3), chunked literals (Task 6).
-- **Known v1 trade-offs recorded, not hidden:** per-message rendering buffers one body at a time; EXISTS-only IDLE; numeric part sections unsupported; READ-WRITE SELECT with NO-writing commands.
+- **Type consistency:** `BatchOutcome`, `MailboxChanged`, `ImapArg`, `SeqSet`, `FetchItem`, `MailboxView`, `SelectedMailbox`, `FetchResponse`, `ImapBackend`, `LocalPasswordStore`, `StoredMessage.mime_structure` are each defined once and consumed by the same names later.
+- **Review Focus coverage:** UIDVALIDITY reset before every command (Task 6) and during IDLE push (Task 7), expunged-uid FETCH (Task 6), no body persistence (Tasks 4/5), constant-time login (Task 5), byte-pinned shapes (Tasks 2/3), chunked literals (Task 6).
+- **Proton Bridge study folded in:** snapshot re-validation before every command (Task 6), `mime_structure` precomputed at first enrichment (Tasks 4/5), `ID` command and NOOP flush (Task 6), IDLE entry flush (Task 7), certificate SANs (Task 6), ENVELOPE index-only ruling recorded in the findings section.
+- **Known v1 trade-offs recorded, not hidden:** per-message rendering buffers one body at a time; EXISTS-only IDLE; numeric part sections unsupported; READ-WRITE SELECT with NO-writing commands; `mime_structure` is the only new column and the no-content guard was updated accordingly.
