@@ -1,11 +1,14 @@
 use std::process;
 use std::sync::Arc;
 
+use secrecy::{ExposeSecret, SecretString};
 use tracing_subscriber::EnvFilter;
 
 use tuta_bridge::adapters::cli::Command;
+use tuta_bridge::adapters::imap::backend::constant_time_eq;
 use tuta_bridge::adapters::keyring_store::KeyringCredentialStore;
 use tuta_bridge::adapters::mime::MimeRenderer;
+use tuta_bridge::adapters::password_store::KeyringPasswordStore;
 use tuta_bridge::adapters::terminal_prompt::TerminalPrompt;
 use tuta_bridge::adapters::tuta::session::TutaSessionFactory;
 use tuta_bridge::app::dump::{DumpArgs, DumpUseCase};
@@ -15,11 +18,12 @@ use tuta_bridge::app::state_sync::{open_state_store, StateSyncUseCase};
 use tuta_bridge::app::status::StatusUseCase;
 use tuta_bridge::app::sync::SyncReport;
 use tuta_bridge::app::watch::{
-    BackoffPolicy, WatchUseCase, CONNECT_TIMEOUT, LOOKUP_FAILURE_THRESHOLD,
+    BackoffPolicy, ServeUseCase, WatchUseCase, CONNECT_TIMEOUT, LOOKUP_FAILURE_THRESHOLD,
 };
 use tuta_bridge::config::{config_path, data_dir, resolve_base_url, validate_base_url, Config};
 use tuta_bridge::domain::Error;
 use tuta_bridge::ports::clock::Clock;
+use tuta_bridge::ports::local_password::LocalPasswordStore;
 use tuta_bridge::ports::renderer::MessageRenderer;
 
 use tutasdk::bindings::native_file_client::NativeFileClient;
@@ -101,7 +105,7 @@ fn main() {
         Ok(d) => d,
         Err(e) => exit_with_error(Error::Config(e.to_string())),
     };
-    let file_client = match NativeFileClient::try_new(data_dir) {
+    let file_client = match NativeFileClient::try_new(data_dir.clone()) {
         Ok(fc) => Arc::new(fc),
         Err(e) => exit_with_error(Error::Config(e.to_string())),
     };
@@ -184,6 +188,26 @@ fn main() {
                 uc.run().await?;
                 Ok(())
             }
+            Command::Serve => {
+                let state = open_state_store().await?;
+                let uc = ServeUseCase {
+                    factory: Arc::clone(&factory)
+                        as Arc<dyn tuta_bridge::ports::session::SessionFactory>,
+                    credentials: Arc::clone(&store)
+                        as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
+                    passwords: Arc::new(KeyringPasswordStore)
+                        as Arc<dyn tuta_bridge::ports::local_password::LocalPasswordStore>,
+                    config_path,
+                    state,
+                    clock: Arc::new(SystemClock),
+                    data_dir,
+                    backoff: BackoffPolicy::production(),
+                    connect_timeout: CONNECT_TIMEOUT,
+                    lookup_failure_threshold: LOOKUP_FAILURE_THRESHOLD,
+                };
+                uc.run().await?;
+                Ok(())
+            }
             Command::Logout => {
                 let uc = LogoutUseCase {
                     factory: Arc::clone(&factory)
@@ -197,10 +221,32 @@ fn main() {
                 Ok(())
             }
             Command::Passwd => {
-                // The parser contract is pinned in cli.rs; the prompt and
-                // keyring wiring lands with the serve main wiring that
-                // follows. Fixed, credential-free error until then.
-                Err(Error::Unsupported("passwd is not wired yet".into()))
+                // Read the password twice, hidden; a mismatch or an
+                // empty value refuses without storing anything. The
+                // prompts and the outcome line are fixed strings — the
+                // password itself never appears anywhere.
+                let first = SecretString::new(
+                    rpassword::prompt_password("New local IMAP password: ")
+                        .map_err(|_| Error::Login("prompt failed".into()))?
+                        .into(),
+                );
+                let repeat = SecretString::new(
+                    rpassword::prompt_password("Repeat password: ")
+                        .map_err(|_| Error::Login("prompt failed".into()))?
+                        .into(),
+                );
+                if first.expose_secret().is_empty() {
+                    return Err(Error::Config("password must not be empty".into()));
+                }
+                if !constant_time_eq(
+                    first.expose_secret().as_bytes(),
+                    repeat.expose_secret().as_bytes(),
+                ) {
+                    return Err(Error::Config("passwords do not match".into()));
+                }
+                KeyringPasswordStore.set(&first).await?;
+                println!("local IMAP password stored");
+                Ok(())
             }
             Command::Dump { folder, limit, out } => {
                 let uc = DumpUseCase::new(

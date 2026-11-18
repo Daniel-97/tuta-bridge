@@ -24,6 +24,13 @@ pub trait Session: Send + Sync {
     fn account(&self) -> AccountInfo;
     fn mail(&self) -> &dyn MailSource;
 
+    /// The same mail source as [`Session::mail`], but owned.
+    ///
+    /// `serve` hands this to the long-lived IMAP backend while the
+    /// session itself stays with the watch loop; the shared `Arc`
+    /// keeps the logged-in state alive independently of either holder.
+    fn shared_mail(&self) -> Arc<dyn MailSource>;
+
     /// Group ids the event bus must be subscribed to, in subscription order.
     ///
     /// Defaults to none: adapters without an event bus report no groups and

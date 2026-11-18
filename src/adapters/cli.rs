@@ -34,6 +34,8 @@ pub enum Command {
     Resync,
     /// Stream Tuta events and update the local index.
     Watch,
+    /// Serve IMAP on TLS loopback while watching Tuta events.
+    Serve,
     /// Set the local IMAP password.
     Passwd,
     Dump {
@@ -93,9 +95,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_serve_command() {
+        let cli = parse_from(["tuta-bridge", "serve"]).unwrap();
+        assert!(matches!(cli.command, Command::Serve));
+        assert_eq!(cli.base_url, None);
+        assert!(!cli.debug);
+    }
+
+    #[test]
     fn parses_passwd_command() {
-        // The prompt/keyring wiring belongs to the serve main wiring;
-        // this task pins the parser contract only.
+        // The prompt and keyring wiring live in main; this pins the
+        // parser contract only.
         assert!(matches!(
             parse_from(["tuta-bridge", "passwd"]).unwrap().command,
             Command::Passwd

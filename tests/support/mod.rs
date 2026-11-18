@@ -837,6 +837,10 @@ impl Session for FakeSession {
         self.mail.as_ref()
     }
 
+    fn shared_mail(&self) -> Arc<dyn MailSource> {
+        Arc::clone(&self.mail) as Arc<dyn MailSource>
+    }
+
     async fn close(&self) -> Result<()> {
         self.close_calls.fetch_add(1, Ordering::SeqCst);
         if self.close_should_fail {
@@ -1104,6 +1108,10 @@ impl Session for FakeEventSessionHandle {
 
     fn mail(&self) -> &dyn MailSource {
         self.0.mail.as_ref()
+    }
+
+    fn shared_mail(&self) -> Arc<dyn MailSource> {
+        Arc::clone(&self.0.mail) as Arc<dyn MailSource>
     }
 
     fn event_groups(&self) -> Vec<String> {

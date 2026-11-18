@@ -65,12 +65,12 @@ impl SessionFactory for TutaSessionFactory {
             mail_address: credentials.login.clone(),
             user_id: credentials.user_id.clone(),
         };
-        let mail = TutaMailSource::new(
+        let mail = Arc::new(TutaMailSource::new(
             Arc::clone(&logged),
             Arc::clone(&self.rest),
             credentials.access_token.clone(),
             self.base_url.clone(),
-        );
+        ));
 
         Ok(Box::new(TutaSession {
             logged,
@@ -92,7 +92,8 @@ pub struct TutaSession {
     info: AccountInfo,
     access_token: String,
     base_url: String,
-    mail: TutaMailSource,
+    /// The mail source, shared with the IMAP backend by `serve`.
+    mail: Arc<TutaMailSource>,
 }
 
 #[async_trait::async_trait]
@@ -102,7 +103,11 @@ impl Session for TutaSession {
     }
 
     fn mail(&self) -> &dyn MailSource {
-        &self.mail
+        self.mail.as_ref()
+    }
+
+    fn shared_mail(&self) -> Arc<dyn MailSource> {
+        Arc::clone(&self.mail) as Arc<dyn MailSource>
     }
 
     fn event_groups(&self) -> Vec<String> {

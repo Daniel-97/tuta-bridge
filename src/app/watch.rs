@@ -1,4 +1,5 @@
-//! Long-running Tuta event-bus watcher.
+//! Long-running Tuta event-bus watcher, and the `serve` command that
+//! hosts it next to the IMAP listener.
 //!
 //! [`WatchUseCase`] resumes the stored session, reconciles the local index
 //! with a baseline (re)sync, and then consumes the event bus until it is
@@ -10,6 +11,14 @@
 //! addresses, and URLs never appear in it. An optional notifier
 //! additionally broadcasts local mailbox ids — nothing else — after
 //! each applied batch and after each resync.
+//!
+//! [`ServeUseCase`] runs that watch loop as a task next to a TLS-only
+//! loopback IMAP listener that answers from the same state store. One
+//! broadcast channel connects them: the watch publishes mailbox ids,
+//! idling sessions drain them. The listener binds `127.0.0.1` only and
+//! never a configurable address; Ctrl-C (or the injected stop future)
+//! ends the accept loop, which then ends the watch loop and returns its
+//! result as the command's own.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -18,14 +27,25 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, oneshot};
+
+use crate::adapters::imap::backend::TutaImapBackend;
+use crate::adapters::imap::server::{ensure_certificate, tls_acceptor};
+use crate::adapters::imap::session::run_session;
+use crate::adapters::mime::MimeRenderer;
 use crate::adapters::tuta::generated_id::{batch_is_expired, timestamp_to_generated_id};
+use crate::app::enrich::EnvelopeEnricher;
 use crate::app::event_sync::EventProcessor;
 use crate::app::state_sync::{current_uidvalidity, next_uidvalidity, resync_with, sync_with};
-use crate::config::Config;
+use crate::config::{resolve_imap_port, validate_imap_port, Config};
 use crate::domain::{AccountId, Error, EventFrame, Result};
 use crate::ports::clock::Clock;
 use crate::ports::credentials::CredentialStore;
+use crate::ports::imap_backend::ImapBackend;
+use crate::ports::local_password::LocalPasswordStore;
 use crate::ports::mailbox_events::{MailboxChanged, MailboxEventSender};
+use crate::ports::renderer::MessageRenderer;
 use crate::ports::session::{Session, SessionFactory};
 use crate::ports::state_store::StateStore;
 
@@ -347,6 +367,199 @@ impl WatchUseCase {
         }
         Ok(batches)
     }
+}
+
+// ---------------------------------------------------------------------------
+// serve
+// ---------------------------------------------------------------------------
+
+/// Capacity of the mailbox-change broadcast: one event per touched
+/// mailbox per batch, plus one per mailbox after a resync. A consumer
+/// that falls behind treats the lag as "everything changed", so the
+/// exact size only bounds buffer memory.
+const NOTIFIER_CAPACITY: usize = 256;
+
+/// Serve the local index over IMAP while the event loop keeps it fresh.
+///
+/// One process runs both loops: the TLS-only loopback listener that
+/// answers from the state store, and the watch task that feeds it.
+/// Every dependency is injected exactly like [`WatchUseCase`]'s, so
+/// tests drive the whole command against the in-memory fakes.
+pub struct ServeUseCase {
+    pub factory: Arc<dyn SessionFactory>,
+    pub credentials: Arc<dyn CredentialStore>,
+    /// The bridge password store IMAP clients authenticate against;
+    /// `serve` only reads it, `passwd` writes it.
+    pub passwords: Arc<dyn LocalPasswordStore>,
+    pub config_path: PathBuf,
+    pub state: Arc<dyn StateStore>,
+    pub clock: Arc<dyn Clock>,
+    /// Directory that holds (or receives) the TLS certificate pair.
+    pub data_dir: PathBuf,
+    pub backoff: BackoffPolicy,
+    /// How long one watch `events` connect may hang before it is
+    /// abandoned and retried like a dropped connection.
+    pub connect_timeout: Duration,
+    /// Consecutive watch batches with failed lookups before the index
+    /// is reset and resynced.
+    pub lookup_failure_threshold: usize,
+}
+
+impl ServeUseCase {
+    /// Serve until Ctrl-C.
+    pub async fn run(&self) -> Result<()> {
+        self.run_until(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+    }
+
+    /// Serve until `stop` resolves, then end the watch loop and return
+    /// its result.
+    ///
+    /// The output is fixed text: the listen address and counters only.
+    /// The listener binds `127.0.0.1:{port}` and nothing else — the
+    /// address is not configurable — after the port passes
+    /// [`validate_imap_port`], so a reserved port fails the command
+    /// instead of silently binding an ephemeral one. The Tuta session
+    /// is resumed once and never closed; its shared mail source keeps
+    /// the logged-in state alive for the backend. A fatal watch error
+    /// ends serve with that error; a lost event connection does not,
+    /// because the watch retries it itself.
+    pub async fn run_until<F>(&self, stop: F) -> Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        // 1. Configuration: the active account and the listen port.
+        //    The port is validated before anything is opened.
+        let config = Config::load(&self.config_path).map_err(|e| Error::Config(e.to_string()))?;
+        let account = config
+            .active_account
+            .clone()
+            .ok_or(Error::NoActiveAccount)?;
+        let port = resolve_imap_port(&config);
+        validate_imap_port(port).map_err(Error::Config)?;
+
+        // 2. Resume the session and resolve the account row. serve
+        //    never closes the session; the binding below keeps it for
+        //    the process lifetime next to the shared source the
+        //    backend now owns.
+        let credentials = self
+            .credentials
+            .load(&AccountId(account))?
+            .ok_or(Error::MissingCredentials)?;
+        let session = self.factory.resume(&credentials).await?;
+        let account_id = self.state.upsert_account(&credentials.login).await?;
+        let expected_user = session.account().mail_address;
+
+        // 3. The bridge password must exist before anything listens.
+        //    A missing password is a configuration problem the user
+        //    fixes with `tuta-bridge passwd`.
+        if self.passwords.load().await?.is_none() {
+            return Err(Error::Config(
+                "local IMAP password not set; run tuta-bridge passwd first".into(),
+            ));
+        }
+
+        // 4. The backend: stored metadata for listings and searches,
+        //    on-demand rendering for bodies. One renderer instance
+        //    serves the enricher and the fetches.
+        let renderer: Arc<dyn MessageRenderer> = Arc::new(MimeRenderer);
+        let backend: Arc<dyn ImapBackend> = Arc::new(TutaImapBackend {
+            account_id,
+            expected_user,
+            passwords: Arc::clone(&self.passwords),
+            store: Arc::clone(&self.state),
+            enricher: Arc::new(EnvelopeEnricher {
+                store: Arc::clone(&self.state),
+                renderer: Arc::clone(&renderer),
+            }),
+            source: session.shared_mail(),
+            renderer,
+        });
+        let _session = session;
+
+        // 5. The watch task feeds the same store and broadcasts every
+        //    mailbox change to the idling sessions.
+        let (sender, _) = broadcast::channel::<MailboxChanged>(NOTIFIER_CAPACITY);
+        let (stop_watch, watch_stopped) = oneshot::channel::<()>();
+        let watch = WatchUseCase {
+            factory: Arc::clone(&self.factory),
+            credentials: Arc::clone(&self.credentials),
+            config_path: self.config_path.clone(),
+            state: Arc::clone(&self.state),
+            clock: Arc::clone(&self.clock),
+            backoff: BackoffPolicy {
+                first_ms: self.backoff.first_ms,
+                second_ms: self.backoff.second_ms,
+                max_ms: self.backoff.max_ms,
+            },
+            connect_timeout: self.connect_timeout,
+            lookup_failure_threshold: self.lookup_failure_threshold,
+            notifier: None,
+        }
+        .with_notifier(sender.clone());
+        let mut watch_task = tokio::spawn(async move {
+            watch
+                .run_until(async move {
+                    let _ = watch_stopped.await;
+                })
+                .await
+        });
+
+        // 6. TLS on loopback only. The certificate is generated (0600)
+        //    or reused, the port comes from the config, and the
+        //    address is fixed.
+        let (cert_pem, key_pem) = ensure_certificate(&self.data_dir)?;
+        let tls = tls_acceptor(&cert_pem, &key_pem)?;
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .map_err(|_| Error::Network("imap listener bind failed".into()))?;
+        println!("serving IMAP on 127.0.0.1:{port}; press Ctrl-C to stop");
+
+        // 7. Accept until the stop future resolves, then end the
+        //    watch loop and return its result. A watch that ended on
+        //    its own — only a fatal error can — ends serve with that
+        //    error. Failures close one connection at most.
+        let mut stop = pin!(stop);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stop => break,
+                watched = &mut watch_task => {
+                    return match watched {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::Storage("watch task failed".into())),
+                    };
+                }
+                accepted = listener.accept() => {
+                    let (stream, _peer) = accepted.map_err(accept_failed)?;
+                    let tls = tls.clone();
+                    let backend = Arc::clone(&backend);
+                    let events = sender.subscribe();
+                    tokio::spawn(async move {
+                        match tls.accept(stream).await {
+                            Ok(stream) => {
+                                let _ = run_session(stream, backend, events).await;
+                            }
+                            Err(_) => tracing::debug!("tls handshake failed"),
+                        }
+                        tracing::debug!("connection ended");
+                    });
+                }
+            }
+        }
+        let _ = stop_watch.send(());
+        match watch_task.await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Storage("watch task failed".into())),
+        }
+    }
+}
+
+/// A failed accept ends the command: the listener is dead.
+fn accept_failed(_: std::io::Error) -> Error {
+    Error::Network("listener accept failed".into())
 }
 
 #[cfg(test)]
