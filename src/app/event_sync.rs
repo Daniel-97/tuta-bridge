@@ -6,14 +6,14 @@
 //! the resulting [`StateChange`]s together with the batch id in a single
 //! [`StateStore::apply_batch`] call, so a replayed batch is a no-op and the
 //! batch marker never advances past unapplied changes. All lookups are
-//! metadata-only, and the report carries fixed-size counters: ids,
-//! subjects, and addresses never appear in it.
+//! metadata-only, and the report carries counters and local mailbox ids:
+//! subjects, addresses, and entity ids never appear in it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::domain::{
-    EntityEvent, EntityOperation, EventBatch, MailPlacement, Result, StateChange,
+    EntityEvent, EntityOperation, EventBatch, MailPlacement, MailboxId, Result, StateChange,
     MAIL_SET_ENTRY_TYPE_ID, MAIL_SET_TYPE_ID, MAIL_TYPE_ID, TUTANOTA_APP,
 };
 use crate::ports::event_lookup::EventLookup;
@@ -29,9 +29,11 @@ use crate::ports::state_store::StateStore;
 /// `lookup_failures` counts the skipped events whose entity lookup failed
 /// with an error — unreadable entities and unhandled events stay out of
 /// it — because a long run of them desyncs the index and the watch loop
-/// heals that with a resync. All fields are fixed-size so a report never
-/// carries entity data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// heals that with a resync. `touched_mailboxes` lists every mailbox whose
+/// rows the batch changed, deduplicated, so idling sessions can learn
+/// their cached view is stale. All fields carry counters or mailbox ids
+/// only: entity data never appears in a report.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventReport {
     /// Events that produced a state change.
     pub changes: usize,
@@ -41,6 +43,9 @@ pub struct EventReport {
     /// Events skipped because their lookup failed with an error; a
     /// subset of `skipped`.
     pub lookup_failures: usize,
+    /// Mailboxes whose rows the batch inserted, updated, or deleted,
+    /// deduplicated and in first-touch order.
+    pub touched_mailboxes: Vec<MailboxId>,
 }
 
 /// Coalesced effect of one element's mail events within a batch.
@@ -159,7 +164,8 @@ impl EventProcessor {
                 .flat_map(|(element_id, action)| action_changes(element_id, action)),
         );
 
-        self.store
+        let outcome = self
+            .store
             .apply_batch(account_id, &batch.owner_group_id, &batch.batch_id, &changes)
             .await?;
 
@@ -167,6 +173,7 @@ impl EventProcessor {
             changes: applied,
             skipped,
             lookup_failures,
+            touched_mailboxes: outcome.touched,
         })
     }
 }

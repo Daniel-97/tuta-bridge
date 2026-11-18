@@ -3,6 +3,18 @@ use super::mail::{Address, Folder, FolderKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MailboxId(pub i64);
 
+/// Mailboxes one applied batch actually changed.
+///
+/// `touched` lists every mailbox whose rows the batch's transaction
+/// inserted, updated, or deleted, deduplicated and in the order the
+/// changes first touched them. Idling sessions use it to learn that
+/// their cached view of a mailbox may be stale. Like the batch types
+/// around it, this type deliberately does not implement `Debug`.
+#[derive(Clone)]
+pub struct BatchOutcome {
+    pub touched: Vec<MailboxId>,
+}
+
 /// One stored placement of a mail: the mailbox it belongs to and its header.
 ///
 /// `mailbox_list_id` is the folder's entries list id and resolves the

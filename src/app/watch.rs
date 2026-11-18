@@ -7,7 +7,9 @@
 //! fatal because it needs the user to act. A run of batches whose entity
 //! lookups fail resyncs the index, exactly like an expired marker. The
 //! output is fixed text and counters only: ids, tokens, subjects,
-//! addresses, and URLs never appear in it.
+//! addresses, and URLs never appear in it. An optional notifier
+//! additionally broadcasts local mailbox ids — nothing else — after
+//! each applied batch and after each resync.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,6 +25,7 @@ use crate::config::Config;
 use crate::domain::{AccountId, Error, EventFrame, Result};
 use crate::ports::clock::Clock;
 use crate::ports::credentials::CredentialStore;
+use crate::ports::mailbox_events::{MailboxChanged, MailboxEventSender};
 use crate::ports::session::{Session, SessionFactory};
 use crate::ports::state_store::StateStore;
 
@@ -82,9 +85,23 @@ pub struct WatchUseCase {
     /// Consecutive batches with failed lookups before the index is
     /// reset and resynced; unreadable or unhandled events never count.
     pub lookup_failure_threshold: usize,
+    /// Broadcasts one [`MailboxChanged`] per mailbox each applied batch
+    /// touched, and one per current mailbox after a resync. `None` — the
+    /// default — publishes nothing; send errors from a closed channel
+    /// are ignored because they only mean nobody idles.
+    pub notifier: Option<MailboxEventSender>,
 }
 
 impl WatchUseCase {
+    /// Attach a mailbox-change broadcaster.
+    ///
+    /// Additive: construction sites without a notifier keep their
+    /// behavior, and the watch loop runs the same either way.
+    pub fn with_notifier(mut self, sender: MailboxEventSender) -> Self {
+        self.notifier = Some(sender);
+        self
+    }
+
     /// Watch until Ctrl-C.
     pub async fn run(&self) -> Result<()> {
         println!("watching for Tuta events; press Ctrl-C to stop");
@@ -177,6 +194,14 @@ impl WatchUseCase {
                             batches.insert(batch.owner_group_id.clone(), batch.batch_id.clone());
                             if report.changes > 0 {
                                 println!("applied {} changes", report.changes);
+                            }
+                            // Idling sessions learn which mailboxes the
+                            // batch changed; a closed channel only means
+                            // nobody idles, so send errors are ignored.
+                            if let Some(notifier) = &self.notifier {
+                                for mailbox in &report.touched_mailboxes {
+                                    let _ = notifier.send(MailboxChanged(*mailbox));
+                                }
                             }
                             // A run of batches whose lookups failed has
                             // silently skipped events, so the index may
@@ -310,6 +335,15 @@ impl WatchUseCase {
                 .set_last_batch(account_id, group, &resume_id)
                 .await?;
             batches.insert(group.clone(), resume_id.clone());
+        }
+        // A resync never goes through `apply_batch`, so every current
+        // mailbox is announced here: idling sessions must re-examine
+        // UIDVALIDITY and their cached views. A closed channel only
+        // means nobody idles, so send errors are ignored.
+        if let Some(notifier) = &self.notifier {
+            for mailbox in self.state.mailboxes(account_id).await? {
+                let _ = notifier.send(MailboxChanged(mailbox.id));
+            }
         }
         Ok(batches)
     }

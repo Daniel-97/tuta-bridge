@@ -8,8 +8,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::domain::{
-    Address, Error, Folder, FolderKind, MailboxId, MessageHeader, Result, StateChange,
-    StoredMailbox, StoredMessage,
+    Address, BatchOutcome, Error, Folder, FolderKind, MailboxId, MessageHeader, Result,
+    StateChange, StoredMailbox, StoredMessage,
 };
 use crate::ports::StateStore;
 
@@ -194,6 +194,77 @@ impl SqliteStateStore {
             }
         }
     }
+
+    /// Delete the placements of `element_id` outside `keep_list_ids` on
+    /// `executor` and return the mailboxes that lost a row.
+    ///
+    /// An empty `keep_list_ids` removes every placement of the element
+    /// in the account, exactly like [`StateChange::RemoveHeaderEverywhere`].
+    /// The mailboxes are listed before the delete so the outcome can
+    /// attribute the removed rows; both statements run in the caller's
+    /// transaction, so the list cannot drift from what is deleted.
+    async fn remove_placements_in(
+        &self,
+        executor: &mut SqliteConnection,
+        account_id: i64,
+        element_id: &str,
+        keep_list_ids: &[String],
+    ) -> Result<Vec<MailboxId>> {
+        if keep_list_ids.is_empty() {
+            let mailbox_ids: Vec<i64> = sqlx::query_scalar(SELECT_ELEMENT_MAILBOXES_SQL)
+                .bind(element_id)
+                .bind(account_id)
+                .fetch_all(&mut *executor)
+                .await
+                .map_err(storage_error)?;
+            let result = sqlx::query(DELETE_ELEMENT_HEADERS_SQL)
+                .bind(element_id)
+                .bind(account_id)
+                .execute(&mut *executor)
+                .await
+                .map_err(storage_error)?;
+            return Ok(mailboxes_touched_by_removal(
+                mailbox_ids,
+                result.rows_affected(),
+            ));
+        }
+
+        let placeholders = vec!["?"; keep_list_ids.len()].join(", ");
+        let filter_sql = format!(
+            "tuta_element_id = ? AND mailbox_id IN ( \
+                SELECT id FROM mailboxes \
+                WHERE account_id = ? AND list_id NOT IN ({placeholders}) \
+            )"
+        );
+        let select_sql = format!(
+            "SELECT DISTINCT mailbox_id FROM messages WHERE {filter_sql} ORDER BY mailbox_id"
+        );
+        let mut select = sqlx::query_scalar::<_, i64>(&select_sql)
+            .bind(element_id)
+            .bind(account_id);
+        for list_id in keep_list_ids {
+            select = select.bind(list_id);
+        }
+        let mailbox_ids: Vec<i64> = select
+            .fetch_all(&mut *executor)
+            .await
+            .map_err(storage_error)?;
+
+        let delete_sql = format!("DELETE FROM messages WHERE {filter_sql}");
+        let mut delete = sqlx::query(&delete_sql).bind(element_id).bind(account_id);
+        for list_id in keep_list_ids {
+            delete = delete.bind(list_id);
+        }
+        let result = delete
+            .execute(&mut *executor)
+            .await
+            .map_err(storage_error)?;
+
+        Ok(mailboxes_touched_by_removal(
+            mailbox_ids,
+            result.rows_affected(),
+        ))
+    }
 }
 
 const UPSERT_ACCOUNT_SQL: &str = "\
@@ -274,6 +345,12 @@ const DELETE_ELEMENT_HEADERS_SQL: &str = "\
 DELETE FROM messages
 WHERE tuta_element_id = ?
   AND mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = ?)";
+
+const SELECT_ELEMENT_MAILBOXES_SQL: &str = "\
+SELECT DISTINCT mailbox_id FROM messages
+WHERE tuta_element_id = ?
+  AND mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = ?)
+ORDER BY mailbox_id";
 
 const DELETE_MAILBOX_MESSAGES_SQL: &str = "\
 DELETE FROM messages
@@ -360,6 +437,27 @@ fn u32_from_i64(value: i64) -> Result<u32> {
 fn u64_from_i64(value: i64) -> Result<u64> {
     u64::try_from(value)
         .map_err(|_| Error::Storage("invalid message size in state database".into()))
+}
+
+/// Record `mailbox` in `touched` unless it is already listed.
+///
+/// The outcome keeps insertion order, so a mailbox touched by several
+/// changes of one batch appears once, at its first change.
+fn touch_mailbox(touched: &mut Vec<MailboxId>, mailbox: MailboxId) {
+    if !touched.contains(&mailbox) {
+        touched.push(mailbox);
+    }
+}
+
+/// Mailboxes a removal statement actually deleted rows from.
+///
+/// `mailbox_ids` lists the mailboxes the rows to delete belonged to;
+/// they count only when the delete removed at least one row.
+fn mailboxes_touched_by_removal(mailbox_ids: Vec<i64>, deleted_rows: u64) -> Vec<MailboxId> {
+    if deleted_rows == 0 {
+        return Vec::new();
+    }
+    mailbox_ids.into_iter().map(MailboxId).collect()
 }
 
 fn stored_mailbox_from_row(row: &SqliteRow) -> Result<StoredMailbox> {
@@ -511,8 +609,11 @@ impl StateStore for SqliteStateStore {
         group_id: &str,
         batch_id: &str,
         changes: &[StateChange],
-    ) -> Result<()> {
+    ) -> Result<BatchOutcome> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        // Mailboxes whose rows this transaction changes, deduplicated
+        // and in first-touch order.
+        let mut touched: Vec<MailboxId> = Vec::new();
 
         // Folders go first so a new folder and its mail can arrive in the same
         // batch regardless of the order the events were produced in.
@@ -522,7 +623,7 @@ impl StateStore for SqliteStateStore {
                 uidvalidity,
             } = change
             {
-                sqlx::query(INSERT_MAILBOX_SQL)
+                let result = sqlx::query(INSERT_MAILBOX_SQL)
                     .bind(account_id)
                     .bind(&folder.list_id)
                     .bind(&folder.name)
@@ -531,6 +632,18 @@ impl StateStore for SqliteStateStore {
                     .execute(&mut *transaction)
                     .await
                     .map_err(storage_error)?;
+                let mailbox = sqlx::query_scalar(SELECT_MAILBOX_ID_SQL)
+                    .bind(account_id)
+                    .bind(&folder.list_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?
+                    .ok_or_else(|| Error::Storage("mailbox missing after upsert".into()))?;
+                // The statement either created the row or ran its
+                // DO UPDATE; both count as a change.
+                if result.rows_affected() > 0 {
+                    touch_mailbox(&mut touched, MailboxId(mailbox));
+                }
             }
         }
 
@@ -565,8 +678,10 @@ impl StateStore for SqliteStateStore {
                 .await
                 .map_err(storage_error)?;
             if let Some(mailbox) = mailbox {
+                // A successful write always inserts or updates a row.
                 self.assign_uid_in(&mut transaction, MailboxId(mailbox), header)
                     .await?;
+                touch_mailbox(&mut touched, MailboxId(mailbox));
             }
         }
 
@@ -575,43 +690,28 @@ impl StateStore for SqliteStateStore {
         for change in changes {
             match change {
                 StateChange::RemoveHeaderEverywhere { element_id } => {
-                    sqlx::query(DELETE_ELEMENT_HEADERS_SQL)
-                        .bind(element_id)
-                        .bind(account_id)
-                        .execute(&mut *transaction)
-                        .await
-                        .map_err(storage_error)?;
+                    let removed_from = self
+                        .remove_placements_in(&mut transaction, account_id, element_id, &[])
+                        .await?;
+                    for mailbox in removed_from {
+                        touch_mailbox(&mut touched, mailbox);
+                    }
                 }
                 StateChange::RemoveOtherPlacements {
                     element_id,
                     keep_list_ids,
                 } => {
-                    if keep_list_ids.is_empty() {
-                        sqlx::query(DELETE_ELEMENT_HEADERS_SQL)
-                            .bind(element_id)
-                            .bind(account_id)
-                            .execute(&mut *transaction)
-                            .await
-                            .map_err(storage_error)?;
-                        continue;
+                    let removed_from = self
+                        .remove_placements_in(
+                            &mut transaction,
+                            account_id,
+                            element_id,
+                            keep_list_ids,
+                        )
+                        .await?;
+                    for mailbox in removed_from {
+                        touch_mailbox(&mut touched, mailbox);
                     }
-                    let placeholders = vec!["?"; keep_list_ids.len()].join(", ");
-                    let sql = format!(
-                        "DELETE FROM messages \
-                         WHERE tuta_element_id = ? \
-                         AND mailbox_id IN ( \
-                             SELECT id FROM mailboxes \
-                             WHERE account_id = ? AND list_id NOT IN ({placeholders}) \
-                         )"
-                    );
-                    let mut query = sqlx::query(&sql).bind(element_id).bind(account_id);
-                    for list_id in keep_list_ids {
-                        query = query.bind(list_id);
-                    }
-                    query
-                        .execute(&mut *transaction)
-                        .await
-                        .map_err(storage_error)?;
                 }
                 StateChange::UpsertMailbox { .. } | StateChange::UpsertHeader { .. } => {}
             }
@@ -626,7 +726,7 @@ impl StateStore for SqliteStateStore {
             .map_err(storage_error)?;
 
         transaction.commit().await.map_err(storage_error)?;
-        Ok(())
+        Ok(BatchOutcome { touched })
     }
 
     async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {
@@ -1003,7 +1103,10 @@ mod tests {
                 ],
             )
             .await
-            .unwrap_err();
+            // `BatchOutcome` deliberately has no `Debug`, so the outcome is
+            // discarded without `unwrap_err`.
+            .err()
+            .expect("apply_batch must fail");
         assert!(matches!(error, Error::Storage(_)));
         assert!(store.mailboxes(account).await.unwrap().is_empty());
         assert_eq!(store.last_batch(account, "group").await.unwrap(), None);
@@ -1146,6 +1249,122 @@ mod tests {
 
         assert_eq!(store.messages(first).await.unwrap().len(), 1);
         assert!(store.messages(second).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_batch_reports_touched_mailboxes() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let mailbox_a = store
+            .upsert_mailbox(account, &folder("list-a", "Inbox", FolderKind::Inbox), 1)
+            .await
+            .unwrap();
+        let mailbox_b = store
+            .upsert_mailbox(account, &folder("list-b", "Second", FolderKind::Archive), 1)
+            .await
+            .unwrap();
+        let mailbox_c = store
+            .upsert_mailbox(account, &folder("list-c", "Third", FolderKind::Custom), 1)
+            .await
+            .unwrap();
+        // A stale placement of "shared" lives in list-b.
+        store
+            .assign_uid(mailbox_b, &header("list-b", "shared"))
+            .await
+            .unwrap();
+
+        // Two mailboxes; one is upserted into, one has a stale placement
+        // removed, a third is untouched.
+        let outcome = store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[
+                    StateChange::UpsertHeader {
+                        mailbox_list_id: "list-a".into(),
+                        header: header("mail-list", "mail-1"),
+                    },
+                    StateChange::RemoveOtherPlacements {
+                        element_id: "shared".into(),
+                        keep_list_ids: vec!["list-a".into()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The outcome lists exactly the two changed ids, in the order
+        // the batch first touched them.
+        assert_eq!(outcome.touched, vec![mailbox_a, mailbox_b]);
+        assert!(!outcome.touched.contains(&mailbox_c));
+    }
+
+    #[tokio::test]
+    async fn apply_batch_touches_only_mailboxes_whose_rows_changed() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let mailbox_a = store
+            .upsert_mailbox(account, &folder("list-a", "Inbox", FolderKind::Inbox), 1)
+            .await
+            .unwrap();
+        let mailbox_b = store
+            .upsert_mailbox(account, &folder("list-b", "Second", FolderKind::Archive), 1)
+            .await
+            .unwrap();
+        store
+            .assign_uid(mailbox_a, &header("list-a", "e1"))
+            .await
+            .unwrap();
+
+        // An upsert for an unknown mailbox writes no row; the removal
+        // deletes a row only in list-a.
+        let outcome = store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[
+                    StateChange::UpsertHeader {
+                        mailbox_list_id: "missing".into(),
+                        header: header("mail-list", "e2"),
+                    },
+                    StateChange::RemoveHeaderEverywhere {
+                        element_id: "e1".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.touched, vec![mailbox_a]);
+        assert!(!outcome.touched.contains(&mailbox_b));
+    }
+
+    #[tokio::test]
+    async fn apply_batch_marks_upserted_mailboxes_as_touched() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+
+        let changes = [StateChange::UpsertMailbox {
+            folder: folder("list-a", "Inbox", FolderKind::Inbox),
+            uidvalidity: 7,
+        }];
+        let outcome = store
+            .apply_batch(account, "group", "batch-1", &changes)
+            .await
+            .unwrap();
+        let mailbox = store.mailboxes(account).await.unwrap().remove(0);
+        // Creating the row counts.
+        assert_eq!(outcome.touched, vec![mailbox.id]);
+
+        // Replaying the same upsert runs the DO UPDATE path, which also
+        // counts as a change.
+        let outcome = store
+            .apply_batch(account, "group", "batch-2", &changes)
+            .await
+            .unwrap();
+        assert_eq!(outcome.touched, vec![mailbox.id]);
     }
 
     #[tokio::test]

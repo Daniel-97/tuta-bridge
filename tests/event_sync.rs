@@ -160,12 +160,14 @@ async fn mail_set_create_upserts_a_folder() {
         .await
         .unwrap();
 
+    let created = store.mailbox_id(account, "folder-list");
     assert_eq!(
         report,
         EventReport {
             changes: 1,
             skipped: 0,
-            lookup_failures: 0
+            lookup_failures: 0,
+            touched_mailboxes: vec![created]
         }
     );
     let mailboxes = store.mailboxes(account).await.unwrap();
@@ -211,17 +213,20 @@ async fn mail_update_adds_every_placement_and_removes_old_ones() {
         .await
         .unwrap();
 
+    let list_a = store.mailbox_id(account, "list-a");
+    let list_b = store.mailbox_id(account, "list-b");
+    let list_c = store.mailbox_id(account, "list-c");
     assert_eq!(
         report,
         EventReport {
             changes: 1,
             skipped: 0,
-            lookup_failures: 0
+            lookup_failures: 0,
+            // The upserts touched list-a and list-b first; the removal
+            // guard then dropped the stale row in list-c.
+            touched_mailboxes: vec![list_a, list_b, list_c]
         }
     );
-    let list_a = store.mailbox_id(account, "list-a");
-    let list_b = store.mailbox_id(account, "list-b");
-    let list_c = store.mailbox_id(account, "list-c");
     assert_eq!(store.uid_for(list_a, "mail-list", "mail-1"), Some(1));
     assert_eq!(store.uid_for(list_b, "mail-list", "mail-1"), Some(1));
     assert_eq!(store.uid_for(list_c, "mail-list", "mail-1"), None);
@@ -253,7 +258,12 @@ async fn mail_update_with_no_placements_removes_the_mail() {
         EventReport {
             changes: 1,
             skipped: 0,
-            lookup_failures: 0
+            lookup_failures: 0,
+            // Both mailboxes lost the mail's row.
+            touched_mailboxes: vec![
+                store.mailbox_id(account, "list-a"),
+                store.mailbox_id(account, "list-b")
+            ]
         }
     );
     assert_eq!(
@@ -292,7 +302,8 @@ async fn unreadable_mail_is_skipped_and_keeps_the_existing_row() {
             changes: 0,
             skipped: 1,
             // An unreadable mail (Ok(None)) is not a lookup failure.
-            lookup_failures: 0
+            lookup_failures: 0,
+            touched_mailboxes: Vec::new()
         }
     );
     assert_eq!(
@@ -334,7 +345,12 @@ async fn mail_delete_removes_every_placement() {
         EventReport {
             changes: 1,
             skipped: 0,
-            lookup_failures: 0
+            lookup_failures: 0,
+            // Both mailboxes lost the mail's row.
+            touched_mailboxes: vec![
+                store.mailbox_id(account, "list-a"),
+                store.mailbox_id(account, "list-b")
+            ]
         }
     );
     assert_eq!(
@@ -398,7 +414,8 @@ async fn lookup_failure_is_skipped_and_the_batch_is_still_persisted() {
             skipped: 3,
             // Every skipped event was skipped because its lookup
             // failed.
-            lookup_failures: 3
+            lookup_failures: 3,
+            touched_mailboxes: Vec::new()
         }
     );
     assert_eq!(
@@ -453,7 +470,8 @@ async fn unknown_types_and_entry_deletes_are_skipped_but_persisted() {
             skipped: 3,
             // Unknown types, foreign applications, and entry deletes
             // never reach a lookup, so none counts as a failure.
-            lookup_failures: 0
+            lookup_failures: 0,
+            touched_mailboxes: Vec::new()
         }
     );
     assert_eq!(store.mailboxes(account).await.unwrap().len(), 0);
@@ -603,5 +621,44 @@ async fn reapplying_the_same_batch_does_not_change_uids() {
             .filter(|call| *call == "apply_batch")
             .count(),
         2
+    );
+}
+
+#[tokio::test]
+async fn report_lists_every_touched_mailbox() {
+    let store = Arc::new(FakeStateStore::new());
+    let account = account(&store).await;
+    store
+        .upsert_mailbox(account, &folder("list-a"), 7)
+        .await
+        .unwrap();
+    // The mail is already filed in list-b; the update below keeps only
+    // list-a, so list-b's stale row is removed.
+    filed(&store, account, "list-b", "mail-list", "mail-1").await;
+    let lookup = FakeEventLookup::new().with_mail_placements(
+        "mail-list",
+        "mail-1",
+        Some(vec![placement("list-a", "mail-list", "mail-1")]),
+    );
+    let batch = batch(vec![event(
+        "tutanota",
+        MAIL_TYPE_ID,
+        "mail-list",
+        "mail-1",
+        EntityOperation::Update,
+    )]);
+
+    let report = EventProcessor::new(store.clone())
+        .apply(account, &lookup, 7, &batch)
+        .await
+        .unwrap();
+
+    // The upsert touched list-a first, the removal touched list-b.
+    assert_eq!(
+        report.touched_mailboxes,
+        vec![
+            store.mailbox_id(account, "list-a"),
+            store.mailbox_id(account, "list-b")
+        ]
     );
 }

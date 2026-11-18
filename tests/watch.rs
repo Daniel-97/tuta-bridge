@@ -16,10 +16,11 @@ use tuta_bridge::app::watch::{BackoffPolicy, WatchUseCase};
 use tuta_bridge::config::Config;
 use tuta_bridge::domain::{
     AccountInfo, Address, EntityEvent, EntityOperation, Error, EventBatch, EventFrame, Folder,
-    FolderKind, MailPlacement, MessageHeader, Result, StoredCredentials, MAIL_SET_ENTRY_TYPE_ID,
-    MAIL_TYPE_ID, TUTANOTA_APP,
+    FolderKind, MailPlacement, MailboxId, MessageHeader, Result, StoredCredentials,
+    MAIL_SET_ENTRY_TYPE_ID, MAIL_TYPE_ID, TUTANOTA_APP,
 };
 use tuta_bridge::ports::clock::Clock;
+use tuta_bridge::ports::mailbox_events::MailboxChanged;
 use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
 use tuta_bridge::ports::state_store::StateStore;
 
@@ -125,6 +126,7 @@ fn use_case(
         },
         connect_timeout: Duration::from_secs(5),
         lookup_failure_threshold: 10,
+        notifier: None,
     }
 }
 
@@ -640,4 +642,141 @@ async fn connect_timeout_is_retried() {
             .as_deref(),
         Some("batch-6")
     );
+}
+
+#[tokio::test]
+async fn batches_notify_every_touched_mailbox() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, _marker) = synced_account(&state).await;
+
+    // The entry event resolves to one placement of mail-1 in list-a.
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()]).with_lookup(Arc::new(
+            FakeEventLookup::new().with_entry_placement(
+                "list-a",
+                "entry-1",
+                placement("list-a", "list-a", "mail-1"),
+            ),
+        )),
+    );
+    // One batch touches list-a; the empty batch after it touches nothing.
+    session.push_script(vec![
+        Ok(EventFrame::Batch(entry_batch(
+            "batch-2", "group1", "entry-1",
+        ))),
+        Ok(EventFrame::Batch(empty_batch("batch-3", "group1"))),
+        Ok(EventFrame::InitialSyncDone),
+        Err(Error::Login("stop".into())),
+    ]);
+
+    let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .with_notifier(sender)
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+
+    // Exactly one notification, for the mailbox the batch touched.
+    let mailbox = state.mailbox_id(account, "list-a");
+    assert_eq!(receiver.recv().await.unwrap(), MailboxChanged(mailbox));
+    assert!(
+        receiver.try_recv().is_err(),
+        "the empty batch must not notify"
+    );
+}
+
+#[tokio::test]
+async fn closed_notifier_channel_is_ignored() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, _marker) = synced_account(&state).await;
+
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()]).with_lookup(Arc::new(
+            FakeEventLookup::new().with_entry_placement(
+                "list-a",
+                "entry-1",
+                placement("list-a", "list-a", "mail-1"),
+            ),
+        )),
+    );
+    session.push_script(vec![
+        Ok(EventFrame::Batch(entry_batch(
+            "batch-2", "group1", "entry-1",
+        ))),
+        Err(Error::Login("stop".into())),
+    ]);
+
+    // No receiver: every send fails, and the loop must keep running.
+    let (sender, receiver) = tokio::sync::broadcast::channel(4);
+    drop(receiver);
+
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .with_notifier(sender)
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+
+    // The batch was applied despite the failed notifications.
+    let mailbox = state.mailbox_id(account, "list-a");
+    assert_eq!(state.uid_for(mailbox, "list-a", "mail-1"), Some(1));
+}
+
+#[tokio::test]
+async fn resync_notifies_every_current_mailbox() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let account = account_id(&state).await;
+    state
+        .upsert_mailbox(account, &folder("list-a"), 100)
+        .await
+        .unwrap();
+    let old = timestamp_to_generated_id(NOW_MS - BATCH_EXPIRY_MS - 1);
+    state.set_last_batch(account, "group1", &old).await.unwrap();
+
+    // The resync rebuilds two mailboxes; both must be announced.
+    let mut mail = FakeMailSource::new();
+    mail.folders = vec![folder("list-a"), folder("list-b")];
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()]).with_mail(Arc::new(mail)),
+    );
+    session
+        .mail
+        .set_headers("list-a", vec![header("list-a", "e1")]);
+    session
+        .mail
+        .set_headers("list-b", vec![header("list-b", "e2")]);
+    session.push_script(vec![
+        Ok(EventFrame::Batch(empty_batch("batch-9", "group1"))),
+        Err(Error::Login("stop".into())),
+    ]);
+
+    let (sender, mut receiver) = tokio::sync::broadcast::channel(8);
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .with_notifier(sender)
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+
+    // The rebuild announced every current mailbox, in id order; the
+    // empty batch after it added nothing.
+    let mut notified = Vec::new();
+    while let Ok(changed) = receiver.try_recv() {
+        notified.push(changed.0);
+    }
+    let current: Vec<MailboxId> = state
+        .mailboxes(account)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|mailbox| mailbox.id)
+        .collect();
+    assert_eq!(notified, current);
 }

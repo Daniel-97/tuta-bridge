@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use secrecy::SecretString;
 use tuta_bridge::domain::{
-    AccountId, AccountInfo, Error, EventFrame, Folder, MailPlacement, MailboxId, MessageContent,
-    MessageHeader, MessagePage, MessageSummary, Result, StateChange, StoredCredentials,
-    StoredMailbox, StoredMessage,
+    AccountId, AccountInfo, BatchOutcome, Error, EventFrame, Folder, MailPlacement, MailboxId,
+    MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
+    StoredCredentials, StoredMailbox, StoredMessage,
 };
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::event_lookup::EventLookup;
@@ -245,7 +245,9 @@ impl FakeStateStore {
             .retain(|(stored_mailbox, _, _), _| *stored_mailbox != mailbox);
     }
 
-    fn remove_element_headers(&self, account_id: i64, element_id: &str) {
+    /// Remove the element's rows in the account and return the mailboxes
+    /// that lost a row, in ascending id order like the SQLite adapter.
+    fn remove_element_headers(&self, account_id: i64, element_id: &str) -> Vec<MailboxId> {
         let account_mailboxes: HashSet<MailboxId> = self
             .mailboxes
             .lock()
@@ -254,15 +256,30 @@ impl FakeStateStore {
             .filter(|mailbox| mailbox.account_id == account_id)
             .map(|mailbox| mailbox.id)
             .collect();
+        let mut removed: HashSet<MailboxId> = HashSet::new();
         self.messages
             .lock()
             .unwrap()
             .retain(|(mailbox, _, element), _| {
-                !(account_mailboxes.contains(mailbox) && element == element_id)
+                if account_mailboxes.contains(mailbox) && element == element_id {
+                    removed.insert(*mailbox);
+                    false
+                } else {
+                    true
+                }
             });
+        sorted_mailbox_ids(removed)
     }
 
-    fn remove_other_placements(&self, account_id: i64, element_id: &str, keep_list_ids: &[String]) {
+    /// Remove the element's rows outside `keep_list_ids` and return the
+    /// mailboxes that lost a row, in ascending id order like the SQLite
+    /// adapter.
+    fn remove_other_placements(
+        &self,
+        account_id: i64,
+        element_id: &str,
+        keep_list_ids: &[String],
+    ) -> Vec<MailboxId> {
         let (account_mailboxes, kept): (HashSet<MailboxId>, HashSet<MailboxId>) = {
             let mailboxes = self.mailboxes.lock().unwrap();
             let account_mailboxes = mailboxes
@@ -279,14 +296,37 @@ impl FakeStateStore {
                 .collect();
             (account_mailboxes, kept)
         };
+        let mut removed: HashSet<MailboxId> = HashSet::new();
         self.messages
             .lock()
             .unwrap()
             .retain(|(mailbox, _, element), _| {
-                !(account_mailboxes.contains(mailbox)
+                if account_mailboxes.contains(mailbox)
                     && !kept.contains(mailbox)
-                    && element == element_id)
+                    && element == element_id
+                {
+                    removed.insert(*mailbox);
+                    false
+                } else {
+                    true
+                }
             });
+        sorted_mailbox_ids(removed)
+    }
+}
+
+/// Mailbox ids in ascending id order, mirroring the SQLite adapter's
+/// `ORDER BY id` when a removal attributes its deleted rows.
+fn sorted_mailbox_ids(ids: HashSet<MailboxId>) -> Vec<MailboxId> {
+    let mut ids: Vec<i64> = ids.into_iter().map(|id| id.0).collect();
+    ids.sort_unstable();
+    ids.into_iter().map(MailboxId).collect()
+}
+
+/// Record `mailbox` in `touched` unless it is already listed.
+fn touch_mailbox(touched: &mut Vec<MailboxId>, mailbox: MailboxId) {
+    if !touched.contains(&mailbox) {
+        touched.push(mailbox);
     }
 }
 
@@ -514,8 +554,11 @@ impl StateStore for FakeStateStore {
         group_id: &str,
         batch_id: &str,
         changes: &[StateChange],
-    ) -> Result<()> {
+    ) -> Result<BatchOutcome> {
         self.calls.lock().unwrap().push("apply_batch".into());
+        // Mailboxes whose rows this batch changes, deduplicated and in
+        // first-touch order.
+        let mut touched: Vec<MailboxId> = Vec::new();
 
         for change in changes {
             if let StateChange::UpsertMailbox {
@@ -523,7 +566,10 @@ impl StateStore for FakeStateStore {
                 uidvalidity,
             } = change
             {
-                self.upsert_mailbox_entry(account_id, folder, *uidvalidity);
+                // Creating the row and running the update path both
+                // count as a change.
+                let mailbox = self.upsert_mailbox_entry(account_id, folder, *uidvalidity);
+                touch_mailbox(&mut touched, mailbox);
             }
         }
 
@@ -554,19 +600,29 @@ impl StateStore for FakeStateStore {
                 .get(&(account_id, mailbox_list_id.to_string()))
                 .map(|mailbox| mailbox.id);
             if let Some(mailbox) = mailbox {
+                // A successful write always inserts or updates a row.
                 self.assign_uid_entry(mailbox, header)?;
+                touch_mailbox(&mut touched, mailbox);
             }
         }
 
         for change in changes {
             match change {
                 StateChange::RemoveHeaderEverywhere { element_id } => {
-                    self.remove_element_headers(account_id, element_id);
+                    for mailbox in self.remove_element_headers(account_id, element_id) {
+                        touch_mailbox(&mut touched, mailbox);
+                    }
                 }
                 StateChange::RemoveOtherPlacements {
                     element_id,
                     keep_list_ids,
-                } => self.remove_other_placements(account_id, element_id, keep_list_ids),
+                } => {
+                    let removed =
+                        self.remove_other_placements(account_id, element_id, keep_list_ids);
+                    for mailbox in removed {
+                        touch_mailbox(&mut touched, mailbox);
+                    }
+                }
                 StateChange::UpsertMailbox { .. } | StateChange::UpsertHeader { .. } => {}
             }
         }
@@ -575,7 +631,7 @@ impl StateStore for FakeStateStore {
             .lock()
             .unwrap()
             .insert((account_id, group_id.to_string()), batch_id.to_string());
-        Ok(())
+        Ok(BatchOutcome { touched })
     }
 
     async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {

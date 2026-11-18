@@ -179,6 +179,7 @@ fn main() {
                     backoff: BackoffPolicy::production(),
                     connect_timeout: CONNECT_TIMEOUT,
                     lookup_failure_threshold: LOOKUP_FAILURE_THRESHOLD,
+                    notifier: None,
                 };
                 uc.run().await?;
                 Ok(())
