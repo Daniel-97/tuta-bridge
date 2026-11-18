@@ -1,0 +1,71 @@
+use secrecy::SecretString;
+
+use crate::adapters::imap::codec::FetchItem;
+use crate::domain::{MailboxId, Result};
+
+/// One mailbox as `LIST`/`LSUB` answer it.
+///
+/// `special_use` is the rendered SPECIAL-USE attribute ("" for INBOX and
+/// custom folders). Like every data-carrying port type it deliberately
+/// does not implement `Debug`: mailbox names are personal data that must
+/// not end up in logs.
+pub struct MailboxView {
+    pub id: MailboxId,
+    pub name: String,
+    pub special_use: &'static str,
+}
+
+/// The snapshot `SELECT` reports for one mailbox.
+pub struct SelectedMailbox {
+    pub view: MailboxView,
+    pub uidvalidity: u32,
+    pub uidnext: u32,
+    pub exists: usize,
+    pub unseen: usize,
+}
+
+/// One FETCH response, built from the requested item list.
+///
+/// `envelope`, `bodystructure`, `rfc822_size`, and `body` stay `None`
+/// when the request did not ask for them. The port models a single body
+/// per response: with several body items in one request the last one
+/// wins — real clients request one body section per FETCH. The strings
+/// are already IMAP-encoded (literals framed as `{n}\r\n<bytes>` where
+/// needed), so the session writes them verbatim. No `Debug`: envelopes
+/// and bodies are personal data that must never reach a log line.
+pub struct FetchResponse {
+    pub uid: u32,
+    pub flags: String,
+    pub internal_date: String,
+    pub envelope: Option<String>,
+    pub bodystructure: Option<String>,
+    pub rfc822_size: Option<u64>,
+    pub body: Option<Vec<u8>>,
+}
+
+/// The read-only backend seam a session talks to.
+///
+/// Implementations answer from the local state store; only body fetches
+/// may load content on demand. Login compares against the locally stored
+/// bridge password.
+#[async_trait::async_trait]
+pub trait ImapBackend: Send + Sync {
+    /// Compare `user`/`password` against the expected account login and
+    /// the stored bridge password. `false` on any mismatch; never an
+    /// error, and never a log line.
+    async fn login(&self, user: &str, password: &SecretString) -> Result<bool>;
+    async fn mailboxes(&self) -> Result<Vec<MailboxView>>;
+    /// Resolve one mailbox by name: exact, plus `INBOX` case-insensitively.
+    async fn select(&self, name: &str) -> Result<Option<SelectedMailbox>>;
+    /// Fetch one stored message by UID, or `None` when the mailbox has no
+    /// such row.
+    async fn fetch(
+        &self,
+        mailbox: MailboxId,
+        uid: u32,
+        items: &[FetchItem],
+    ) -> Result<Option<FetchResponse>>;
+    /// Evaluate SEARCH criteria over the stored index; the returned
+    /// numbers are UIDs.
+    async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>>;
+}

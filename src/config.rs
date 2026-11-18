@@ -8,12 +8,17 @@ use std::path::{Path, PathBuf};
 const DEFAULT_BASE_URL: &str = "https://app.tuta.com";
 const APP_DIR: &str = "tuta-bridge";
 
+/// Local IMAP listen port used when the config names none.
+pub const DEFAULT_IMAP_PORT: u16 = 9930;
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_account: Option<String>,
     pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imap_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -21,6 +26,7 @@ impl Default for Config {
         Self {
             active_account: None,
             base_url: DEFAULT_BASE_URL.to_owned(),
+            imap_port: None,
         }
     }
 }
@@ -114,6 +120,24 @@ pub fn resolve_base_url(cli: Option<&str>, env: Option<&str>, config: &Config) -
         .or(env.filter(|s| !s.is_empty()))
         .unwrap_or(&config.base_url)
         .to_owned()
+}
+
+/// Resolve the local IMAP listen port: the configured value, or the
+/// default 9930 when the config names none.
+pub fn resolve_imap_port(config: &Config) -> u16 {
+    config.imap_port.unwrap_or(DEFAULT_IMAP_PORT)
+}
+
+/// Validate a configured IMAP port: only the range 1..=65535 is valid.
+///
+/// `u16` already bounds the upper end, so the only rejected value is
+/// the reserved port 0.
+pub fn validate_imap_port(port: u16) -> std::result::Result<(), String> {
+    if (1..=u16::MAX).contains(&port) {
+        Ok(())
+    } else {
+        Err("imap_port must be between 1 and 65535".to_string())
+    }
 }
 
 pub fn config_path() -> anyhow::Result<PathBuf> {
@@ -214,6 +238,7 @@ mod tests {
         let cfg = Config {
             active_account: None,
             base_url: "https://cfg.example".into(),
+            imap_port: None,
         };
         assert_eq!(
             resolve_base_url(Some(""), Some(""), &cfg),
@@ -254,6 +279,7 @@ mod tests {
         let cfg = Config {
             active_account: Some("a@b.c".into()),
             base_url: "https://cfg.example".into(),
+            imap_port: None,
         };
         cfg.save(&path).unwrap();
         assert!(Config::load(&path).unwrap() == cfg);
@@ -270,6 +296,43 @@ mod tests {
             "https://env.example"
         );
         assert_eq!(resolve_base_url(None, None, &cfg), "https://cfg.example");
+    }
+
+    #[test]
+    fn imap_port_roundtrips_and_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // A configured port survives a save/load round trip. `Config`
+        // deliberately has no `Debug` (it carries the account address),
+        // so the comparison is PartialEq.
+        let cfg = Config {
+            imap_port: Some(10143),
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded == cfg);
+        assert_eq!(loaded.imap_port, Some(10143));
+        assert_eq!(resolve_imap_port(&loaded), 10143);
+
+        // A config that names no port keeps `None`; serve resolves the
+        // documented default.
+        let plain = Config::default();
+        plain.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().imap_port, None);
+        assert_eq!(resolve_imap_port(&plain), DEFAULT_IMAP_PORT);
+    }
+
+    #[test]
+    fn imap_port_validation_accepts_the_range_and_rejects_zero() {
+        assert!(validate_imap_port(1).is_ok());
+        assert!(validate_imap_port(DEFAULT_IMAP_PORT).is_ok());
+        assert!(validate_imap_port(u16::MAX).is_ok());
+        assert_eq!(
+            validate_imap_port(0),
+            Err("imap_port must be between 1 and 65535".to_string())
+        );
     }
 
     #[test]

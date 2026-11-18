@@ -34,6 +34,8 @@ pub enum Command {
     Resync,
     /// Stream Tuta events and update the local index.
     Watch,
+    /// Set the local IMAP password.
+    Passwd,
     Dump {
         #[arg(long)]
         folder: String,
@@ -87,6 +89,16 @@ mod tests {
         assert!(matches!(
             parse_from(["tuta-bridge", "watch"]).unwrap().command,
             Command::Watch
+        ));
+    }
+
+    #[test]
+    fn parses_passwd_command() {
+        // The prompt/keyring wiring belongs to the serve main wiring;
+        // this task pins the parser contract only.
+        assert!(matches!(
+            parse_from(["tuta-bridge", "passwd"]).unwrap().command,
+            Command::Passwd
         ));
     }
 

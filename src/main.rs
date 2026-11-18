@@ -196,6 +196,12 @@ fn main() {
                 println!("logged out");
                 Ok(())
             }
+            Command::Passwd => {
+                // The parser contract is pinned in cli.rs; the prompt and
+                // keyring wiring lands with the serve main wiring that
+                // follows. Fixed, credential-free error until then.
+                Err(Error::Unsupported("passwd is not wired yet".into()))
+            }
             Command::Dump { folder, limit, out } => {
                 let uc = DumpUseCase::new(
                     Arc::clone(&factory) as Arc<dyn tuta_bridge::ports::session::SessionFactory>,
