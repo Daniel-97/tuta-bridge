@@ -619,7 +619,7 @@ Expected: FAIL.
 - `passwd`: read the password twice with `rpassword` (hidden), store via `KeyringPasswordStore::set`, print `local IMAP password stored` — never the password.
 - Add `Session::shared_mail(&self) -> Arc<dyn MailSource>`; implement it in `TutaSession` (wrap `TutaMailSource` in an `Arc` at construction) and in the test fakes; keep the existing `mail()` method unchanged.
 - `serve`:
-  1. Load config; resolve `imap_port` (default `9930`).
+  1. Load config; resolve `imap_port` (default `9930`) and validate it with `validate_imap_port` before binding — a bad port must fail `serve` with a fixed message, never silently bind an ephemeral port.
   2. `open_state_store()`, resume the session, `upsert_account`.
   3. Load the bridge password; missing → `Error::Config("local IMAP password not set; run tuta-bridge passwd first".into())`.
   4. Build the `TutaImapBackend` (expected user = the account's mail address; `source = session.shared_mail()`; enricher; `Arc::new(MimeRenderer)` as the `Arc<dyn MessageRenderer>`).
