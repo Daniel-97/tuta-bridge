@@ -62,7 +62,29 @@ pub fn parse_line(line: &str) -> Result<Request> {
     }
 
     let mut args = Vec::new();
-    rest = tail.trim_start();
+    parse_args(tail, &mut args)?;
+    Ok(Request {
+        tag: tag.to_string(),
+        command: command.to_string(),
+        args,
+    })
+}
+
+/// Parse the continuation line that follows a client literal: the
+/// arguments after the announced bytes, with no tag or command.
+///
+/// The session reads the `{n}` bytes itself, fills the placeholder the
+/// marker produced, and then hands the rest of the line here. A trailing
+/// `{n}` marker appends another empty [`ImapArg::Literal`] placeholder
+/// for the session to fill, so chained literals keep working with no
+/// session-side reimplementation of the tokenizer.
+pub fn parse_continuation(line: &str, args: &mut Vec<ImapArg>) -> Result<()> {
+    parse_args(line, args)
+}
+
+/// Parse argument tokens off `rest`, filling `args`.
+fn parse_args(rest: &str, args: &mut Vec<ImapArg>) -> Result<()> {
+    let mut rest = rest.trim_start();
     while !rest.is_empty() {
         match rest.as_bytes()[0] {
             b'(' => {
@@ -95,12 +117,7 @@ pub fn parse_line(line: &str) -> Result<Request> {
             }
         }
     }
-
-    Ok(Request {
-        tag: tag.to_string(),
-        command: command.to_string(),
-        args,
-    })
+    Ok(())
 }
 
 /// Split off the first whitespace-delimited atom, returning the remainder
@@ -179,10 +196,11 @@ pub fn pending_literal(line: &str) -> Option<usize> {
 ///
 /// `ranges` holds `(start, stop)` pairs where a `None` stop is the
 /// unbounded upper end produced by `*`. A pure codec cannot know the
-/// mailbox size, so a lone `*` — which in IMAP names the largest number in
-/// use — anchors at the highest concrete number in the set, or at 1 when
-/// the set names none: the ALL set `1:*`. The session clamps ranges
-/// against the mailbox when resolving message numbers.
+/// mailbox size, so the session resolves each range against it:
+/// `(x, Some(y))` selects the numbers both ends clamp to, `(x, None)`
+/// selects `x..max`, and `(0, None)` — produced only by a lone `*`
+/// (or `*:*`), never by a concrete start — selects exactly the last
+/// message, per RFC 3501 §6.4.8. The ALL set `1:*` is `(1, None)`.
 #[derive(Debug, Clone)]
 pub struct SeqSet {
     ranges: Vec<(u32, Option<u32>)>,
@@ -194,6 +212,13 @@ impl SeqSet {
         Self {
             ranges: vec![(1, None)],
         }
+    }
+
+    /// The raw `(start, stop)` pairs, for a consumer that must resolve
+    /// star semantics against a concrete maximum instead of testing
+    /// membership with [`SeqSet::contains`].
+    pub fn ranges(&self) -> &[(u32, Option<u32>)] {
+        &self.ranges
     }
 
     /// True when `n` falls inside any range (a `None` stop is unbounded).
@@ -221,8 +246,10 @@ fn seq_number(raw: &str) -> Result<u32> {
 ///
 /// `*` is the unbounded upper end wherever it appears: `4:*` covers every
 /// number from 4 up, and `*:4` is normalized to the same range. A lone `*`
-/// (or `*:*`) anchors as described on [`SeqSet`]. Sequence number `0` and
-/// reversed finite ranges (`5:1`) are rejected with the fixed error
+/// (or `*:*`) anchors at `(0, None)` — a start no concrete number can
+/// produce — so the session can resolve it to exactly the last message,
+/// while `1:*` stays the ALL set. Sequence number `0` and reversed finite
+/// ranges (`5:1`) are rejected with the fixed error
 /// `invalid sequence set`.
 pub fn parse_seq_set(raw: &str) -> Result<SeqSet> {
     if raw.trim().is_empty() {
@@ -231,7 +258,7 @@ pub fn parse_seq_set(raw: &str) -> Result<SeqSet> {
 
     let mut ranges: Vec<(u32, Option<u32>)> = Vec::new();
     let mut stars = 0usize;
-    let mut highest: u32 = 1;
+    let mut highest: u32 = 0;
     for part in raw.split(',') {
         let part = part.trim();
         if part.is_empty() {
@@ -266,8 +293,16 @@ pub fn parse_seq_set(raw: &str) -> Result<SeqSet> {
             },
         }
     }
-    for _ in 0..stars {
-        ranges.push((highest, None));
+    if ranges.is_empty() {
+        // A pure-star set names no concrete number: anchor at zero, the
+        // start no `x:*` range can ever produce.
+        for _ in 0..stars {
+            ranges.push((0, None));
+        }
+    } else {
+        for _ in 0..stars {
+            ranges.push((highest.max(1), None));
+        }
     }
     Ok(SeqSet { ranges })
 }
@@ -604,6 +639,55 @@ mod tests {
         // the session fills after reading the announced bytes.
         let request = parse_line("a003 LOGIN {5}").unwrap();
         assert!(matches!(request.args[0], ImapArg::Literal(ref bytes) if bytes.is_empty()));
+    }
+
+    #[test]
+    fn continuation_lines_append_arguments_without_a_tag() {
+        // The bytes after one literal: more arguments, no tag or command.
+        let mut args = Vec::new();
+        parse_continuation(" hunter2", &mut args).unwrap();
+        assert_eq!(args, vec![ImapArg::Atom("hunter2".into())]);
+
+        // A quoted value with a space stays one argument.
+        let mut args = Vec::new();
+        parse_continuation(" \"pass word\"", &mut args).unwrap();
+        assert_eq!(args, vec![ImapArg::Quoted("pass word".into())]);
+
+        // A trailing marker appends the next placeholder to fill.
+        let mut args = vec![ImapArg::Literal(b"user".to_vec())];
+        parse_continuation(" {7}", &mut args).unwrap();
+        assert_eq!(args[0], ImapArg::Literal(b"user".to_vec()));
+        assert!(matches!(args[1], ImapArg::Literal(ref bytes) if bytes.is_empty()));
+
+        // An empty continuation line (the literal ended the command) adds
+        // nothing; an unterminated group is a parse error.
+        let mut args = Vec::new();
+        parse_continuation("", &mut args).unwrap();
+        assert!(args.is_empty());
+        assert!(parse_continuation(" (unclosed", &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn lone_star_anchors_at_zero_for_the_session_to_clamp() {
+        // A lone `*` (or `*:*`) selects exactly the LAST message, so it
+        // anchors at `(0, None)` — a shape a concrete start can never
+        // produce — and the session resolves it against the mailbox.
+        let lone = parse_seq_set("*").unwrap();
+        assert_eq!(lone.ranges(), &[(0, None)]);
+        let stars = parse_seq_set("*,*:*").unwrap();
+        assert_eq!(stars.ranges(), &[(0, None), (0, None)]);
+
+        // Concrete starts keep their numbers: `1:*` is the ALL set and a
+        // trailing star anchors at the set's highest concrete number.
+        let all = parse_seq_set("1:*").unwrap();
+        assert_eq!(all.ranges(), &[(1, None)]);
+        let trailing = parse_seq_set("9:10,1,*").unwrap();
+        assert_eq!(
+            trailing.ranges(),
+            &[(9, Some(10)), (1, Some(1)), (10, None)]
+        );
+        let reversed = parse_seq_set("*:4").unwrap();
+        assert_eq!(reversed.ranges(), &[(4, None)]);
     }
 
     #[test]

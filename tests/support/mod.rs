@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
+use tuta_bridge::adapters::imap::codec::FetchItem;
 use tuta_bridge::domain::{
     AccountId, AccountInfo, BatchOutcome, Error, EventFrame, Folder, MailPlacement, MailboxId,
     MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
@@ -13,6 +14,7 @@ use tuta_bridge::domain::{
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::event_lookup::EventLookup;
 use tuta_bridge::ports::event_stream::{EventHandles, EventStream};
+use tuta_bridge::ports::imap_backend::{FetchResponse, ImapBackend, MailboxView, SelectedMailbox};
 use tuta_bridge::ports::mail_source::MailSource;
 use tuta_bridge::ports::prompt::LoginPrompt;
 use tuta_bridge::ports::renderer::MessageRenderer;
@@ -1202,5 +1204,227 @@ impl MessageRenderer for FakeRenderer {
     fn render(&self, _content: &MessageContent) -> Result<Vec<u8>> {
         self.render_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.output.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeImapBackend
+// ---------------------------------------------------------------------------
+
+/// One scripted `SELECT` snapshot. The uid list doubles as the message
+/// count (`exists` is its length), so a new stored message is one pushed
+/// uid — exactly how the real store reports a growing mailbox.
+#[derive(Clone)]
+pub struct FakeSelected {
+    pub uidvalidity: u32,
+    pub uidnext: u32,
+    pub unseen: usize,
+    pub uids: Vec<u32>,
+}
+
+impl FakeSelected {
+    pub fn new(uidvalidity: u32, uidnext: u32, unseen: usize, uids: Vec<u32>) -> Self {
+        Self {
+            uidvalidity,
+            uidnext,
+            unseen,
+            uids,
+        }
+    }
+}
+
+/// One scripted `FETCH` answer; the session renders whichever of these
+/// fields the request asked for.
+#[derive(Clone)]
+pub struct FakeFetched {
+    pub flags: String,
+    pub internal_date: String,
+    pub envelope: Option<String>,
+    pub bodystructure: Option<String>,
+    pub rfc822_size: Option<u64>,
+    pub body: Vec<u8>,
+}
+
+/// In-memory [`ImapBackend`] for session tests.
+///
+/// Logins compare against the expected pair. `select` matches names
+/// exactly plus the `INBOX` alias for a mailbox named Inbox. `search`
+/// answers the snapshot's uid list for the `["ALL"]` criteria the
+/// session uses to enumerate the mailbox, a scripted result for exact
+/// criteria, and the default scripted list otherwise. `fetch` answers
+/// only the scripted uids and `None` for anything else, so an unscripted
+/// uid behaves exactly like an expunged message.
+pub struct FakeImapBackend {
+    pub expected_user: String,
+    pub expected_password: String,
+    pub views: Vec<MailboxView>,
+    pub snapshots: Mutex<HashMap<String, FakeSelected>>,
+    pub fetches: Mutex<HashMap<u32, FakeFetched>>,
+    /// Non-ALL search answers, keyed by the exact criteria.
+    pub search_scripts: Mutex<HashMap<Vec<String>, Vec<u32>>>,
+    /// The fallback non-ALL search answer.
+    pub search_uids: Mutex<Vec<u32>>,
+}
+
+impl FakeImapBackend {
+    pub fn new(user: &str, password: &str) -> Self {
+        Self {
+            expected_user: user.into(),
+            expected_password: password.into(),
+            views: Vec::new(),
+            snapshots: Mutex::new(HashMap::new()),
+            fetches: Mutex::new(HashMap::new()),
+            search_scripts: Mutex::new(HashMap::new()),
+            search_uids: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register one mailbox: its LIST view plus its `SELECT` snapshot.
+    pub fn with_mailbox(
+        mut self,
+        id: MailboxId,
+        name: &str,
+        special_use: &'static str,
+        snapshot: FakeSelected,
+    ) -> Self {
+        self.views.push(MailboxView {
+            id,
+            name: name.into(),
+            special_use,
+        });
+        self.snapshots.lock().unwrap().insert(name.into(), snapshot);
+        self
+    }
+
+    /// Script one uid's FETCH answer.
+    pub fn with_fetch(self, uid: u32, fetched: FakeFetched) -> Self {
+        self.fetches.lock().unwrap().insert(uid, fetched);
+        self
+    }
+
+    /// Script the exact `SEARCH` result for one criteria list.
+    pub fn with_search_result(self, criteria: &[&str], uids: Vec<u32>) -> Self {
+        self.search_scripts.lock().unwrap().insert(
+            criteria.iter().map(|token| token.to_string()).collect(),
+            uids,
+        );
+        self
+    }
+
+    /// Script the fallback `SEARCH` result for unknown criteria.
+    pub fn with_search(self, uids: Vec<u32>) -> Self {
+        *self.search_uids.lock().unwrap() = uids;
+        self
+    }
+
+    /// Simulate a resync: change the mailbox's UIDVALIDITY under a live
+    /// session.
+    pub fn resync(&self, name: &str, uidvalidity: u32) {
+        self.snapshots
+            .lock()
+            .unwrap()
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("mailbox {name} is not scripted"))
+            .uidvalidity = uidvalidity;
+    }
+
+    /// Simulate one new stored message: append a uid.
+    pub fn add_message(&self, name: &str, uid: u32) {
+        self.snapshots
+            .lock()
+            .unwrap()
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("mailbox {name} is not scripted"))
+            .uids
+            .push(uid);
+    }
+}
+
+#[async_trait::async_trait]
+impl ImapBackend for FakeImapBackend {
+    async fn login(&self, user: &str, password: &SecretString) -> Result<bool> {
+        Ok(user == self.expected_user && password.expose_secret() == self.expected_password)
+    }
+
+    async fn mailboxes(&self) -> Result<Vec<MailboxView>> {
+        Ok(self
+            .views
+            .iter()
+            .map(|view| MailboxView {
+                id: view.id,
+                name: view.name.clone(),
+                special_use: view.special_use,
+            })
+            .collect())
+    }
+
+    async fn select(&self, name: &str) -> Result<Option<SelectedMailbox>> {
+        let found = self
+            .views
+            .iter()
+            .find(|view| view.name == name)
+            .or_else(|| {
+                name.eq_ignore_ascii_case("INBOX")
+                    .then(|| {
+                        self.views
+                            .iter()
+                            .find(|view| view.name.eq_ignore_ascii_case("Inbox"))
+                    })
+                    .flatten()
+            });
+        let Some(view) = found else {
+            return Ok(None);
+        };
+        let snapshot = self.snapshots.lock().unwrap().get(&view.name).cloned();
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        Ok(Some(SelectedMailbox {
+            view: MailboxView {
+                id: view.id,
+                name: view.name.clone(),
+                special_use: view.special_use,
+            },
+            uidvalidity: snapshot.uidvalidity,
+            uidnext: snapshot.uidnext,
+            exists: snapshot.uids.len(),
+            unseen: snapshot.unseen,
+        }))
+    }
+
+    async fn fetch(
+        &self,
+        _mailbox: MailboxId,
+        uid: u32,
+        _items: &[FetchItem],
+    ) -> Result<Option<FetchResponse>> {
+        let fetches = self.fetches.lock().unwrap();
+        let Some(fetched) = fetches.get(&uid) else {
+            return Ok(None);
+        };
+        Ok(Some(FetchResponse {
+            uid,
+            flags: fetched.flags.clone(),
+            internal_date: fetched.internal_date.clone(),
+            envelope: fetched.envelope.clone(),
+            bodystructure: fetched.bodystructure.clone(),
+            rfc822_size: fetched.rfc822_size,
+            body: Some(fetched.body.clone()),
+        }))
+    }
+
+    async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>> {
+        // The session enumerates a mailbox with the ALL criteria.
+        if criteria.len() == 1 && criteria[0].eq_ignore_ascii_case("ALL") {
+            if let Some(view) = self.views.iter().find(|view| view.id == mailbox) {
+                if let Some(snapshot) = self.snapshots.lock().unwrap().get(&view.name) {
+                    return Ok(snapshot.uids.clone());
+                }
+            }
+        }
+        if let Some(scripted) = self.search_scripts.lock().unwrap().get(criteria) {
+            return Ok(scripted.clone());
+        }
+        Ok(self.search_uids.lock().unwrap().clone())
     }
 }
