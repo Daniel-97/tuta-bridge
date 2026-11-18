@@ -126,12 +126,17 @@ pub fn address_from_encrypted(address: &EncryptedMailAddress) -> Address {
 /// date with [`mail_parser::DateTime::parse_rfc822`], whose
 /// `to_timestamp` applies the zone offset; the seconds are scaled to
 /// milliseconds (RFC 5322 dates carry no sub-second precision). A missing
-/// or malformed `Date` yields `fallback_ms` when it is positive, and 0
-/// otherwise, so a zeroed Tuta `sentDate` can never masquerade as a real
-/// date: Tuta stores external mail's real send time only in the headers,
-/// with `MailDetails.sentDate` at 0.
-pub fn sent_at_from(headers: &HashMap<String, Vec<String>>, fallback_ms: i64) -> i64 {
-    let fallback = if fallback_ms > 0 { fallback_ms } else { 0 };
+/// or malformed `Date` falls back to `sent_date_ms` when it is positive,
+/// then to `received_ms` when it is positive, and yields 0 otherwise, so a
+/// zeroed Tuta `sentDate` can never masquerade as a real date while mail
+/// that arrives without a `Date:` header still gets the received time the
+/// web client displays: Tuta stores external mail's real send time only in
+/// the headers, with `MailDetails.sentDate` at 0.
+pub fn sent_at_from(
+    headers: &HashMap<String, Vec<String>>,
+    sent_date_ms: i64,
+    received_ms: i64,
+) -> i64 {
     let joined = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("date"))
@@ -140,7 +145,15 @@ pub fn sent_at_from(headers: &HashMap<String, Vec<String>>, fallback_ms: i64) ->
 
     match mail_parser::DateTime::parse_rfc822(&joined) {
         Some(date) => date.to_timestamp() * 1000,
-        None => fallback,
+        None => {
+            if sent_date_ms > 0 {
+                sent_date_ms
+            } else if received_ms > 0 {
+                received_ms
+            } else {
+                0
+            }
+        }
     }
 }
 

@@ -436,7 +436,11 @@ impl MailSource for TutaMailSource {
                 .iter()
                 .map(address_from_encrypted)
                 .collect(),
-            sent_at_ms: sent_at_from(&headers, details.sentDate.as_millis() as i64),
+            sent_at_ms: sent_at_from(
+                &headers,
+                details.sentDate.as_millis() as i64,
+                message.received_at_ms,
+            ),
             subject: mail.subject,
             message_id,
             in_reply_to,

@@ -171,13 +171,17 @@
 - Sent dates are taken from the parsed `Date:` header, not Tuta's
   `MailDetails.sentDate`, which is 0 for external mail — an M2-era root
   cause that left every enriched row with `sent_at_ms = 0`, so ENVELOPE
-  dates rendered NIL and Thunderbird showed 01/01/1970. Rows already
-  in a database heal on their next BODYSTRUCTURE/RFC822.SIZE/BODY
-  request: the enricher treats a row as complete only when its sent
-  date landed, so a row marked complete with a zero date re-enriches
-  once (one content load) and comes back with the header's date — no
-  migration. Genuinely dateless mail keeps re-loading per body request,
-  the same accepted posture as permanently-unavailable content.
+  dates rendered NIL and Thunderbird showed 01/01/1970. Mail without a
+  parseable `Date:` falls back to `sentDate`, then to the received time
+  (mirroring the web client's display), so undated mail never renders
+  as epoch. Rows already in a database heal on their next
+  BODYSTRUCTURE/RFC822.SIZE/BODY request: the enricher treats a row as
+  complete only when its sent date landed, so a row marked complete
+  with a zero date re-enriches once (one content load) and comes back
+  with the header's date (or the received time when the mail is
+  undated) — no migration. Only mail with no Date header, no sent date,
+  and no received time keeps re-loading per body request, the same
+  accepted posture as permanently-unavailable content.
 
 ## M1/M2 manual acceptance (2026-11-16)
 

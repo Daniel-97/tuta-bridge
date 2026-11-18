@@ -68,7 +68,7 @@ fn extracts_threading_headers() {
 #[test]
 fn extracts_the_sent_date_from_a_valid_rfc5322_date_header() {
     let h = parse_headers("Date: Tue, 14 Nov 2023 22:13:20 +0000\r\n");
-    assert_eq!(sent_at_from(&h, 99), 1_700_000_000_000);
+    assert_eq!(sent_at_from(&h, 99, 0), 1_700_000_000_000);
 }
 
 #[test]
@@ -76,41 +76,64 @@ fn parses_folded_and_repeated_date_headers() {
     // A folded continuation is joined by parse_headers, and the zone
     // offset is applied by the date parser.
     let folded = parse_headers("Date: Tue, 14 Nov 2023\r\n 23:13:20 +0100\r\n");
-    assert_eq!(sent_at_from(&folded, 0), 1_700_000_000_000);
+    assert_eq!(sent_at_from(&folded, 0, 0), 1_700_000_000_000);
     // Repeated Date headers keep separate values; they are joined and
     // the first date in the joined string wins.
     let repeated = parse_headers(
         "Date: Tue, 14 Nov 2023 22:13:20 +0000\r\nDate: Wed, 15 Nov 2023 10:00:00 +0000\r\n",
     );
-    assert_eq!(sent_at_from(&repeated, 0), 1_700_000_000_000);
+    assert_eq!(sent_at_from(&repeated, 0, 0), 1_700_000_000_000);
 }
 
 #[test]
 fn missing_date_falls_back_to_a_positive_fallback() {
     let h = parse_headers("Subject: no date here\r\n");
-    assert_eq!(sent_at_from(&h, 1_700_000_000_000), 1_700_000_000_000);
+    assert_eq!(sent_at_from(&h, 1_700_000_000_000, 0), 1_700_000_000_000);
 }
 
 #[test]
 fn missing_date_with_zero_fallback_returns_zero() {
     let h = parse_headers("Subject: no date here\r\n");
-    assert_eq!(sent_at_from(&h, 0), 0);
+    assert_eq!(sent_at_from(&h, 0, 0), 0);
 }
 
 #[test]
 fn malformed_date_falls_back_like_a_missing_one() {
     let h = parse_headers("Date: definitely not a timestamp\r\n");
-    assert_eq!(sent_at_from(&h, 1_700_000_000_000), 1_700_000_000_000);
+    assert_eq!(sent_at_from(&h, 1_700_000_000_000, 0), 1_700_000_000_000);
     // A non-positive fallback never masquerades as a real date.
-    assert_eq!(sent_at_from(&h, 0), 0);
+    assert_eq!(sent_at_from(&h, 0, 0), 0);
+}
+
+#[test]
+fn missing_date_with_zero_sent_date_falls_back_to_the_received_time() {
+    let h = parse_headers("Subject: no date here\r\n");
+    assert_eq!(sent_at_from(&h, 0, 1_700_000_000_000), 1_700_000_000_000);
+    // A malformed Date goes down the same chain.
+    let malformed = parse_headers("Date: definitely not a timestamp\r\n");
+    assert_eq!(
+        sent_at_from(&malformed, 0, 1_700_000_000_000),
+        1_700_000_000_000
+    );
+    // A positive sent date still wins over the received time.
+    assert_eq!(
+        sent_at_from(&h, 1_600_000_000_000, 1_700_000_000_000),
+        1_600_000_000_000
+    );
+}
+
+#[test]
+fn missing_date_with_zero_sent_date_and_zero_received_returns_zero() {
+    let h = parse_headers("Subject: no date here\r\n");
+    assert_eq!(sent_at_from(&h, 0, 0), 0);
 }
 
 #[test]
 fn date_header_name_matches_case_insensitively() {
     let upper = parse_headers("DATE: Tue, 14 Nov 2023 22:13:20 +0000\r\n");
-    assert_eq!(sent_at_from(&upper, 0), 1_700_000_000_000);
+    assert_eq!(sent_at_from(&upper, 0, 0), 1_700_000_000_000);
     let mixed = parse_headers("dAtE: Tue, 14 Nov 2023 22:13:20 +0000\r\n");
-    assert_eq!(sent_at_from(&mixed, 0), 1_700_000_000_000);
+    assert_eq!(sent_at_from(&mixed, 0, 0), 1_700_000_000_000);
 }
 
 #[test]
