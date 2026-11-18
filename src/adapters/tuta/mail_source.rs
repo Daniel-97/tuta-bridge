@@ -35,8 +35,20 @@ pub fn folder_kind(folder_type: i64) -> Option<FolderKind> {
 }
 
 /// Build a [`Folder`] from raw Tuta mail-set parts, skipping the "All" set.
+///
+/// System MailSets carry an empty `name` on the server, so the kind's default
+/// display name is used instead. A custom set with an empty name cannot be
+/// addressed and is skipped.
 pub fn folder_from_parts(list_id: &str, name: &str, folder_type: i64) -> Option<Folder> {
     let kind = folder_kind(folder_type)?;
+    let name = if name.trim().is_empty() {
+        if kind == FolderKind::Custom {
+            return None;
+        }
+        kind.default_name()
+    } else {
+        name
+    };
     Some(Folder {
         list_id: list_id.to_string(),
         name: name.to_string(),

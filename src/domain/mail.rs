@@ -24,6 +24,21 @@ impl FolderKind {
         }
     }
 
+    /// Display name for system MailSets, which Tuta stores with an empty
+    /// `name` on the server (clients localize the label by folder type).
+    /// Custom folders carry real names, so they have no default.
+    pub fn default_name(&self) -> &'static str {
+        match self {
+            Self::Inbox => "Inbox",
+            Self::Sent => "Sent",
+            Self::Drafts => "Drafts",
+            Self::Trash => "Trash",
+            Self::Junk => "Junk",
+            Self::Archive => "Archive",
+            Self::Custom => "",
+        }
+    }
+
     /// Stable string stored in the SQLite `mailboxes.kind` column.
     pub fn as_db_str(&self) -> &'static str {
         match self {

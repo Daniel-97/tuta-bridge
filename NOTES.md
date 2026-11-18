@@ -164,6 +164,10 @@
   - Tuta can emit RFC-invalid MIME boundaries; the renderer regenerates
     boundaries from a deterministic seed instead of echoing the
     originals.
+- System folder display names (`Inbox`, `Sent`, `Drafts`, `Trash`,
+  `Junk`, `Archive`) are derived from the folder kind because Tuta
+  stores the `name` of system MailSets empty on the server; custom
+  MailSets carry real names and an unnamed custom set is skipped.
 
 ## M1/M2 manual acceptance (2026-11-16)
 
