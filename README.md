@@ -2,7 +2,7 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M4 complete for a single account (login, status/logout, dump, minimal state, sync, and live event watching). IMAP/SMTP are not implemented yet.
+Status: M0–M5 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, and a read-only IMAP server). The M5 manual acceptance is pending. IMAP is read-only; writes and SMTP are not implemented yet.
 
 ## Credentials
 
@@ -65,6 +65,111 @@ Limits:
 - `watch` never fetches or stores message bodies, attachments, or `.eml`
   files; event lookups reload header metadata only.
 
+## IMAP server (read-only)
+
+`tuta-bridge serve` runs one process with two loops: the `watch` event
+loop keeping the index current, and a TLS-only IMAP listener that
+answers from it. Ctrl-C stops the process.
+
+```sh
+# Set the password IMAP clients must use (prompted twice, hidden input)
+tuta-bridge passwd
+
+# Serve read-only IMAP while watching Tuta events (Ctrl-C to stop)
+tuta-bridge serve
+```
+
+- The listener binds `127.0.0.1` only — the address is not configurable.
+  The port defaults to `9930` and can be changed with the `imap_port`
+  key in the config file; it is validated to be within 1..=65535, so a
+  reserved port fails the command instead of silently binding an
+  ephemeral one.
+- On first start a self-signed certificate is generated into the data
+  directory: `imap-cert.pem` and `imap-key.pem`, both mode `0600`, CN
+  `localhost`, with SANs `DNS:localhost`, `IP:127.0.0.1`, and `IP:::1`.
+  Existing non-empty files are reused; if either file is missing a
+  fresh pair is generated.
+- The bridge password — the one IMAP clients send — is stored in the
+  system Secret Service (service `tuta-bridge`, account `imap-bridge`),
+  never in a file and never printed. `passwd` prompts twice with hidden
+  input, refuses empty or mismatched entries without storing anything,
+  and overwrites the previous password. `serve` refuses to start until
+  the password exists.
+- Ctrl-C stops `serve`. A Ctrl-C pressed during the initial baseline
+  sync takes effect only after that sync finishes; once the event
+  stream is running the stop is immediate.
+- `serve` resumes the stored session exactly like `watch`, so run
+  `login` first; fatal authentication errors end it with the same
+  message.
+
+### Thunderbird
+
+Use manual account configuration (not the automatic account dialog):
+
+- Incoming, IMAP: hostname `127.0.0.1`, port `9930`, connection
+  security SSL/TLS, authentication "Normal password".
+- Username: the Tuta address of the logged-in account. Password: the
+  bridge password set by `passwd`.
+- Accept the certificate exception on first connect — the certificate
+  is self-signed.
+- Outgoing (SMTP) fields are placeholders: SMTP is not implemented, so
+  sending always fails.
+
+Deleting or moving a mail, or changing a read/unread flag, is refused
+by the server with `NO` — the bridge is read-only, and the change stays
+local to the client until it refreshes.
+
+### mbsync
+
+```ini
+IMAPAccount tuta-bridge
+Host 127.0.0.1
+Port 9930
+User <the Tuta address>
+TLSType IMAPS
+CertificateFile ~/.local/share/tuta-bridge/imap-cert.pem
+# Read the password from the Secret Service instead of storing it:
+PassCmd "secret-tool lookup service tuta-bridge username imap-bridge"
+
+IMAPStore tuta-bridge-remote
+Account tuta-bridge
+
+MaildirStore tuta-bridge-local
+Path ~/mail/tuta-bridge/
+Inbox ~/mail/tuta-bridge/INBOX
+
+Channel tuta-bridge
+Far :tuta-bridge-remote:
+Near :tuta-bridge-local:
+Patterns *
+Create Near
+Expunge None
+Sync PullNew PullFlags
+SyncState *
+```
+
+`CertificateFile` points at the bridge certificate
+(`$XDG_DATA_HOME/tuta-bridge/imap-cert.pem`), so mbsync verifies TLS
+without a per-host exception. `Sync PullNew PullFlags` pulls new mail
+and flag changes only: the server refuses every write, so pushing
+would only produce errors. The `Far`/`Near` names require mbsync ≥ 1.3
+(older releases spell them `Master`/`Slave`).
+
+### Limits of v1
+
+- **Read-only.** `STORE`, `APPEND`, `COPY`, `MOVE`, `EXPUNGE`, and
+  folder mutations (`CREATE`, `DELETE`, `RENAME`, `SUBSCRIBE`,
+  `UNSUBSCRIBE`) answer `NO`; write support is planned for a later
+  milestone.
+- `SEARCH BODY` and `SEARCH TEXT` are unsupported — bodies are never
+  stored. `NEW`/`OLD` are unsupported too (`RECENT` is always zero).
+  Unsupported keys answer `NO`.
+- Numeric `BODY[n]` part sections are unsupported; only whole-message
+  `BODY[]`, `HEADER`, `TEXT`, and `HEADER.FIELDS` sections are served.
+- IDLE updates are `EXISTS`-only: counts change live, expunges are not
+  itemized, and clients re-fetch.
+- One account at a time.
+
 ## Dump
 
 Write messages from a mailbox folder to one `.eml` file per message:
@@ -98,6 +203,12 @@ tuta-bridge dump --folder inbox --limit 10 --out ~/tuta-inbox
 
 # Watch live events and keep the index current (Ctrl-C to stop)
 tuta-bridge watch
+
+# Set the local IMAP password (prompted twice, hidden)
+tuta-bridge passwd
+
+# Serve read-only IMAP on 127.0.0.1:9930 (Ctrl-C to stop)
+tuta-bridge serve
 
 # Remove stored credentials and clear the active account
 tuta-bridge logout

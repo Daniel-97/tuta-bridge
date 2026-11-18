@@ -88,6 +88,71 @@
   `messages.tuta_list_id` stays the Mail's own list id so content reloads
   can still find the mail.
 
+## M5 IMAP server
+
+- Served subset: `CAPABILITY`, `NOOP`, `ID`, `LOGIN`, `SELECT`,
+  `EXAMINE`, `LIST`, `LSUB`, `STATUS`, `FETCH`, `UID FETCH`, `SEARCH`,
+  `UID SEARCH`, `CHECK`, `CLOSE`, `IDLE`, `LOGOUT`. Writes — `STORE`,
+  `APPEND`, `COPY`, `MOVE`, `EXPUNGE`, `CREATE`, `DELETE`, `RENAME`,
+  `SUBSCRIBE`, `UNSUBSCRIBE`, `UID STORE`, `UID COPY` — are understood
+  and always refused with the fixed `NO not supported by this
+  read-only bridge`; unknown commands answer `BAD unknown command`.
+  The greeting, `CAPABILITY`, and `LOGIN` responses advertise
+  `IMAP4rev1 IDLE ID`.
+- Response shapes worth remembering:
+  - The `SELECT` untagged block ships in Dovecot order, FLAGS first:
+    `* FLAGS (\Seen)`, `* <n> EXISTS`, `* 0 RECENT`, `* OK [UNSEEN
+    <n>]` (omitted at zero), `* OK [PERMANENTFLAGS ()] Read-only
+    mailbox`, `* OK [UIDVALIDITY <v>]`, `* OK [UIDNEXT <n>]`, then
+    `<tag> OK [READ-WRITE] SELECT completed`. RFC 3501 mandates
+    presence, not order; `[READ-WRITE]` with `PERMANENTFLAGS ()` keeps
+    clients working while every write answers NO.
+  - Server-sent literals are inline `{n}\r\n<bytes>` — no continuation
+    round-trip; bodies stream in 64 KiB chunks with at most one
+    rendered message in memory. Client literals get a `+ ` continuation
+    and are capped at 16 MiB (an oversized announcement answers NO and
+    ends the connection); command lines are capped at 64 KiB.
+  - `ID` is answered with `* ID ("name" "tuta-bridge")` without
+    interpreting the client payload.
+  - A FETCH for an expunged uid answers nothing and the rest of the
+    FETCH continues.
+- IDLE reset rules: a `Selected` session re-validates its snapshot
+  before every command except `SELECT`/`EXAMINE` (which replace it)
+  and `CLOSE`/`LOGOUT` (which drop or end it), and on every drained
+  notification: a UIDVALIDITY drift or a vanished mailbox sends the
+  fixed `* BYE mailbox state was resynced; reconnect` and closes the
+  session. `NOOP` drains queued notifications so polling clients see
+  untagged `EXISTS`; a `RecvError::Lagged` broadcast receiver means
+  "everything may have changed" and forces the same re-check, both in
+  and out of IDLE.
+- Password and certificate locations and modes: the bridge password is
+  stored verbatim (no JSON, nothing to version) in the Secret Service
+  under service `tuta-bridge`, account `imap-bridge` — readable with
+  `secret-tool lookup service tuta-bridge username imap-bridge` — and
+  never printed or written to a file. The certificate pair lives in
+  the data directory: `imap-cert.pem` / `imap-key.pem`, both 0600, CN
+  `localhost`, SANs `DNS:localhost`, `IP:127.0.0.1`, `IP:::1`; when
+  both files are non-empty they are reused verbatim, a missing or empty
+  one regenerates the pair.
+- Proton Bridge study conclusions that shaped the server (concepts
+  only, no code):
+  - Snapshot re-validation before every command: a stale view gets the
+    fixed BYE, never a silently wrong answer.
+  - `mime_structure` (the precomputed BODYSTRUCTURE string) and
+    `rfc822_size` are persisted at first enrichment, so structure and
+    size requests never re-download content; `BODY[]` always re-renders
+    — there is no body cache by design.
+  - `ENVELOPE` is served index-only, from the stored header; it never
+    triggers a network load. cc/bcc/message-id stay blank in a
+    listing until the first body open enriches the row.
+  - Batch markers written *after* a rebuild give Proton's
+    bookmark-and-rewind property: events that arrive during the resync
+    postdate the marker and are replayed. UID problems are solved by
+    reset-and-rebuild, never by in-band renumbering.
+  - Tuta can emit RFC-invalid MIME boundaries; the renderer regenerates
+    boundaries from a deterministic seed instead of echoing the
+    originals.
+
 ## M1/M2 manual acceptance (2026-11-16)
 
 - Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.
@@ -103,4 +168,8 @@
 - Expired-marker self-healing, observed live: markers written by an earlier build with the wrong timestamp layout decoded to 1973, so `watch` resynced on startup (`uidvalidity` 1794940997 → 1794954354) and rewrote the markers in the correct format.
 - The event path never fetched or stored bodies: `messages` still has no body/attachment/`.eml` column; `watch` output is fixed strings and counts only.
 - Two live-only defects were found and fixed during this acceptance, each with a regression test: the server sends `NumberString` fields as JSON strings (the SDK models them as `i64`, so every `entityUpdate` failed to parse), and marker ids encoded the timestamp with a 24-bit instead of 28-bit suffix (the server read them as ancient and replayed the whole retained backlog).
+
+## M5 manual acceptance
+
+- Pending: the M5 checklist (terminal `imaplib` client, `mbsync` second-sync stability, Thunderbird folders/attachment/read-only NO, IDLE push and restart, DB schema, log hygiene) has not been run against the real account yet; results will be recorded here.
 
