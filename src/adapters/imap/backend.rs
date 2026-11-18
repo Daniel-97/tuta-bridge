@@ -48,6 +48,21 @@ pub struct TutaImapBackend {
     pub renderer: Arc<dyn MessageRenderer>,
 }
 
+/// Compare two byte strings ASCII-case-insensitively without leaking
+/// their contents through timing: the same loop shape as
+/// [`constant_time_eq`], with every byte folded through the std
+/// lowercase table (a branch-free lookup) before the XOR. Used for
+/// the account address, which clients type in any casing.
+pub fn constant_time_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u64 = (a.len() ^ b.len()) as u64;
+    for i in 0..a.len().max(b.len()) {
+        let byte_a = u64::from(a.get(i).copied().unwrap_or(0).to_ascii_lowercase());
+        let byte_b = u64::from(b.get(i).copied().unwrap_or(0).to_ascii_lowercase());
+        diff |= byte_a ^ byte_b;
+    }
+    diff == 0
+}
+
 /// Compare two byte strings without leaking their contents through
 /// timing.
 ///
@@ -436,15 +451,44 @@ fn stored_header_value(header: &MessageHeader, field: &str) -> Option<String> {
     }
 }
 
+/// Whether `n` falls inside the set, with the star semantics of
+/// RFC 3501 §6.4.8 resolved against `max` — the largest number in
+/// use in the caller's space (positions or uids):
+///
+/// * a lone `*` (`(0, None)`) selects exactly the last number;
+/// * `x:*` selects `x..max`, and an `x` beyond `max` still selects
+///   the last number, so a `UID <max+1>:*` probe never misses the
+///   newest mail;
+/// * finite ranges select what they name.
+///
+/// This mirrors the resolution the session applies on the FETCH
+/// path, kept backend-side on purpose: a shared helper would couple
+/// the two modules for a refinement that does not need it yet.
+fn number_in_set(set: &SeqSet, n: u32, max: u32) -> bool {
+    set.ranges().iter().any(|&(start, stop)| match stop {
+        Some(stop) => start <= n && n <= stop,
+        None if start == 0 => n == max,
+        None => start <= n || n == max,
+    })
+}
+
 /// Evaluate one key against a stored message; `msn` is the message's
-/// 1-based position in the mailbox.
-fn search_key_matches(key: &SearchKey, msn: u32, message: &StoredMessage) -> bool {
+/// 1-based position in the mailbox, `len` the mailbox's message
+/// count, and `max_uid` its highest uid — the ends star ranges
+/// resolve against in each space.
+fn search_key_matches(
+    key: &SearchKey,
+    msn: u32,
+    len: u32,
+    max_uid: u32,
+    message: &StoredMessage,
+) -> bool {
     match key {
         SearchKey::All => true,
         SearchKey::Unseen => message.header.unread,
         SearchKey::Seen => !message.header.unread,
-        SearchKey::Uid(set) => set.contains(message.uid),
-        SearchKey::Sequence(set) => set.contains(msn),
+        SearchKey::Uid(set) => number_in_set(set, message.uid, max_uid),
+        SearchKey::Sequence(set) => number_in_set(set, msn, len),
         SearchKey::Since(start) => message.header.received_at_ms >= *start,
         SearchKey::Before(start) => message.header.received_at_ms < *start,
         SearchKey::On(start, end) => {
@@ -461,9 +505,10 @@ fn search_key_matches(key: &SearchKey, msn: u32, message: &StoredMessage) -> boo
         // without a stored size matches neither LARGER nor SMALLER.
         SearchKey::Larger(n) => message.rfc822_size.is_some_and(|size| size > *n),
         SearchKey::Smaller(n) => message.rfc822_size.is_some_and(|size| size < *n),
-        SearchKey::Not(inner) => !search_key_matches(inner, msn, message),
+        SearchKey::Not(inner) => !search_key_matches(inner, msn, len, max_uid, message),
         SearchKey::Or(first, second) => {
-            search_key_matches(first, msn, message) || search_key_matches(second, msn, message)
+            search_key_matches(first, msn, len, max_uid, message)
+                || search_key_matches(second, msn, len, max_uid, message)
         }
     }
 }
@@ -517,14 +562,17 @@ impl TutaImapBackend {
 #[async_trait::async_trait]
 impl ImapBackend for TutaImapBackend {
     async fn login(&self, user: &str, password: &SecretString) -> Result<bool> {
-        // A missing stored password is a plain mismatch. Both comparisons
-        // run to completion; nothing about the outcome is observable
-        // except the returned boolean, and no credential ever reaches a
-        // log line or an error string.
+        // The user name compares ASCII-case-insensitively (clients
+        // type the address in any casing); the password stays exact.
+        // Both comparisons run to completion in the same constant-
+        // time shape, nothing about the outcome is observable except
+        // the returned boolean, and no credential ever reaches a log
+        // line or an error string.
         let Some(stored) = self.passwords.load().await? else {
             return Ok(false);
         };
-        let user_ok = constant_time_eq(user.as_bytes(), self.expected_user.as_bytes());
+        let user_ok =
+            constant_time_eq_ignore_ascii_case(user.as_bytes(), self.expected_user.as_bytes());
         let password_ok = constant_time_eq(
             password.expose_secret().as_bytes(),
             stored.expose_secret().as_bytes(),
@@ -646,12 +694,21 @@ impl ImapBackend for TutaImapBackend {
     async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>> {
         let keys = parse_search_criteria(criteria)?;
         let messages = self.store.messages(mailbox).await?;
+        // Star ranges resolve against the ends actually in use: the
+        // message count in MSN space, the highest uid in UID space.
+        let len = u32::try_from(messages.len()).unwrap_or(u32::MAX);
+        let max_uid = messages
+            .iter()
+            .map(|message| message.uid)
+            .max()
+            .unwrap_or(0);
         Ok(messages
             .iter()
             .enumerate()
             .filter(|(index, message)| {
                 let msn = u32::try_from(index + 1).unwrap_or(u32::MAX);
-                keys.iter().all(|key| search_key_matches(key, msn, message))
+                keys.iter()
+                    .all(|key| search_key_matches(key, msn, len, max_uid, message))
             })
             .map(|(_, message)| message.uid)
             .collect())
@@ -674,6 +731,50 @@ mod tests {
         // blur a length difference.
         assert!(!constant_time_eq(b"a\0", b"a\0\0"));
         assert!(!constant_time_eq(b"xxxxxxxx", b"xxxxxxxxx"));
+    }
+
+    #[test]
+    fn caseless_compares_fold_ascii_case_without_length_short_circuit() {
+        assert!(constant_time_eq_ignore_ascii_case(b"", b""));
+        assert!(constant_time_eq_ignore_ascii_case(
+            b"Owner@Example",
+            b"OWNER@example"
+        ));
+        assert!(constant_time_eq_ignore_ascii_case(
+            b"owner@example",
+            b"Owner@Example"
+        ));
+        assert!(!constant_time_eq_ignore_ascii_case(
+            b"owner@example",
+            b"owner@examples"
+        ));
+        // A prefix must not pass for equality, in either direction.
+        assert!(!constant_time_eq_ignore_ascii_case(
+            b"own",
+            b"owner@example"
+        ));
+        assert!(!constant_time_eq_ignore_ascii_case(
+            b"owner@example",
+            b"own"
+        ));
+        // Folding is ASCII-only: non-ASCII bytes compare exactly.
+        assert!(!constant_time_eq_ignore_ascii_case(&[0xC4], &[0xE4]));
+        assert!(constant_time_eq_ignore_ascii_case(&[0xC4], &[0xC4]));
+    }
+
+    #[test]
+    fn search_star_ranges_resolve_against_the_mailbox_ends() {
+        // A lone `*` selects exactly the last number, never every
+        // number.
+        let lone = parse_seq_set("*").unwrap();
+        assert!(number_in_set(&lone, 5, 5) && !number_in_set(&lone, 4, 5));
+        // `x:*` runs to the end, and an `x` beyond the end still
+        // selects the last number: the `<max+1>:*` probe mbsync sends.
+        let mbsync = parse_seq_set("6:*").unwrap();
+        assert!(number_in_set(&mbsync, 5, 5) && !number_in_set(&mbsync, 4, 5));
+        // Finite ranges select what they name.
+        let finite = parse_seq_set("2:4").unwrap();
+        assert!(number_in_set(&finite, 3, 5) && !number_in_set(&finite, 5, 5));
     }
 
     #[test]

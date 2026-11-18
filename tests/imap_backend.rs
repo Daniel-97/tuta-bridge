@@ -219,6 +219,23 @@ async fn login_is_case_insensitive_inbox_and_constant_time() {
         .await
         .unwrap());
 
+    // The user name compares ASCII-case-insensitively: a client that
+    // types the address in different casing than the stored one still
+    // logs in, while the password stays exact.
+    assert!(world
+        .backend
+        .login("OWNER@Example.Invalid", &good)
+        .await
+        .unwrap());
+    assert!(!world
+        .backend
+        .login(
+            "owner@example.invalid",
+            &SecretString::new("Bridge-Password".into())
+        )
+        .await
+        .unwrap());
+
     // A missing stored password is a plain mismatch, never an error.
     let empty = world_with(Arc::new(FakePasswordStore::empty())).await;
     assert!(!empty
@@ -736,6 +753,50 @@ async fn fetch_unknown_uid_returns_none() {
 // ---------------------------------------------------------------------------
 // SEARCH
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_resolves_star_ranges_like_the_fetch_path() {
+    let world = world().await;
+    let backend = &world.backend;
+    let inbox = world.inbox;
+
+    // An empty mailbox selects nothing, star included.
+    assert_eq!(search(backend, inbox, &["*"]).await, Vec::<u32>::new());
+    assert_eq!(
+        search(backend, inbox, &["UID", "*"]).await,
+        Vec::<u32>::new()
+    );
+
+    // uids 1 and 3 (2 was removed): the gap proves UID-space
+    // resolution against the highest uid, not the message count.
+    for element in ["e1", "e2", "e3"] {
+        world
+            .store
+            .assign_uid(
+                inbox,
+                &partial_header(element, "any subject", 1_700_000_000_000, true),
+            )
+            .await
+            .unwrap();
+    }
+    world.store.remove_message(inbox, 2).await.unwrap();
+
+    // A lone `*` selects exactly the LAST message — not every
+    // message.
+    assert_eq!(search(backend, inbox, &["*"]).await, vec![3]);
+    // `3:*` with fewer than three messages still selects the last.
+    assert_eq!(search(backend, inbox, &["3:*"]).await, vec![3]);
+    // Finite sequence ranges keep their exact positions.
+    assert_eq!(search(backend, inbox, &["1:2"]).await, vec![1, 3]);
+
+    // UID keys resolve in uid space: `<max+1>:*` (mbsync's
+    // newest-mail probe) includes the highest uid, and a lone `*`
+    // selects it alone.
+    assert_eq!(search(backend, inbox, &["UID", "4:*"]).await, vec![3]);
+    assert_eq!(search(backend, inbox, &["UID", "*"]).await, vec![3]);
+    // Finite UID ranges are unchanged.
+    assert_eq!(search(backend, inbox, &["UID", "1:2"]).await, vec![1]);
+}
 
 #[tokio::test]
 async fn search_covers_index_keys() {
