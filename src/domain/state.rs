@@ -93,6 +93,11 @@ pub struct StoredMessage {
     pub uid: u32,
     pub header: MessageHeader,
     pub rfc822_size: Option<u64>,
+    /// Precomputed BODYSTRUCTURE string; `None` until first enrichment.
+    ///
+    /// Metadata only: the rendered message bytes it describes are never
+    /// stored.
+    pub mime_structure: Option<String>,
 }
 
 #[derive(Clone)]

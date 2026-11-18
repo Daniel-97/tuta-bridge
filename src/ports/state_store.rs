@@ -33,8 +33,17 @@ pub trait StateStore: Send + Sync {
         header: &MessageHeader,
         rfc822_size: Option<u64>,
     ) -> Result<()>;
+    /// Persist the precomputed BODYSTRUCTURE string for one message.
+    ///
+    /// The structure is metadata only; the rendered bytes it describes
+    /// are never stored. Fails when the `(mailbox, uid)` row is missing.
+    async fn set_mime_structure(&self, mailbox: MailboxId, uid: u32, structure: &str)
+        -> Result<()>;
     async fn remove_message(&self, mailbox: MailboxId, uid: u32) -> Result<()>;
     async fn messages(&self, mailbox: MailboxId) -> Result<Vec<StoredMessage>>;
+    /// Load one stored message by UID, or `None` when the mailbox has no
+    /// such UID. Like every store read this is metadata only.
+    async fn message_by_uid(&self, mailbox: MailboxId, uid: u32) -> Result<Option<StoredMessage>>;
     async fn last_batch(&self, account_id: i64, group_id: &str) -> Result<Option<String>>;
     async fn set_last_batch(&self, account_id: i64, group_id: &str, batch_id: &str) -> Result<()>;
     async fn reset_account(&self, account_id: i64) -> Result<()>;

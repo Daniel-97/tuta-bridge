@@ -49,6 +49,7 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         references_json TEXT NOT NULL,
         rfc822_size INTEGER,                -- computed at first rendering
         envelope_complete INTEGER NOT NULL DEFAULT 0,
+        mime_structure TEXT,                -- precomputed BODYSTRUCTURE; NULL until enriched
         PRIMARY KEY (mailbox_id, uid),
         UNIQUE (mailbox_id, tuta_list_id, tuta_element_id)
     )",
@@ -119,9 +120,31 @@ impl SqliteStateStore {
         for statement in SCHEMA_STATEMENTS {
             sqlx::query(statement).execute(&self.pool).await?;
         }
-        sqlx::query("PRAGMA user_version = 1")
+        self.add_mime_structure_column().await?;
+        sqlx::query("PRAGMA user_version = 2")
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// v2 migration: add the metadata-only `mime_structure` column.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` cannot extend an existing table, so a
+    /// database created at version 1 gains the column here; its rows
+    /// keep `NULL`, which reads back as "not enriched yet". The check
+    /// keeps the migration idempotent: a fresh database already carries
+    /// the column from the schema statements above.
+    async fn add_mime_structure_column(&self) -> anyhow::Result<()> {
+        let columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'mime_structure'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if columns == 0 {
+            sqlx::query("ALTER TABLE messages ADD COLUMN mime_structure TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
@@ -324,8 +347,17 @@ const INCREMENT_NEXT_UID_SQL: &str = "UPDATE mailboxes SET next_uid = next_uid +
 const LIST_MESSAGES_SQL: &str = "\
 SELECT uid, tuta_list_id, tuta_element_id, received_at_ms, sent_at_ms, subject,
        from_name, from_address, recipients_json, unread, message_id, in_reply_to,
-       references_json, rfc822_size, envelope_complete
+       references_json, rfc822_size, envelope_complete, mime_structure
 FROM messages WHERE mailbox_id = ? ORDER BY uid";
+
+const SELECT_MESSAGE_BY_UID_SQL: &str = "\
+SELECT uid, tuta_list_id, tuta_element_id, received_at_ms, sent_at_ms, subject,
+       from_name, from_address, recipients_json, unread, message_id, in_reply_to,
+       references_json, rfc822_size, envelope_complete, mime_structure
+FROM messages WHERE mailbox_id = ? AND uid = ?";
+
+const SET_MIME_STRUCTURE_SQL: &str = "\
+UPDATE messages SET mime_structure = ? WHERE mailbox_id = ? AND uid = ?";
 
 const SELECT_LAST_BATCH_SQL: &str =
     "SELECT last_batch_id FROM sync_state WHERE account_id = ? AND group_id = ?";
@@ -472,6 +504,59 @@ fn stored_mailbox_from_row(row: &SqliteRow) -> Result<StoredMailbox> {
         kind,
         uidvalidity: u32_from_i64(row.try_get("uidvalidity").map_err(storage_error)?)?,
         next_uid: u32_from_i64(row.try_get("next_uid").map_err(storage_error)?)?,
+    })
+}
+
+/// Map one stored message row to its domain value.
+///
+/// The columns are metadata only; `mime_structure` is `NULL` until the
+/// first enrichment and bodies are never selected because none exist.
+fn stored_message_from_row(row: &SqliteRow) -> Result<StoredMessage> {
+    let recipients_json: Option<String> = row.try_get("recipients_json").map_err(storage_error)?;
+    let recipients = match recipients_json {
+        Some(json) => {
+            serde_json::from_str::<RecipientsJson>(&json).map_err(|_| metadata_error())?
+        }
+        None => RecipientsJson::default(),
+    };
+    let references_json: String = row.try_get("references_json").map_err(storage_error)?;
+    let references: Vec<String> =
+        serde_json::from_str(&references_json).map_err(|_| metadata_error())?;
+    let rfc822_size: Option<i64> = row.try_get("rfc822_size").map_err(storage_error)?;
+    let RecipientsJson {
+        to,
+        cc,
+        bcc,
+        reply_to,
+    } = recipients;
+
+    Ok(StoredMessage {
+        uid: u32_from_i64(row.try_get("uid").map_err(storage_error)?)?,
+        header: MessageHeader {
+            list_id: row.try_get("tuta_list_id").map_err(storage_error)?,
+            element_id: row.try_get("tuta_element_id").map_err(storage_error)?,
+            received_at_ms: row.try_get("received_at_ms").map_err(storage_error)?,
+            sent_at_ms: row.try_get("sent_at_ms").map_err(storage_error)?,
+            subject: row.try_get("subject").map_err(storage_error)?,
+            from: Address {
+                name: row.try_get("from_name").map_err(storage_error)?,
+                address: row.try_get("from_address").map_err(storage_error)?,
+            },
+            to: to.into_iter().map(Address::from).collect(),
+            cc: cc.into_iter().map(Address::from).collect(),
+            bcc: bcc.into_iter().map(Address::from).collect(),
+            reply_to: reply_to.into_iter().map(Address::from).collect(),
+            unread: row.try_get::<i64, _>("unread").map_err(storage_error)? != 0,
+            message_id: row.try_get("message_id").map_err(storage_error)?,
+            in_reply_to: row.try_get("in_reply_to").map_err(storage_error)?,
+            references,
+            envelope_complete: row
+                .try_get::<i64, _>("envelope_complete")
+                .map_err(storage_error)?
+                != 0,
+        },
+        rfc822_size: rfc822_size.map(u64_from_i64).transpose()?,
+        mime_structure: row.try_get("mime_structure").map_err(storage_error)?,
     })
 }
 
@@ -757,6 +842,25 @@ impl StateStore for SqliteStateStore {
         write_message_metadata(&self.pool, mailbox, uid, header, rfc822_size).await
     }
 
+    async fn set_mime_structure(
+        &self,
+        mailbox: MailboxId,
+        uid: u32,
+        structure: &str,
+    ) -> Result<()> {
+        let result = sqlx::query(SET_MIME_STRUCTURE_SQL)
+            .bind(structure)
+            .bind(mailbox.0)
+            .bind(i64::from(uid))
+            .execute(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(Error::Storage("message UID not found".into()));
+        }
+        Ok(())
+    }
+
     async fn remove_message(&self, mailbox: MailboxId, uid: u32) -> Result<()> {
         sqlx::query("DELETE FROM messages WHERE mailbox_id = ? AND uid = ?")
             .bind(mailbox.0)
@@ -774,56 +878,17 @@ impl StateStore for SqliteStateStore {
             .await
             .map_err(storage_error)?;
 
-        rows.iter()
-            .map(|row| {
-                let recipients_json: Option<String> =
-                    row.try_get("recipients_json").map_err(storage_error)?;
-                let recipients = match recipients_json {
-                    Some(json) => serde_json::from_str::<RecipientsJson>(&json)
-                        .map_err(|_| metadata_error())?,
-                    None => RecipientsJson::default(),
-                };
-                let references_json: String =
-                    row.try_get("references_json").map_err(storage_error)?;
-                let references: Vec<String> =
-                    serde_json::from_str(&references_json).map_err(|_| metadata_error())?;
-                let rfc822_size: Option<i64> = row.try_get("rfc822_size").map_err(storage_error)?;
-                let RecipientsJson {
-                    to,
-                    cc,
-                    bcc,
-                    reply_to,
-                } = recipients;
+        rows.iter().map(stored_message_from_row).collect()
+    }
 
-                Ok(StoredMessage {
-                    uid: u32_from_i64(row.try_get("uid").map_err(storage_error)?)?,
-                    header: MessageHeader {
-                        list_id: row.try_get("tuta_list_id").map_err(storage_error)?,
-                        element_id: row.try_get("tuta_element_id").map_err(storage_error)?,
-                        received_at_ms: row.try_get("received_at_ms").map_err(storage_error)?,
-                        sent_at_ms: row.try_get("sent_at_ms").map_err(storage_error)?,
-                        subject: row.try_get("subject").map_err(storage_error)?,
-                        from: Address {
-                            name: row.try_get("from_name").map_err(storage_error)?,
-                            address: row.try_get("from_address").map_err(storage_error)?,
-                        },
-                        to: to.into_iter().map(Address::from).collect(),
-                        cc: cc.into_iter().map(Address::from).collect(),
-                        bcc: bcc.into_iter().map(Address::from).collect(),
-                        reply_to: reply_to.into_iter().map(Address::from).collect(),
-                        unread: row.try_get::<i64, _>("unread").map_err(storage_error)? != 0,
-                        message_id: row.try_get("message_id").map_err(storage_error)?,
-                        in_reply_to: row.try_get("in_reply_to").map_err(storage_error)?,
-                        references,
-                        envelope_complete: row
-                            .try_get::<i64, _>("envelope_complete")
-                            .map_err(storage_error)?
-                            != 0,
-                    },
-                    rfc822_size: rfc822_size.map(u64_from_i64).transpose()?,
-                })
-            })
-            .collect()
+    async fn message_by_uid(&self, mailbox: MailboxId, uid: u32) -> Result<Option<StoredMessage>> {
+        let row = sqlx::query(SELECT_MESSAGE_BY_UID_SQL)
+            .bind(mailbox.0)
+            .bind(i64::from(uid))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        row.as_ref().map(stored_message_from_row).transpose()
     }
 
     async fn last_batch(&self, account_id: i64, group_id: &str) -> Result<Option<String>> {
@@ -1642,6 +1707,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_by_uid_returns_one_row_and_none_for_unknown_uids() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (account, mailbox) = account_and_mailbox(&store).await;
+        let other = store
+            .upsert_mailbox(account, &folder("other", "Other", FolderKind::Archive), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .assign_uid(mailbox, &header("entries", "e1"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .assign_uid(other, &header("entries", "e2"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        // The lookup is scoped to one mailbox's UID namespace.
+        let found = store
+            .message_by_uid(mailbox, 1)
+            .await
+            .unwrap()
+            .expect("uid 1 exists in the first mailbox");
+        assert_eq!(found.uid, 1);
+        assert_eq!(found.header.element_id, "e1");
+        assert_eq!(found.mime_structure, None);
+        let found = store
+            .message_by_uid(other, 1)
+            .await
+            .unwrap()
+            .expect("uid 1 exists in the second mailbox");
+        assert_eq!(found.header.element_id, "e2");
+        // Unknown uids answer None instead of an error.
+        assert!(store.message_by_uid(mailbox, 42).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_mime_structure_round_trips_and_rejects_unknown_uids() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (_, mailbox) = account_and_mailbox(&store).await;
+        assert_eq!(
+            store
+                .assign_uid(mailbox, &header("entries", "e1"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        store
+            .set_mime_structure(mailbox, 1, "(\"TEXT\" \"PLAIN\")")
+            .await
+            .unwrap();
+
+        let by_uid = store
+            .message_by_uid(mailbox, 1)
+            .await
+            .unwrap()
+            .expect("uid 1 exists");
+        assert_eq!(
+            by_uid.mime_structure.as_deref(),
+            Some("(\"TEXT\" \"PLAIN\")")
+        );
+        let listed = store.messages(mailbox).await.unwrap();
+        assert_eq!(
+            listed[0].mime_structure.as_deref(),
+            Some("(\"TEXT\" \"PLAIN\")")
+        );
+
+        assert!(store.set_mime_structure(mailbox, 42, "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn migrates_an_existing_version_one_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+
+        // A pre-migration (M4) database: the messages table predates the
+        // mime_structure column and user_version is 1.
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal);
+            let pool = pool_options().connect_with(options).await.unwrap();
+            for statement in [
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY,
+                    mail_address TEXT NOT NULL UNIQUE
+                )",
+                "CREATE TABLE mailboxes (
+                    id INTEGER PRIMARY KEY,
+                    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    list_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    parent_list_id TEXT,
+                    uidvalidity INTEGER NOT NULL,
+                    next_uid INTEGER NOT NULL,
+                    UNIQUE (account_id, list_id)
+                )",
+                "CREATE TABLE messages (
+                    mailbox_id INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+                    uid INTEGER NOT NULL,
+                    tuta_list_id TEXT NOT NULL,
+                    tuta_element_id TEXT NOT NULL,
+                    received_at_ms INTEGER NOT NULL,
+                    sent_at_ms INTEGER NOT NULL DEFAULT 0,
+                    subject TEXT NOT NULL,
+                    from_name TEXT,
+                    from_address TEXT NOT NULL,
+                    recipients_json TEXT,
+                    unread INTEGER NOT NULL,
+                    message_id TEXT,
+                    in_reply_to TEXT,
+                    references_json TEXT NOT NULL,
+                    rfc822_size INTEGER,
+                    envelope_complete INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (mailbox_id, uid),
+                    UNIQUE (mailbox_id, tuta_list_id, tuta_element_id)
+                )",
+                "INSERT INTO accounts (id, mail_address) VALUES (1, 'owner@example.invalid')",
+                "INSERT INTO mailboxes (id, account_id, list_id, name, kind, uidvalidity, next_uid)
+                 VALUES (1, 1, 'entries', 'Inbox', 'inbox', 100, 2)",
+                "INSERT INTO messages (mailbox_id, uid, tuta_list_id, tuta_element_id,
+                     received_at_ms, subject, from_address, unread, references_json)
+                 VALUES (1, 1, 'mail-list', 'e1', 1700000000000, 'subject',
+                     'sender@example.invalid', 1, '[]')",
+                "PRAGMA user_version = 1",
+            ] {
+                sqlx::query(statement).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        // Opening migrates: the column is added, the pre-migration row
+        // survives with a NULL structure, and the version becomes 2.
+        let store = SqliteStateStore::open(&path).await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+        let stored = store
+            .message_by_uid(MailboxId(1), 1)
+            .await
+            .unwrap()
+            .expect("the pre-migration row survived");
+        assert_eq!(stored.header.element_id, "e1");
+        assert_eq!(stored.header.subject, "subject");
+        assert!(!stored.header.envelope_complete);
+        assert_eq!(stored.mime_structure, None);
+
+        // Enrichment persists on the migrated database and survives a
+        // reopen, which is itself idempotent.
+        store
+            .set_mime_structure(MailboxId(1), 1, "(\"TEXT\" \"PLAIN\")")
+            .await
+            .unwrap();
+        let store = SqliteStateStore::open(&path).await.unwrap();
+        let stored = store
+            .message_by_uid(MailboxId(1), 1)
+            .await
+            .unwrap()
+            .expect("row present after reopen");
+        assert_eq!(
+            stored.mime_structure.as_deref(),
+            Some("(\"TEXT\" \"PLAIN\")")
+        );
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[tokio::test]
+    async fn messages_table_stores_only_metadata_columns() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('messages') ORDER BY cid")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        // The exact v2 column set: header metadata, the size, and the
+        // one enrichment column — nothing else.
+        let expected: Vec<String> = [
+            "mailbox_id",
+            "uid",
+            "tuta_list_id",
+            "tuta_element_id",
+            "received_at_ms",
+            "sent_at_ms",
+            "subject",
+            "from_name",
+            "from_address",
+            "recipients_json",
+            "unread",
+            "message_id",
+            "in_reply_to",
+            "references_json",
+            "rfc822_size",
+            "envelope_complete",
+            "mime_structure",
+        ]
+        .iter()
+        .map(|column| column.to_string())
+        .collect();
+        assert_eq!(columns, expected);
+        // The no-content guard: `mime_structure` is the explicit
+        // metadata-only allowance, and no column may look like content.
+        for column in &columns {
+            let lower = column.to_ascii_lowercase();
+            for marker in ["body", "attachment", "eml", "blob", "content"] {
+                assert!(
+                    !lower.contains(marker),
+                    "messages.{column} looks like a content column"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn remove_message_deletes_mapping_but_never_reuses_uid() {
         let store = SqliteStateStore::open_in_memory().await.unwrap();
         let (account, mailbox) = account_and_mailbox(&store).await;
@@ -1767,11 +2059,12 @@ mod tests {
         for table in ["accounts", "mailboxes", "messages", "sync_state"] {
             assert!(tables.contains(&table.to_string()), "missing {table}");
         }
+        // v2 adds the metadata-only mime_structure column.
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(store.pool())
             .await
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[tokio::test]
@@ -1803,7 +2096,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[cfg(unix)]

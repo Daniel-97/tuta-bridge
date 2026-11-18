@@ -227,6 +227,7 @@ impl FakeStateStore {
                 uid,
                 header: header.clone(),
                 rfc822_size: None,
+                mime_structure: None,
             },
         );
         Ok(uid)
@@ -663,6 +664,25 @@ impl StateStore for FakeStateStore {
         Ok(())
     }
 
+    async fn set_mime_structure(
+        &self,
+        mailbox: MailboxId,
+        uid: u32,
+        structure: &str,
+    ) -> Result<()> {
+        self.calls.lock().unwrap().push("set_mime_structure".into());
+        let mut messages = self.messages.lock().unwrap();
+        let message = messages
+            .iter_mut()
+            .find(|((stored_mailbox, _, _), message)| {
+                *stored_mailbox == mailbox && message.uid == uid
+            })
+            .map(|(_, message)| message)
+            .ok_or_else(|| Error::Storage("message not found".into()))?;
+        message.mime_structure = Some(structure.to_string());
+        Ok(())
+    }
+
     async fn remove_message(&self, mailbox: MailboxId, uid: u32) -> Result<()> {
         self.calls.lock().unwrap().push("remove_message".into());
         self.messages
@@ -686,6 +706,19 @@ impl StateStore for FakeStateStore {
             .collect();
         messages.sort_by_key(|message| message.uid);
         Ok(messages)
+    }
+
+    async fn message_by_uid(&self, mailbox: MailboxId, uid: u32) -> Result<Option<StoredMessage>> {
+        self.calls.lock().unwrap().push("message_by_uid".into());
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|((stored_mailbox, _, _), message)| {
+                *stored_mailbox == mailbox && message.uid == uid
+            })
+            .map(|(_, message)| message.clone()))
     }
 
     async fn last_batch(&self, account_id: i64, group_id: &str) -> Result<Option<String>> {
@@ -877,6 +910,16 @@ impl FakeMailSource {
 
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Number of `content` calls served so far.
+    pub fn content_calls(&self) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.as_str() == "content")
+            .count()
     }
 }
 
@@ -1138,16 +1181,26 @@ impl EventStream for PendingEventStream {
 
 pub struct FakeRenderer {
     pub output: Vec<u8>,
+    render_calls: AtomicUsize,
 }
 
 impl FakeRenderer {
     pub fn new(output: Vec<u8>) -> Self {
-        Self { output }
+        Self {
+            output,
+            render_calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of `render` calls served so far.
+    pub fn render_calls(&self) -> usize {
+        self.render_calls.load(Ordering::SeqCst)
     }
 }
 
 impl MessageRenderer for FakeRenderer {
     fn render(&self, _content: &MessageContent) -> Result<Vec<u8>> {
+        self.render_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.output.clone())
     }
 }

@@ -1,4 +1,5 @@
 pub mod dump;
+pub mod enrich;
 pub mod event_sync;
 pub mod login;
 pub mod logout;
