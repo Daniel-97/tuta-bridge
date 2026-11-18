@@ -24,7 +24,9 @@
 //!   answers BAD and returns to normal dispatch.
 //!
 //! * **Log hygiene**: the session logs with `tracing::debug!` only, with
-//!   tag, command, and count fields. Mailbox names, subjects, bodies,
+//!   tag, command, and count fields — the tag only after the same
+//!   printable-ASCII validation a BAD response applies, so raw client
+//!   bytes never reach a log line. Mailbox names, subjects, bodies,
 //!   credentials, and argument vectors never reach a log line, and no
 //!   `Debug` printing exists for the types that carry them.
 
@@ -63,8 +65,11 @@ const BODY_CHUNK: usize = 64 * 1024;
 /// so the guard exists to bound the allocation, not the parse.
 const MAX_LITERAL_BYTES: usize = 16 * 1024 * 1024;
 
-/// A command line beyond this bound is refused. Message bodies arrive
-/// through literals, never through a line.
+/// A command line beyond this bound is refused, and the read is
+/// bounded with it: lines are scanned window by window and discarded
+/// once they cross the cap, so a runaway line never sits in memory
+/// whole. Message bodies arrive through literals, never through a
+/// line.
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// The untagged BYE a stale snapshot sends before closing.
@@ -182,7 +187,10 @@ enum Incoming {
 /// Read one full command: the line, every announced literal (continuation
 /// `+ `, exact byte count, continuation line), and nothing else.
 ///
-/// A literal that never arrives is an EOF: the client is gone. A tail
+/// A line beyond [`MAX_LINE_BYTES`] is refused exactly as it always
+/// was, but never buffered whole: the bounded read scans the stream
+/// window by window and discards a line once it crosses the cap. A
+/// literal that never arrives is an EOF: the client is gone. A tail
 /// line that fails to parse answers BAD with the command's own tag.
 async fn read_request<R, W>(reader: &mut R, writer: &mut W) -> Result<Incoming>
 where
@@ -191,12 +199,12 @@ where
 {
     let mut bytes = Vec::new();
     let mut line = match read_line(reader, &mut bytes).await? {
-        Some(line) => line,
+        Some(LineRead::Line(line)) => line,
+        // An over-cap line: the fixed refusal, with the connection
+        // left at the start of the next line.
+        Some(LineRead::TooLong) => return Ok(Incoming::Invalid("*".into())),
         None => return Ok(Incoming::Eof),
     };
-    if line.len() > MAX_LINE_BYTES {
-        return Ok(Incoming::Invalid("*".into()));
-    }
     let mut request = match codec::parse_line(&line) {
         Ok(request) => request,
         Err(_) => return Ok(Incoming::Invalid(bad_tag(&line))),
@@ -226,12 +234,10 @@ where
 
         // The rest of the line follows the literal bytes.
         line = match read_line(reader, &mut bytes).await? {
-            Some(line) => line,
+            Some(LineRead::Line(line)) => line,
+            Some(LineRead::TooLong) => return Ok(Incoming::Invalid(request.tag.clone())),
             None => return Ok(Incoming::Eof),
         };
-        if line.len() > MAX_LINE_BYTES {
-            return Ok(Incoming::Invalid(request.tag.clone()));
-        }
         if codec::parse_continuation(&line, &mut request.args).is_err() {
             return Ok(Incoming::Invalid(request.tag.clone()));
         }
@@ -239,8 +245,36 @@ where
     Ok(Incoming::Request(request))
 }
 
-/// Read one CRLF-terminated line. Invalid UTF-8 degrades to replacement
-/// characters, which the parser rejects with its fixed error.
+/// What one bounded line read produced.
+enum LineRead {
+    /// A line within the cap: CRLF stripped, invalid UTF-8 degraded
+    /// to replacement characters the parser rejects with its fixed
+    /// error.
+    Line(String),
+    /// The line crossed the cap with no newline: its remainder is
+    /// discarded so the connection resumes at the next line, and the
+    /// caller answers the same BAD as before.
+    TooLong,
+}
+
+/// How one scan window moved the read along.
+enum Scan {
+    /// The newline arrived inside the window.
+    Done,
+    /// No newline; the window joined the line within the cap.
+    More,
+    /// The cap was crossed and the newline with it: the line is fully
+    /// consumed, nothing more to discard.
+    OverLine,
+    /// The cap was crossed before any newline: the rest of the line
+    /// still has to be discarded.
+    OverRest,
+}
+
+/// Read one CRLF-terminated line without ever buffering a line beyond
+/// [`MAX_LINE_BYTES`]: each pass inspects the reader's buffered window,
+/// copies it into `bytes` only while the running total stays within
+/// the cap, and consumes what it has already accounted for.
 ///
 /// `bytes` is the caller's buffer: whatever a partially-completed read
 /// consumed stays in it, so a read that is abandoned mid-line (the IDLE
@@ -249,36 +283,151 @@ where
 async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     bytes: &mut Vec<u8>,
-) -> Result<Option<String>> {
-    let read = reader.read_until(b'\n', bytes).await.map_err(io_failed)?;
-    if read == 0 {
-        return Ok(None);
+) -> Result<Option<LineRead>> {
+    loop {
+        let window = match reader.fill_buf().await {
+            Ok(window) => window,
+            Err(error) => return Err(io_failed(error)),
+        };
+        if window.is_empty() {
+            // EOF: nothing more will arrive. An empty buffer with an
+            // empty line means the client is gone; a partial line
+            // within the cap behaves as it always has — it is the
+            // line the client sent before vanishing.
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(LineRead::Line(partial_line(bytes))));
+        }
+        // The newline search and the cap check run on the borrowed
+        // window; the copy and the consume follow the decision, so
+        // the borrow ends before the reader advances.
+        let (scan, consumed) = match window.iter().position(|&b| b == b'\n') {
+            Some(at) => {
+                // The trailing `\r` of a CRLF terminator never counts
+                // against the cap: the finished line strips it, as
+                // the unbounded read always did.
+                let cr = if at == 0 {
+                    bytes.last() == Some(&b'\r')
+                } else {
+                    window[at - 1] == b'\r'
+                };
+                if bytes.len() + at - usize::from(cr) > MAX_LINE_BYTES {
+                    (Scan::OverLine, at + 1)
+                } else {
+                    bytes.extend_from_slice(&window[..at + 1]);
+                    (Scan::Done, at + 1)
+                }
+            }
+            None => {
+                let len = window.len();
+                if bytes.len() + len > MAX_LINE_BYTES {
+                    (Scan::OverRest, len)
+                } else {
+                    bytes.extend_from_slice(window);
+                    (Scan::More, len)
+                }
+            }
+        };
+        reader.consume(consumed);
+        match scan {
+            Scan::Done => return Ok(Some(LineRead::Line(completed_line(bytes)))),
+            Scan::More => {}
+            Scan::OverLine => return Ok(Some(LineRead::TooLong)),
+            Scan::OverRest => {
+                discard_rest_of_line(reader).await?;
+                return Ok(Some(LineRead::TooLong));
+            }
+        }
     }
+}
+
+/// The accumulated bytes as a completed line: strip the CRLF
+/// terminator the newline brought, then hand the rest to
+/// [`partial_line`].
+fn completed_line(bytes: &mut Vec<u8>) -> String {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
     }
     if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
+    partial_line(bytes)
+}
+
+/// The accumulated bytes as a partial line at EOF: no terminator to
+/// strip — the same bytes the unbounded read handed up — with
+/// invalid UTF-8 degraded to replacement characters the parser
+/// rejects with its fixed error. The buffer empties for the next
+/// read.
+fn partial_line(bytes: &mut Vec<u8>) -> String {
     let line = String::from_utf8_lossy(bytes).into_owned();
     bytes.clear();
-    Ok(Some(line))
+    line
+}
+
+/// Discard the remainder of a line that already crossed the cap,
+/// window by window, until its newline or the end of the stream: the
+/// bytes are consumed, never stored.
+async fn discard_rest_of_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<()> {
+    loop {
+        let (newline, consumed) = {
+            let window = match reader.fill_buf().await {
+                Ok(window) => window,
+                Err(error) => return Err(io_failed(error)),
+            };
+            match window.iter().position(|&b| b == b'\n') {
+                Some(at) => (true, at + 1),
+                None => (false, window.len()),
+            }
+        };
+        if consumed == 0 {
+            // EOF mid-line: the caller answers BAD and the next read
+            // observes the EOF, exactly as before.
+            return Ok(());
+        }
+        reader.consume(consumed);
+        if newline {
+            return Ok(());
+        }
+    }
+}
+
+/// Whether a token may serve as a tag: printable ASCII without the
+/// response-code brackets or the literal-opening brace. Control
+/// characters must never enter a response line, and neither may a
+/// garbage `{5}` token — the client could misread its echo as a
+/// continuation announcement.
+fn tag_is_safe(token: &str) -> bool {
+    !token.is_empty()
+        && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        && !token.contains(['[', ']', '{'])
 }
 
 /// The tag to answer a BAD with when the line did not parse: the first
-/// token when it is printable ASCII without response-code brackets or a
-/// literal-opening brace, `*` otherwise. Control characters must never
-/// enter a response line, and neither may a garbage `{5}` token — the
-/// client could misread its echo as a continuation announcement.
+/// token when it is safe, `*` otherwise.
 fn bad_tag(line: &str) -> String {
     let token = line.split_whitespace().next().unwrap_or("*");
-    let safe = !token.is_empty()
-        && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
-        && !token.contains(['[', ']', '{']);
-    if safe {
+    if tag_is_safe(token) {
         token.to_string()
     } else {
         "*".to_string()
+    }
+}
+
+/// The placeholder logged for a tag that fails the same validation a
+/// BAD response applies: log lines carry fixed strings, never raw
+/// client bytes.
+const INVALID_LOG_TAG: &str = "<invalid>";
+
+/// The tag as it may appear in a log line: itself when it passes
+/// [`tag_is_safe`], a fixed placeholder otherwise. The wire never
+/// changes — this is the log field only.
+fn log_tag(tag: &str) -> &str {
+    if tag_is_safe(tag) {
+        tag
+    } else {
+        INVALID_LOG_TAG
     }
 }
 
@@ -323,7 +472,10 @@ impl Session {
     {
         let Request { tag, command, args } = request;
         let command = command.to_ascii_uppercase();
-        tracing::debug!(tag = %tag, command = %command, "imap command");
+        // The logged tag passes the same printable-ASCII gate a BAD
+        // response applies; a tag that fails it logs a fixed
+        // placeholder, so raw client bytes never reach a log line.
+        tracing::debug!(tag = %log_tag(&tag), command = %command, "imap command");
 
         // Snapshot validity: a Selected session never acts on a stale
         // view. SELECT/EXAMINE replace it, CLOSE drops it, LOGOUT ends
@@ -780,11 +932,19 @@ impl Session {
             if !selected {
                 continue;
             }
-            // An expunged uid answers nothing; the rest of the FETCH
-            // continues (the Proton Bridge lesson for mid-session
-            // expunges).
-            let Some(mut response) = self.backend.fetch(mailbox, *uid, &items).await? else {
-                continue;
+            // An expunged uid answers nothing (the Proton Bridge
+            // lesson for mid-session expunges) and so does a uid whose
+            // details cannot be loaded: one poisoned row must not
+            // abort the whole `UID FETCH 1:*` — no FETCH line for it,
+            // the rest of the loop continues, and the row disappears
+            // on the next sync or event. An Unsupported refusal is a
+            // verdict about the request itself, not about one row: it
+            // fails every uid identically and stays fatal.
+            let mut response = match self.backend.fetch(mailbox, *uid, &items).await {
+                Ok(Some(response)) => response,
+                Ok(None) => continue,
+                Err(error @ Error::Unsupported(_)) => return Err(error),
+                Err(_) => continue,
             };
             for piece in render_fetch(msn, &mut response, &items) {
                 match piece {
@@ -1006,15 +1166,24 @@ impl Session {
                     }
                 }
                 line = read_line(reader, &mut fragment) => {
-                    let Some(line) = line? else {
-                        // The client is gone; the main loop's next read
-                        // observes the EOF and ends the session.
-                        return Ok(Flow::Continue);
+                    let read = match line? {
+                        Some(read) => read,
+                        None => {
+                            // The client is gone; the main loop's next read
+                            // observes the EOF and ends the session.
+                            return Ok(Flow::Continue);
+                        }
                     };
-                    if line.len() > MAX_LINE_BYTES {
-                        write_line(writer, "* BAD invalid command").await?;
-                        return Ok(Flow::Continue);
-                    }
+                    let line = match read {
+                        // Beyond the cap: the same BAD the main loop
+                        // answers, with the connection left at the
+                        // next line.
+                        LineRead::TooLong => {
+                            write_line(writer, "* BAD invalid command").await?;
+                            return Ok(Flow::Continue);
+                        }
+                        LineRead::Line(line) => line,
+                    };
                     if line.trim().eq_ignore_ascii_case("done") {
                         write_line(writer, &format!("{tag} OK IDLE completed")).await?;
                         return Ok(Flow::Continue);
@@ -1413,6 +1582,18 @@ mod tests {
         // the client could misread `{5} BAD …` as a continuation
         // announcement.
         assert_eq!(bad_tag("{5} NOOP"), "*");
+    }
+
+    #[test]
+    fn logged_tags_pass_the_same_validation_as_responses() {
+        assert_eq!(log_tag("a1"), "a1");
+        assert_eq!(log_tag("A9999"), "A9999");
+        // Anything a BAD response would refuse logs the fixed
+        // placeholder instead of raw client bytes.
+        assert_eq!(log_tag(""), INVALID_LOG_TAG);
+        assert_eq!(log_tag("\u{7f}weird\u{1b}"), INVALID_LOG_TAG);
+        assert_eq!(log_tag("{5}"), INVALID_LOG_TAG);
+        assert_eq!(log_tag("a[b]"), INVALID_LOG_TAG);
     }
 
     #[test]

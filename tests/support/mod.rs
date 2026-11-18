@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::{ExposeSecret, SecretString};
-use tuta_bridge::adapters::imap::codec::FetchItem;
+use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem};
 use tuta_bridge::domain::{
     AccountId, AccountInfo, BatchOutcome, Error, EventFrame, Folder, MailPlacement, MailboxId,
     MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
@@ -1268,6 +1268,9 @@ pub struct FakeImapBackend {
     pub views: Vec<MailboxView>,
     pub snapshots: Mutex<HashMap<String, FakeSelected>>,
     pub fetches: Mutex<HashMap<u32, FakeFetched>>,
+    /// Uids whose FETCH answers a fixed error: the row exists but its
+    /// details cannot be loaded.
+    pub failing_fetches: Mutex<Vec<u32>>,
     /// Non-ALL search answers, keyed by the exact criteria.
     pub search_scripts: Mutex<HashMap<Vec<String>, Vec<u32>>>,
     /// The fallback non-ALL search answer.
@@ -1282,6 +1285,7 @@ impl FakeImapBackend {
             views: Vec::new(),
             snapshots: Mutex::new(HashMap::new()),
             fetches: Mutex::new(HashMap::new()),
+            failing_fetches: Mutex::new(Vec::new()),
             search_scripts: Mutex::new(HashMap::new()),
             search_uids: Mutex::new(Vec::new()),
         }
@@ -1307,6 +1311,13 @@ impl FakeImapBackend {
     /// Script one uid's FETCH answer.
     pub fn with_fetch(self, uid: u32, fetched: FakeFetched) -> Self {
         self.fetches.lock().unwrap().insert(uid, fetched);
+        self
+    }
+
+    /// Make `fetch` fail for `uid` with a fixed error: the row exists
+    /// but its details cannot be loaded.
+    pub fn with_failing_fetch(self, uid: u32) -> Self {
+        self.failing_fetches.lock().unwrap().push(uid);
         self
     }
 
@@ -1404,8 +1415,28 @@ impl ImapBackend for FakeImapBackend {
         &self,
         _mailbox: MailboxId,
         uid: u32,
-        _items: &[FetchItem],
+        items: &[FetchItem],
     ) -> Result<Option<FetchResponse>> {
+        // The row exists but its details cannot be loaded.
+        if self.failing_fetches.lock().unwrap().contains(&uid) {
+            return Err(Error::Network("fetch failed".into()));
+        }
+        // Numeric part sections are refused like the real backend
+        // refuses them: a protocol verdict about the request, not
+        // about one row.
+        if items.iter().any(|item| {
+            matches!(
+                item,
+                FetchItem::Body {
+                    section: BodySection::Part(_),
+                    ..
+                }
+            )
+        }) {
+            return Err(Error::Unsupported(
+                "message part sections are not supported".into(),
+            ));
+        }
         let fetches = self.fetches.lock().unwrap();
         let Some(fetched) = fetches.get(&uid) else {
             return Ok(None);

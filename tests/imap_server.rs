@@ -4,7 +4,9 @@
 //! scripted fake backend, pinning the exact wire bytes: the greeting and
 //! capability set, LOGIN (plain and through client literals), the
 //! SELECT/EXAMINE block, LIST framing (quoted and literal names), FETCH
-//! with streamed body literals and skipped expunged uids, SEARCH number
+//! with streamed body literals, skipped expunged uids, skipped
+//! unloadable ones, the protocol refusal of part sections, the
+//! oversized-line BAD that keeps the stream framed, SEARCH number
 //! mapping, STATUS, the read-only refusals, the resync BYE, and NOOP's
 //! notification flush. The last test runs one full client round over a
 //! real loopback TLS listener with a test-only accept-all verifier.
@@ -367,6 +369,96 @@ async fn fetch_streams_bodies_and_skips_expunged_uids() {
     )
     .await;
     wire.expect("a7 OK FETCH completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn fetch_skips_poisoned_uids_and_refuses_part_sections() {
+    // uid 1 fails on every fetch, uid 3 answers: one poisoned row
+    // must not abort the batch — exactly one FETCH line, then the
+    // tagged OK.
+    let scripted = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_failing_fetch(1)
+            .with_fetch(
+                3,
+                FakeFetched {
+                    flags: "\\Seen".into(),
+                    internal_date: "\"14-Nov-2023 22:13:20 +0000\"".into(),
+                    envelope: None,
+                    bodystructure: None,
+                    rfc822_size: None,
+                    body: Vec::new(),
+                },
+            ),
+    );
+    let (mut wire, session, _) = spawn_session(scripted, 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // The poisoned uid produces no FETCH line; the uid after it is
+    // served, and the command still ends with its tagged OK.
+    wire.send("a4 UID FETCH 1,3 (FLAGS UID)").await;
+    wire.expect("* 2 FETCH (FLAGS (\\Seen) UID 3)").await;
+    wire.expect("a4 OK UID FETCH completed").await;
+
+    // The same batch as a plain FETCH: the poisoned position vanishes,
+    // the last message still answers.
+    wire.send("a5 FETCH 1:* (UID FLAGS)").await;
+    wire.expect("* 2 FETCH (UID 3 FLAGS (\\Seen))").await;
+    wire.expect("a5 OK FETCH completed").await;
+
+    // A part-section request stays the protocol refusal it has always
+    // been: a tagged NO, not a silently empty OK.
+    wire.send("a6 FETCH 2 (BODY[1.2])").await;
+    wire.expect("a6 NO message part sections are not supported")
+        .await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn oversized_lines_answer_bad_and_keep_the_session_framed() {
+    let (mut wire, session, _) = spawn_session(backend(), 16).await;
+    wire.expect(GREETING).await;
+
+    // A line past the 64 KiB cap: the same `* BAD invalid command`
+    // the session has always answered — the line is detected while
+    // being read and discarded, never buffered whole — and the
+    // connection stays framed on the next line.
+    let mut oversized = String::from("a1 LOGIN user ");
+    oversized.push_str(&"A".repeat(70_000));
+    wire.send_raw(oversized.as_bytes()).await;
+    wire.send_raw(b"\r\n").await;
+    wire.expect("* BAD invalid command").await;
+
+    // The connection state matches today's behavior: the session
+    // continues in the same state and the next line dispatches.
+    wire.send("a1 LOGIN user@example.invalid hunter2").await;
+    wire.expect(LOGIN_OK).await;
+
+    // The same refusal during IDLE: the BAD ends the idling state
+    // and the dispatch loop continues on the next line.
+    wire.send("a3 SELECT Inbox").await;
+    expect_select_block(&mut wire, "a3", 2, Some(1), 7, 4, false).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    let mut oversized_idle = String::from("x");
+    oversized_idle.push_str(&"B".repeat(70_000));
+    wire.send_raw(oversized_idle.as_bytes()).await;
+    wire.send_raw(b"\r\n").await;
+    wire.expect("* BAD invalid command").await;
+    wire.send("i2 NOOP").await;
+    wire.expect("i2 OK NOOP completed").await;
 
     drop(wire);
     session.await.unwrap().unwrap();
