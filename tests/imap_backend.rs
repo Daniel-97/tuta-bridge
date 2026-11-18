@@ -626,7 +626,8 @@ async fn body_sections_slice_and_parts_are_refused() {
         expected_bytes.as_slice()
     );
 
-    // RFC822.HEADER is the non-peek equivalent of BODY[HEADER].
+    // RFC822.HEADER is the peek equivalent of BODY[HEADER] (RFC 3501
+    // §6.4.5): same slice, no persistence — see the dedicated peek test.
     let items = parse_fetch_items("(RFC822.HEADER)").unwrap();
     let response = world
         .backend
@@ -651,6 +652,62 @@ async fn body_sections_slice_and_parts_are_refused() {
         matches!(error, Error::Unsupported(message) if message == "message part sections are not supported")
     );
     assert_eq!(world.source.content_calls(), before);
+}
+
+#[tokio::test]
+async fn rfc822_header_is_peek_and_persists_nothing() {
+    let world = world().await;
+    let uid = world
+        .store
+        .assign_uid(
+            world.inbox,
+            &partial_header("e1", "list subject", 1_700_000_000_000, true),
+        )
+        .await
+        .unwrap();
+    let content = world.source.content.clone().unwrap();
+    let expected_bytes = MimeRenderer.render(&content).unwrap();
+
+    // RFC 3501 §6.4.5: "RFC822.HEADER — Functionally equivalent to
+    // BODY.PEEK[HEADER]". A fresh message returns the header bytes and
+    // the row keeps nothing: no size, no structure, no complete envelope.
+    let items = parse_fetch_items("(RFC822.HEADER)").unwrap();
+    let response = world
+        .backend
+        .fetch(world.inbox, uid, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    let body = response.body.expect("header section renders");
+    assert!(String::from_utf8_lossy(&body).contains("Subject: full subject\r\n"));
+    assert!(body.ends_with(b"\r\n\r\n"));
+    assert!(
+        body.len() < expected_bytes.len(),
+        "the header slice, not the whole message"
+    );
+    assert_eq!(world.source.content_calls(), 1);
+    let stored = world
+        .store
+        .message_by_uid(world.inbox, uid)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(
+        stored.rfc822_size, None,
+        "rfc822.header must not persist the size"
+    );
+    assert_eq!(stored.mime_structure, None);
+    assert!(!stored.header.envelope_complete);
+    assert!(!world
+        .store
+        .calls()
+        .iter()
+        .any(|call| call == "update_metadata"));
+    assert!(!world
+        .store
+        .calls()
+        .iter()
+        .any(|call| call == "set_mime_structure"));
 }
 
 #[tokio::test]
@@ -714,9 +771,6 @@ async fn search_covers_index_keys() {
     assert_eq!(search(backend, inbox, &["ALL"]).await, vec![1, 2, 3]);
     assert_eq!(search(backend, inbox, &["UNSEEN"]).await, vec![1, 3]);
     assert_eq!(search(backend, inbox, &["SEEN"]).await, vec![2]);
-    // NEW/OLD map onto unread/read; no \Recent tracking exists.
-    assert_eq!(search(backend, inbox, &["NEW"]).await, vec![1, 3]);
-    assert_eq!(search(backend, inbox, &["OLD"]).await, vec![2]);
     assert_eq!(search(backend, inbox, &["UID", "1:2"]).await, vec![1, 2]);
     // A bare sequence set filters message numbers, results stay UIDs.
     assert_eq!(search(backend, inbox, &["2:3"]).await, vec![2, 3]);
@@ -724,13 +778,14 @@ async fn search_covers_index_keys() {
         search(backend, inbox, &["SINCE", "15-Nov-2023"]).await,
         vec![2]
     );
+    // The month parses in any casing clients send.
+    assert_eq!(
+        search(backend, inbox, &["ON", "14-nov-2023"]).await,
+        vec![1]
+    );
     assert_eq!(
         search(backend, inbox, &["BEFORE", "14-Nov-2023"]).await,
         vec![3]
-    );
-    assert_eq!(
-        search(backend, inbox, &["ON", "14-Nov-2023"]).await,
-        vec![1]
     );
     assert_eq!(
         search(backend, inbox, &["SUBJECT", "quarterly"]).await,
@@ -758,12 +813,15 @@ async fn search_covers_index_keys() {
     assert_eq!(world.source.content_calls(), 0);
 
     // Body/text search needs a body cache the bridge deliberately keeps
-    // out of the store; keywords and unknown keys answer the same fixed
-    // unsupported string.
+    // out of the store; keywords, NEW/OLD (\Recent-based, no faithful
+    // reduction), and unknown keys answer the same fixed unsupported
+    // string.
     for criteria in [
         ["BODY", "x"],
         ["TEXT", "x"],
         ["KEYWORD", "flag"],
+        ["NEW", ""],
+        ["OLD", ""],
         ["BOGUS", ""],
     ] {
         let owned: Vec<String> = criteria.iter().map(|c| c.to_string()).collect();

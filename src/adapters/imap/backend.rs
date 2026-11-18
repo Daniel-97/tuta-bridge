@@ -51,15 +51,18 @@ pub struct TutaImapBackend {
 /// Compare two byte strings without leaking their contents through
 /// timing.
 ///
-/// The loop always runs `max(a.len(), b.len())` iterations — a count the
-/// attacker already controls through their own input — and every
+/// The loop always runs `max(a.len(), b.len())` iterations and every
 /// iteration performs the same branch-free work: read one byte from
 /// each side (zero past the end) and OR the XOR into the accumulator.
-/// The length difference is folded into the same accumulator instead of
-/// short-circuiting, so a length mismatch costs the same work as a byte
-/// mismatch and byte values never influence control flow. Only the
-/// final accumulator decides equality; a differing length can never
-/// cancel out because the whole 64-bit length XOR is part of it.
+/// The iteration count is attacker-controlled only when the submitted
+/// value is at least as long as the stored one; a shorter submission
+/// runs the stored length's iterations, which is fine because the
+/// stored length is not secret material. The length difference is
+/// folded into the same accumulator instead of short-circuiting, so a
+/// length mismatch costs the same work as a byte mismatch and byte
+/// values never influence control flow. Only the final accumulator
+/// decides equality; a differing length can never cancel out because
+/// the whole 64-bit length XOR is part of it.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff: u64 = (a.len() ^ b.len()) as u64;
     for i in 0..a.len().max(b.len()) {
@@ -247,10 +250,14 @@ fn next_token<'a>(criteria: &'a [String], cursor: &mut usize) -> Result<&'a str>
 
 /// Parse an IMAP date `dd-Mmm-yyyy`.
 ///
-/// RFC 3501 date-days carry one or two digits; the fixed `time` format
-/// covers the two-digit form and the one-digit form retries zero-padded.
+/// RFC 3501 spells the month `Nov`, but clients send any casing; the
+/// fixed `time` format matches the month case-sensitively by default,
+/// so the component parses with `case_sensitive=false`, which accepts
+/// `nov`, `NOV`, and `Nov` alike. RFC 3501 date-days carry one or two
+/// digits; the one-digit form retries zero-padded.
 fn parse_search_date(raw: &str) -> Result<Date> {
-    let format = time::macros::format_description!("[day]-[month repr:short]-[year]");
+    let format =
+        time::macros::format_description!("[day]-[month repr:short case_sensitive:false]-[year]");
     let trimmed = raw.trim();
     if let Ok(date) = Date::parse(trimmed, &format) {
         return Ok(date);
@@ -288,9 +295,8 @@ fn parse_search_key(criteria: &[String], cursor: &mut usize, depth: usize) -> Re
     let token = next_token(criteria, cursor)?;
     match token.to_ascii_uppercase().as_str() {
         "ALL" => Ok(SearchKey::All),
-        // No \Recent tracking exists: NEW/OLD reduce to the read state.
-        "UNSEEN" | "NEW" => Ok(SearchKey::Unseen),
-        "SEEN" | "OLD" => Ok(SearchKey::Seen),
+        "UNSEEN" => Ok(SearchKey::Unseen),
+        "SEEN" => Ok(SearchKey::Seen),
         "UID" => Ok(SearchKey::Uid(parse_seq_set(next_token(
             criteria, cursor,
         )?)?)),
@@ -345,10 +351,12 @@ fn parse_search_key(criteria: &[String], cursor: &mut usize, depth: usize) -> Re
             Ok(SearchKey::Or(Box::new(first), Box::new(second)))
         }
         // Body/text search needs decrypted bodies in the store, which the
-        // bridge deliberately never keeps; keyword and remaining flag keys
-        // have no Tuta equivalent.
+        // bridge deliberately never keeps. Keyword and remaining flag
+        // keys have no Tuta equivalent — NEW/OLD are \Recent-based, and
+        // their only faithful reductions (nothing / everything) would be
+        // a lie, so they are refused like the rest.
         "BODY" | "TEXT" | "KEYWORD" | "UNKEYWORD" | "ANSWERED" | "DELETED" | "DRAFT"
-        | "FLAGGED" | "RECENT" => Err(unsupported_search_key()),
+        | "FLAGGED" | "RECENT" | "NEW" | "OLD" => Err(unsupported_search_key()),
         _ => match parse_seq_set(token) {
             // A bare sequence set (SEARCH 1:2) selects message numbers.
             Ok(set) => Ok(SearchKey::Sequence(set)),
@@ -612,17 +620,21 @@ impl ImapBackend for TutaImapBackend {
                         .await?;
                     response.body = Some(bytes);
                 }
-                // RFC822/RFC822.TEXT/RFC822.HEADER are the non-peek
-                // equivalents of BODY[]/BODY[TEXT]/BODY[HEADER]
-                // (RFC 3501 §6.4.5).
+                // RFC822 and RFC822.TEXT are the non-peek equivalents of
+                // BODY[]/BODY[TEXT] (RFC 3501 §6.4.5). RFC822.HEADER is
+                // functionally equivalent to BODY.PEEK[HEADER] — §6.4.5
+                // says so outright, and §7.4.2's "Equivalent to
+                // BODY[HEADER]" is response-data naming whose own note
+                // says \Seen is not set — so it renders and slices but
+                // never persists.
                 FetchItem::Rfc822 | FetchItem::Rfc822Text | FetchItem::Rfc822Header => {
-                    let section = match item {
-                        FetchItem::Rfc822 => BodySection::Empty,
-                        FetchItem::Rfc822Text => BodySection::Text,
-                        _ => BodySection::Header,
+                    let (peek, section) = match item {
+                        FetchItem::Rfc822 => (false, BodySection::Empty),
+                        FetchItem::Rfc822Text => (false, BodySection::Text),
+                        _ => (true, BodySection::Header),
                     };
                     let bytes = self
-                        .body_section(mailbox, &mut stored, false, &section)
+                        .body_section(mailbox, &mut stored, peek, &section)
                         .await?;
                     response.body = Some(bytes);
                 }
@@ -716,6 +728,19 @@ mod tests {
             day_start_ms(parse_search_date("4-Nov-2023").unwrap()),
             1_699_056_000_000
         );
+        // The month parses in any casing: `nov` and `NOV` alike.
+        for raw in ["14-nov-2023", "14-NOV-2023"] {
+            assert_eq!(
+                day_start_ms(parse_search_date(raw).unwrap()),
+                1_699_920_000_000,
+                "{raw} must parse in any casing"
+            );
+        }
+        // The one-digit-day retry path keeps that behavior too.
+        assert_eq!(
+            day_start_ms(parse_search_date("4-nOV-2023").unwrap()),
+            1_699_056_000_000
+        );
         // Fixed error strings, no client input echoed.
         assert!(matches!(
             parse_search_date("2023-11-14"),
@@ -736,8 +761,7 @@ mod tests {
 
         assert!(matches!(parse(&["ALL"]).unwrap()[0], SearchKey::All));
         assert!(matches!(parse(&["UNSEEN"]).unwrap()[0], SearchKey::Unseen));
-        assert!(matches!(parse(&["NEW"]).unwrap()[0], SearchKey::Unseen));
-        assert!(matches!(parse(&["OLD"]).unwrap()[0], SearchKey::Seen));
+        assert!(matches!(parse(&["SEEN"]).unwrap()[0], SearchKey::Seen));
         assert!(matches!(
             parse(&["UID", "1:2"]).unwrap()[0],
             SearchKey::Uid(_)
@@ -768,12 +792,16 @@ mod tests {
             Err(Error::Unsupported(message)) if message == "invalid search criteria"
         ));
 
-        // Unsupported keys answer the fixed unsupported string.
+        // Unsupported keys answer the fixed unsupported string — NEW/OLD
+        // included: they are \Recent-based, and their only faithful
+        // reductions (nothing / everything) would be a lie.
         for criteria in [
             ["BODY", "x"],
             ["TEXT", "x"],
             ["KEYWORD", "f"],
             ["FLAGGED", ""],
+            ["NEW", ""],
+            ["OLD", ""],
         ] {
             assert!(
                 matches!(parse(&criteria), Err(Error::Unsupported(message)) if message == "search key not supported"),
