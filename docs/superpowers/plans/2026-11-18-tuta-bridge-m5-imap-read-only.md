@@ -477,7 +477,7 @@ async fn greets_authenticates_and_lists() {
 ```
 
 Add:
-- `select_reports_counts_and_read_only_flags`: `* <exists> EXISTS`, `* 0 RECENT`, `* OK [UNSEEN <n>]`, `* OK [UIDVALIDITY <v>]`, `* OK [UIDNEXT <n>]`, `* FLAGS (\\Seen)`, `* OK [PERMANENTFLAGS ()] Read-only mailbox`, `a3 OK [READ-WRITE] SELECT completed` (READ-WRITE because clients dislike read-only SELECT; STORE still answers NO).
+- `select_reports_counts_and_read_only_flags`: `* FLAGS (\\Seen)`, `* <exists> EXISTS`, `* 0 RECENT`, `* OK [UNSEEN <n>]` (omitted when zero), `* OK [PERMANENTFLAGS ()] Read-only mailbox`, `* OK [UIDVALIDITY <v>]`, `* OK [UIDNEXT <n>]`, `a3 OK [READ-WRITE] SELECT completed` (Dovecot-style order; RFC 3501 mandates presence, not order; READ-WRITE because clients dislike read-only SELECT, STORE still answers NO).
 - `fetch_streams_bodies_and_skips_expunged_uids`: UID FETCH `1,3 (FLAGS BODY[])` where uid 3 vanished: exactly one `* 1 FETCH ...` line whose body is a server-sent literal (`{n}\r\n` immediately followed by the raw bytes — no continuation round-trip), no entry for 3, then the tagged OK. Body literals are written in 64 KiB chunks (assert with a >128 KiB fake body).
 - `status_reports_requested_items`; `close_and_check`; `logout_sends_bye`.
 - `writes_are_refused`: `STORE`, `APPEND`, `EXPUNGE`, `CREATE`, `DELETE`, `RENAME`, `COPY`, `MOVE`, `SUBSCRIBE`, `UNSUBSCRIBE` each answer `NO not supported by this read-only bridge`; unknown commands answer `BAD`.
