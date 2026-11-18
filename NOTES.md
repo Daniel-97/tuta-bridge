@@ -168,6 +168,16 @@
   `Junk`, `Archive`) are derived from the folder kind because Tuta
   stores the `name` of system MailSets empty on the server; custom
   MailSets carry real names and an unnamed custom set is skipped.
+- Sent dates are taken from the parsed `Date:` header, not Tuta's
+  `MailDetails.sentDate`, which is 0 for external mail — an M2-era root
+  cause that left every enriched row with `sent_at_ms = 0`, so ENVELOPE
+  dates rendered NIL and Thunderbird showed 01/01/1970. Rows already
+  in a database heal on their next BODYSTRUCTURE/RFC822.SIZE/BODY
+  request: the enricher treats a row as complete only when its sent
+  date landed, so a row marked complete with a zero date re-enriches
+  once (one content load) and comes back with the header's date — no
+  migration. Genuinely dateless mail keeps re-loading per body request,
+  the same accepted posture as permanently-unavailable content.
 
 ## M1/M2 manual acceptance (2026-11-16)
 

@@ -893,3 +893,136 @@ async fn search_covers_index_keys() {
         );
     }
 }
+
+/// Seed one row shaped like the M2-era zero-date population: marked
+/// complete with size and structure stored, but a sent date that never
+/// landed.
+async fn seed_stale_row(
+    store: &Arc<support::FakeStateStore>,
+    inbox: MailboxId,
+    element_id: &str,
+) -> u32 {
+    let mut header = partial_header(element_id, "list subject", 1_700_000_000_000, true);
+    header.envelope_complete = true;
+    header.sent_at_ms = 0;
+    let uid = store.assign_uid(inbox, &header).await.unwrap();
+    store
+        .update_metadata(inbox, uid, &header, Some(4096))
+        .await
+        .unwrap();
+    store
+        .set_mime_structure(inbox, uid, "(\"TEXT\" \"PLAIN\")")
+        .await
+        .unwrap();
+    uid
+}
+
+#[tokio::test]
+async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
+    let world = world().await;
+    let uid_structure = seed_stale_row(&world.store, world.inbox, "e1").await;
+    let uid_size = seed_stale_row(&world.store, world.inbox, "e2").await;
+    let uid_body = seed_stale_row(&world.store, world.inbox, "e3").await;
+    let content = world.source.content.clone().unwrap();
+    let expected_bytes = MimeRenderer.render(&content).unwrap();
+    let expected_structure = bodystructure(&content);
+
+    // BODYSTRUCTURE heals through the enricher even though the
+    // structure was stored: one content load, the sent date lands, and
+    // the recomputed structure is served.
+    let items = parse_fetch_items("(BODYSTRUCTURE)").unwrap();
+    let response = world
+        .backend
+        .fetch(world.inbox, uid_structure, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(world.source.content_calls(), 1);
+    assert_eq!(
+        response.bodystructure.as_deref(),
+        Some(expected_structure.as_str())
+    );
+    let stored = world
+        .store
+        .message_by_uid(world.inbox, uid_structure)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(stored.header.sent_at_ms, 1_700_000_000_000);
+    assert!(stored.header.envelope_complete);
+    assert_eq!(stored.rfc822_size, Some(expected_bytes.len() as u64));
+
+    // The healed row short-circuits: no new source call.
+    let response = world
+        .backend
+        .fetch(world.inbox, uid_structure, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(world.source.content_calls(), 1);
+    assert_eq!(
+        response.bodystructure.as_deref(),
+        Some(expected_structure.as_str())
+    );
+
+    // ENVELOPE now renders the real date — from the healed index alone.
+    let items = parse_fetch_items("(ENVELOPE)").unwrap();
+    let response = world
+        .backend
+        .fetch(world.inbox, uid_structure, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(world.source.content_calls(), 1);
+    assert!(response
+        .envelope
+        .expect("envelope requested")
+        .contains("14 Nov 2023 22:13:20 +0000"));
+
+    // RFC822.SIZE heals the same way even though the size was stored.
+    let items = parse_fetch_items("(RFC822.SIZE)").unwrap();
+    let response = world
+        .backend
+        .fetch(world.inbox, uid_size, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(world.source.content_calls(), 2);
+    assert_eq!(response.rfc822_size, Some(expected_bytes.len() as u64));
+    let stored = world
+        .store
+        .message_by_uid(world.inbox, uid_size)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(stored.header.sent_at_ms, 1_700_000_000_000);
+
+    // BODY[] heals too — one enrich load plus the by-design render —
+    // and only the render is repeated afterwards.
+    let items = parse_fetch_items("(BODY[])").unwrap();
+    let response = world
+        .backend
+        .fetch(world.inbox, uid_body, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(world.source.content_calls(), 4);
+    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    let stored = world
+        .store
+        .message_by_uid(world.inbox, uid_body)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(stored.header.sent_at_ms, 1_700_000_000_000);
+    assert!(stored.header.envelope_complete);
+
+    let response = world
+        .backend
+        .fetch(world.inbox, uid_body, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(world.source.content_calls(), 5);
+    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+}

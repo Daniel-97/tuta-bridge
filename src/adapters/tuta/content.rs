@@ -115,6 +115,35 @@ pub fn address_from_encrypted(address: &EncryptedMailAddress) -> Address {
     }
 }
 
+/// Extract the sent timestamp, in milliseconds since the Unix epoch, from
+/// the `Date` header of a parsed header map.
+///
+/// The header name is matched case-insensitively: [`parse_headers`] already
+/// lower-cases every name it stores, and this lookup folds ASCII case the
+/// same way. All values stored for the name are joined with a space —
+/// repeated `Date:` headers and the folded continuations [`parse_headers`]
+/// has already collapsed — and the joined value is parsed as an RFC 5322
+/// date with [`mail_parser::DateTime::parse_rfc822`], whose
+/// `to_timestamp` applies the zone offset; the seconds are scaled to
+/// milliseconds (RFC 5322 dates carry no sub-second precision). A missing
+/// or malformed `Date` yields `fallback_ms` when it is positive, and 0
+/// otherwise, so a zeroed Tuta `sentDate` can never masquerade as a real
+/// date: Tuta stores external mail's real send time only in the headers,
+/// with `MailDetails.sentDate` at 0.
+pub fn sent_at_from(headers: &HashMap<String, Vec<String>>, fallback_ms: i64) -> i64 {
+    let fallback = if fallback_ms > 0 { fallback_ms } else { 0 };
+    let joined = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("date"))
+        .map(|(_, values)| values.join(" "))
+        .unwrap_or_default();
+
+    match mail_parser::DateTime::parse_rfc822(&joined) {
+        Some(date) => date.to_timestamp() * 1000,
+        None => fallback,
+    }
+}
+
 /// Decide whether a decrypted [`MailDetailsBlob`] is intact.
 ///
 /// The SDK's `EntityFacadeImpl::decrypt_and_map_inner` does not return `Err`

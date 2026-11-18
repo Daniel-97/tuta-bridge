@@ -205,6 +205,8 @@ async fn skips_enrichment_for_already_complete_messages() {
     let (store, mailbox, uid) = seeded_mailbox().await;
     let mut stored = partial_stored(uid);
     stored.header.envelope_complete = true;
+    // A fully-complete row also carries a landed sent date.
+    stored.header.sent_at_ms = 1_700_000_000_000;
     stored.rfc822_size = Some(4096);
     stored.mime_structure = Some("(\"TEXT\" \"PLAIN\")".into());
     let source = content_source(&stored.header);
@@ -232,6 +234,7 @@ async fn re_enriches_when_only_the_structure_is_missing() {
     let (store, mailbox, uid) = seeded_mailbox().await;
     let mut stored = partial_stored(uid);
     stored.header.envelope_complete = true;
+    stored.header.sent_at_ms = 1_700_000_000_000;
     stored.rfc822_size = Some(4096);
     let source = content_source(&stored.header);
     let (enricher, _renderer) = new_enricher(&store);
@@ -243,6 +246,41 @@ async fn re_enriches_when_only_the_structure_is_missing() {
     // A size from an interrupted enrichment is recomputed, not kept.
     assert_eq!(enriched.rfc822_size, Some(10));
     assert_eq!(enriched.header.subject, "full subject");
+}
+
+#[tokio::test]
+async fn re_enriches_a_row_marked_complete_whose_sent_date_never_landed() {
+    let (store, mailbox, uid) = seeded_mailbox().await;
+    // The M2-era stale shape: the envelope was marked complete and the
+    // size and structure were stored, but the sent date never landed
+    // (Tuta's sentDate is 0 for external mail).
+    let mut stored = partial_stored(uid);
+    stored.header.envelope_complete = true;
+    stored.rfc822_size = Some(4096);
+    stored.mime_structure = Some("(\"TEXT\" \"PLAIN\")".into());
+    let source = content_source(&stored.header);
+    let (enricher, _renderer) = new_enricher(&store);
+
+    let healed = enricher.enrich(mailbox, &stored, &source).await.unwrap();
+
+    // One content load, then the sent date comes from the content.
+    assert_eq!(source.content_calls(), 1);
+    assert_eq!(healed.header.sent_at_ms, 1_700_000_000_000);
+    assert!(healed.header.envelope_complete);
+    assert_eq!(healed.rfc822_size, Some(10));
+    assert!(healed.mime_structure.is_some());
+    // The healed row is persisted: no migration needed.
+    let persisted = store
+        .message_by_uid(mailbox, uid)
+        .await
+        .unwrap()
+        .expect("stored row exists");
+    assert_eq!(persisted.header.sent_at_ms, 1_700_000_000_000);
+    assert!(persisted.header.envelope_complete);
+    // Once healed the row short-circuits: no second source call.
+    let again = enricher.enrich(mailbox, &healed, &source).await.unwrap();
+    assert_eq!(source.content_calls(), 1);
+    assert_eq!(again.header.sent_at_ms, 1_700_000_000_000);
 }
 
 #[tokio::test]

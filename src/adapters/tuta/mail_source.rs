@@ -12,7 +12,7 @@ use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, Logged
 use super::blob::{fetch_blob_element, load_attachment, request_archive_read_token};
 use super::content::{
     address_from_encrypted, address_from_mail_address, draft_details_are_intact, mail_is_intact,
-    parse_headers, select_body, threading_headers,
+    parse_headers, select_body, sent_at_from, threading_headers,
 };
 use super::wire::decrypt_mail_details;
 use crate::domain::{
@@ -436,7 +436,7 @@ impl MailSource for TutaMailSource {
                 .iter()
                 .map(address_from_encrypted)
                 .collect(),
-            sent_at_ms: details.sentDate.as_millis() as i64,
+            sent_at_ms: sent_at_from(&headers, details.sentDate.as_millis() as i64),
             subject: mail.subject,
             message_id,
             in_reply_to,

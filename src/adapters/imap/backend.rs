@@ -559,6 +559,19 @@ impl TutaImapBackend {
     }
 }
 
+/// A row marked complete whose sent date never landed — the shape the
+/// M2-era external-mail population left in existing databases, where
+/// Tuta's `MailDetails.sentDate` is 0 and the real send time lived only
+/// in the `Date:` header. Such a row is deliberately not complete (see
+/// [`EnvelopeEnricher::enrich`]), so every body-class fetch routes it
+/// through the enricher once; it comes back with the header's date and
+/// short-circuits from then on. Genuinely dateless mail keeps paying one
+/// content load per request, the same accepted posture as
+/// permanently-unavailable content.
+fn stale_complete(stored: &StoredMessage) -> bool {
+    stored.header.envelope_complete && stored.header.sent_at_ms <= 0
+}
+
 #[async_trait::async_trait]
 impl ImapBackend for TutaImapBackend {
     async fn login(&self, user: &str, password: &SecretString) -> Result<bool> {
@@ -647,22 +660,30 @@ impl ImapBackend for TutaImapBackend {
                     response.envelope = Some(render::envelope(&stored.header));
                 }
                 // The structure answers from the store; a missing one
-                // costs exactly one enrichment, already persisted.
+                // costs exactly one enrichment, already persisted. A
+                // stale row — marked complete, zero sent date — heals
+                // through the same enrichment, exactly once.
                 FetchItem::BodyStructure => {
-                    if stored.mime_structure.is_none() {
+                    if stored.mime_structure.is_none() || stale_complete(&stored) {
                         stored = self.enrich(mailbox, &stored).await?;
                     }
                     response.bodystructure = stored.mime_structure.clone();
                 }
                 // The size answers from the store; a missing one costs
-                // exactly one enrichment, without re-rendering here.
+                // exactly one enrichment, without re-rendering here. A
+                // stale row heals the same way.
                 FetchItem::Rfc822Size => {
-                    if stored.rfc822_size.is_none() {
+                    if stored.rfc822_size.is_none() || stale_complete(&stored) {
                         stored = self.enrich(mailbox, &stored).await?;
                     }
                     response.rfc822_size = stored.rfc822_size;
                 }
                 FetchItem::Body { peek, section } => {
+                    // A stale row heals before the by-design re-render;
+                    // partial rows keep the body-only path.
+                    if stale_complete(&stored) {
+                        stored = self.enrich(mailbox, &stored).await?;
+                    }
                     let bytes = self
                         .body_section(mailbox, &mut stored, *peek, section)
                         .await?;
