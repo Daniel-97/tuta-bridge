@@ -249,16 +249,16 @@ tuta-bridge logout
 
 ## Debugging HTTP errors
 
-Errors are printed to stderr. To also print the HTTP phase, path, status, and
-a sanitized server error body (sensitive JSON fields are redacted), add the
+Errors are printed to stderr. To also print one line per login HTTP request —
+the phase, method, URL path, status code, and response body size — add the
 global `--debug` flag:
 
 ```bash
 cargo run -- --debug login
 ```
 
-The diagnostic line may include a server-provided error message; review it
-before sharing.
+The line never contains a request or response body, the URL query, or any
+header, so it carries no credentials; it does show the server host and path.
 
 ## Development
 

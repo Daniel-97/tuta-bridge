@@ -39,9 +39,8 @@ enum AuthFailure {
 
 /// Print a short, opt-in diagnostic line for an HTTP response.
 ///
-/// Enabled only by `TUTA_BRIDGE_DEBUG_HTTP=1`. The URL query (which contains
-/// `_body` with the mail address/verifier) is never printed; only the path,
-/// status, and recognized error fields from a JSON response.
+/// Enabled only by the global `--debug` flag. See [`debug_line`] for what
+/// the line may contain.
 fn debug_http(
     enabled: bool,
     phase: &str,
@@ -53,63 +52,21 @@ fn debug_http(
     if !enabled {
         return;
     }
-    let path = url.split('?').next().unwrap_or(url);
-    let detail = body
-        .map(describe_error_body)
-        .unwrap_or_else(|| "<empty body>".to_string());
-    eprintln!("http debug: {phase} {method} {path} -> {status}; {detail}");
+    eprintln!("{}", debug_line(phase, method, url, status, body));
 }
 
-fn describe_error_body(body: &[u8]) -> String {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        let text = String::from_utf8_lossy(body);
-        let truncated: String = text.chars().take(500).collect();
-        return format!("<non-json> {truncated}");
-    };
-
-    let redacted = redact_json(value);
-    let compact =
-        serde_json::to_string(&redacted).unwrap_or_else(|_| "<unprintable json>".to_string());
-    let truncated: String = compact.chars().take(2000).collect();
-    truncated
-}
-
-/// Redact values that could carry credentials or account identifiers. The
-/// server's error code/message remain visible for diagnosis.
-fn redact_json(value: serde_json::Value) -> serde_json::Value {
-    const SENSITIVE: &[&str] = &[
-        "password",
-        "passphrase",
-        "authverifier",
-        "accesstoken",
-        "encryptedpassphrasekey",
-        "mailaddress",
-        "salt",
-        "accesskey",
-        "totp",
-        "otpcode",
-        "session",
-    ];
-    match value {
-        serde_json::Value::Object(map) => {
-            let redacted = map
-                .into_iter()
-                .map(|(key, value)| {
-                    let lower = key.to_ascii_lowercase();
-                    if SENSITIVE.contains(&lower.as_str()) {
-                        (key, serde_json::Value::String("<redacted>".to_string()))
-                    } else {
-                        (key, redact_json(value))
-                    }
-                })
-                .collect();
-            serde_json::Value::Object(redacted)
-        }
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(redact_json).collect())
-        }
-        other => other,
-    }
+/// Build the diagnostic line: phase, method, URL path, status, and the body
+/// length in bytes.
+///
+/// Safe by construction rather than by redaction: the URL query (its `_body`
+/// carries the mail address and the access token) is cut off, and no part of
+/// a response body is ever printed. Tuta JSON is keyed by numeric attribute
+/// ids, so a successful session response is `{"1221":"<access token>",...}`
+/// and no list of sensitive key names could recognise it.
+fn debug_line(phase: &str, method: &str, url: &str, status: u32, body: Option<&[u8]>) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let length = body.map_or(0, <[u8]>::len);
+    format!("http debug: {phase} {method} {path} -> {status}; body {length} bytes")
 }
 
 impl TutaPreSession {
@@ -336,32 +293,48 @@ impl TutaPreSession {
 
 #[cfg(test)]
 mod tests {
-    use super::describe_error_body;
+    use super::debug_line;
 
+    /// Real wire shape: Tuta JSON is keyed by numeric attribute ids, so the
+    /// access token sits under `1221` and the salt under `422`.
     #[test]
-    fn describes_json_error_fields_without_the_raw_body() {
-        let body = br#"{"errorCode":"invalid","message":"bad request","other":"ignored"}"#;
-        let text = describe_error_body(body);
-        assert!(text.contains(r#""errorCode":"invalid""#));
-        assert!(text.contains(r#""message":"bad request""#));
-        assert!(text.contains(r#""other":"ignored""#));
+    fn never_prints_a_successful_session_response_body() {
+        let body = br#"{"1220":"0","1221":"SECRETACCESSTOKEN","1222":[],"1223":["SECRETUSERID"]}"#;
+        let line = debug_line(
+            "session request",
+            "POST",
+            "https://app.tuta.com/rest/sys/sessionservice",
+            201,
+            Some(body),
+        );
+        assert_eq!(
+            line,
+            format!(
+                "http debug: session request POST https://app.tuta.com/rest/sys/sessionservice -> 201; body {} bytes",
+                body.len()
+            )
+        );
+        assert!(!line.contains("SECRETACCESSTOKEN"));
+        assert!(!line.contains("SECRETUSERID"));
     }
 
     #[test]
-    fn redacts_sensitive_json_values() {
-        let body = br#"{"message":"bad request","mailAddress":"a@b.c","accessToken":"tok","nested":{"password":"pw"}}"#;
-        let text = describe_error_body(body);
-        assert!(text.contains(r#""message":"bad request""#));
-        assert!(!text.contains("a@b.c"));
-        assert!(!text.contains("tok"));
-        assert!(!text.contains("pw"));
-        assert!(text.contains("<redacted>"));
+    fn never_prints_error_bodies_or_the_url_query() {
+        let line = debug_line(
+            "second factor poll",
+            "GET",
+            "https://app.tuta.com/rest/sys/secondfactorauthservice?_body=%7B%221235%22%3A%22SECRETTOKEN%22%7D",
+            400,
+            Some(br#"{"422":"SECRETSALT","message":"a@b.c"}"#),
+        );
+        assert!(line.ends_with("/rest/sys/secondfactorauthservice -> 400; body 38 bytes"));
+        assert!(!line.contains("SECRET"));
+        assert!(!line.contains("a@b.c"));
     }
 
     #[test]
-    fn describes_non_json_body_with_a_truncated_prefix() {
-        let text = describe_error_body(b"<html>oops</html>");
-        assert!(text.starts_with("<non-json>"));
-        assert!(text.contains("<html>oops</html>"));
+    fn reports_an_empty_body_as_zero_bytes() {
+        let line = debug_line("salt request", "GET", "http://127.0.0.1:1/x", 500, None);
+        assert!(line.ends_with("-> 500; body 0 bytes"));
     }
 }
