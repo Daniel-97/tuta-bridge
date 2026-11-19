@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use tutasdk::bindings::rest_client::RestClient;
 use tutasdk::entities::generated::sys::CloseSessionServicePost;
-use tutasdk::login::{CredentialType, Credentials};
+use tutasdk::login::{CredentialType, Credentials, LoginError};
+use tutasdk::rest_error::HttpError;
 use tutasdk::services::generated::sys::CloseSessionService;
 use tutasdk::services::ExtraServiceParams;
-use tutasdk::{CustomId, GeneratedId, IdTupleCustom, LoggedInSdk, Sdk};
+use tutasdk::{ApiCallError, CustomId, GeneratedId, IdTupleCustom, LoggedInSdk, Sdk};
 
 use super::event_lookup::TutaEventLookup;
 use super::event_stream::{
@@ -63,7 +64,7 @@ impl SessionFactory for TutaSessionFactory {
             .sdk
             .login(creds)
             .await
-            .map_err(|_| Error::Login("session resume failed".into()))?;
+            .map_err(|error| resume_error(&error))?;
 
         let info = AccountInfo {
             mail_address: credentials.login.clone(),
@@ -84,6 +85,44 @@ impl SessionFactory for TutaSessionFactory {
             base_url: self.base_url.clone(),
             mail,
         }))
+    }
+}
+
+/// Map an SDK resume failure to the error the user must act on.
+///
+/// A transport failure or a server-side outage is a [`Error::Network`]: the
+/// stored session is probably still valid and retrying later is the fix. A
+/// rejected token, an expired session, or credentials that do not decrypt
+/// are a [`Error::Login`] that asks for a new login. Anything the SDK does
+/// not classify keeps the previous generic login error. The messages are
+/// fixed strings; nothing from the SDK error is echoed.
+pub fn resume_error(error: &LoginError) -> Error {
+    let unreachable = || Error::Network("session resume failed: server unreachable".into());
+    let invalid = || Error::Login("session is no longer valid; run login again".into());
+    match error {
+        LoginError::InvalidAccessToken { .. }
+        | LoginError::InvalidPassphrase { .. }
+        | LoginError::InvalidKey { .. } => invalid(),
+        LoginError::ApiCall { source } => match source {
+            ApiCallError::RestClient { .. } => unreachable(),
+            ApiCallError::ServerResponseError { source } => match source {
+                HttpError::ConnectionError
+                | HttpError::RequestTimeoutError
+                | HttpError::LockedError
+                | HttpError::TooManyRequestsError { .. }
+                | HttpError::InternalServerError
+                | HttpError::BadGatewayError
+                | HttpError::ServiceUnavailableError { .. } => unreachable(),
+                HttpError::NotAuthenticatedError
+                | HttpError::NotAuthorizedError
+                | HttpError::SessionExpiredError
+                | HttpError::AccessDeactivatedError
+                | HttpError::AccessExpiredError
+                | HttpError::AccessBlockedError => invalid(),
+                _ => Error::Login("session resume failed".into()),
+            },
+            ApiCallError::InternalSdkError { .. } => Error::Login("session resume failed".into()),
+        },
     }
 }
 
@@ -187,5 +226,88 @@ impl Session for TutaSession {
             )
             .await
             .map_err(|_| Error::Network("failed to close session".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tutasdk::bindings::rest_client::RestClientError;
+
+    use super::*;
+
+    fn http(source: HttpError) -> LoginError {
+        LoginError::ApiCall {
+            source: ApiCallError::ServerResponseError { source },
+        }
+    }
+
+    #[test]
+    fn transport_and_server_outages_are_network_errors() {
+        let offline = LoginError::ApiCall {
+            source: ApiCallError::RestClient {
+                source: RestClientError::NetworkError,
+            },
+        };
+        for error in [
+            offline,
+            http(HttpError::ConnectionError),
+            http(HttpError::RequestTimeoutError),
+            http(HttpError::InternalServerError),
+            http(HttpError::BadGatewayError),
+            http(HttpError::ServiceUnavailableError {
+                suspension_time_sec: None,
+            }),
+            http(HttpError::TooManyRequestsError {
+                suspension_time_sec: Some(3),
+            }),
+        ] {
+            let mapped = resume_error(&error);
+            assert!(matches!(mapped, Error::Network(_)), "{error:?}");
+            assert_eq!(
+                mapped.to_string(),
+                "network error: session resume failed: server unreachable"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_sessions_and_credentials_ask_for_a_new_login() {
+        for error in [
+            http(HttpError::NotAuthenticatedError),
+            http(HttpError::SessionExpiredError),
+            http(HttpError::AccessBlockedError),
+            LoginError::InvalidAccessToken {
+                error_message: "SECRET".into(),
+            },
+            LoginError::InvalidPassphrase {
+                error_message: "SECRET".into(),
+            },
+            LoginError::InvalidKey {
+                error_message: "SECRET".into(),
+            },
+        ] {
+            let mapped = resume_error(&error);
+            assert_eq!(
+                mapped.to_string(),
+                "login failed: session is no longer valid; run login again"
+            );
+        }
+    }
+
+    #[test]
+    fn unclassified_failures_keep_the_generic_login_error() {
+        for error in [
+            http(HttpError::BadRequestError),
+            LoginError::ApiCall {
+                source: ApiCallError::InternalSdkError {
+                    error_message: "SECRET".into(),
+                },
+            },
+        ] {
+            assert_eq!(
+                resume_error(&error).to_string(),
+                "login failed: session resume failed"
+            );
+        }
     }
 }
