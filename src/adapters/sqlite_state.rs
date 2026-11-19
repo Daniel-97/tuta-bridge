@@ -19,7 +19,7 @@ use crate::ports::StateStore;
 /// Opening migrates an older database forward inside one transaction and
 /// refuses a newer one: a binary that does not know a later schema must
 /// not write to it.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The database carries a schema version newer than [`SCHEMA_VERSION`].
 #[derive(Debug, thiserror::Error)]
@@ -188,6 +188,106 @@ impl SqliteStateStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(storage_error)
+    }
+
+    /// Create or refresh a mailbox on `executor` and return its id.
+    ///
+    /// A new mailbox, and one whose name changed, gets a UIDVALIDITY no
+    /// mailbox of the account has ever carried: IMAP clients key their
+    /// caches by mailbox name and UIDVALIDITY, so a folder re-created
+    /// under an old name, or renamed onto one, must never present the
+    /// pair an earlier folder used. An unchanged mailbox keeps its value
+    /// and its UID sequence. A mailbox stored with an empty name was
+    /// never addressable by name, so naming it is not a rename.
+    async fn upsert_mailbox_in(
+        &self,
+        executor: &mut SqliteConnection,
+        account_id: i64,
+        folder: &Folder,
+        uidvalidity: u32,
+    ) -> Result<MailboxId> {
+        let existing: Option<(i64, String)> = sqlx::query_as(SELECT_MAILBOX_NAME_SQL)
+            .bind(account_id)
+            .bind(&folder.list_id)
+            .fetch_optional(&mut *executor)
+            .await
+            .map_err(storage_error)?;
+
+        match existing {
+            Some((id, name)) if name == folder.name || name.is_empty() => {
+                sqlx::query(UPDATE_MAILBOX_SQL)
+                    .bind(&folder.name)
+                    .bind(folder.kind.as_db_str())
+                    .bind(id)
+                    .execute(&mut *executor)
+                    .await
+                    .map_err(storage_error)?;
+                Ok(MailboxId(id))
+            }
+            Some((id, _)) => {
+                let uidvalidity = self
+                    .allocate_uidvalidity_in(&mut *executor, account_id, uidvalidity)
+                    .await?;
+                sqlx::query(RENAME_MAILBOX_SQL)
+                    .bind(&folder.name)
+                    .bind(folder.kind.as_db_str())
+                    .bind(i64::from(uidvalidity))
+                    .bind(id)
+                    .execute(&mut *executor)
+                    .await
+                    .map_err(storage_error)?;
+                Ok(MailboxId(id))
+            }
+            None => {
+                let uidvalidity = self
+                    .allocate_uidvalidity_in(&mut *executor, account_id, uidvalidity)
+                    .await?;
+                let result = sqlx::query(INSERT_MAILBOX_SQL)
+                    .bind(account_id)
+                    .bind(&folder.list_id)
+                    .bind(&folder.name)
+                    .bind(folder.kind.as_db_str())
+                    .bind(i64::from(uidvalidity))
+                    .execute(&mut *executor)
+                    .await
+                    .map_err(storage_error)?;
+                Ok(MailboxId(result.last_insert_rowid()))
+            }
+        }
+    }
+
+    /// Reserve a UIDVALIDITY the account has never used.
+    ///
+    /// `at_least` is the caller's wall-clock suggestion. The result is
+    /// that value or the account's high-water mark plus one, whichever is
+    /// greater, and becomes the new mark; the mark lives on the account
+    /// row, so it survives deleted mailboxes and a full reset. The result
+    /// is never 0, which IMAP does not allow.
+    async fn allocate_uidvalidity_in(
+        &self,
+        executor: &mut SqliteConnection,
+        account_id: i64,
+        at_least: u32,
+    ) -> Result<u32> {
+        let floor: Option<i64> = sqlx::query_scalar(SELECT_UIDVALIDITY_FLOOR_SQL)
+            .bind(account_id)
+            .fetch_optional(&mut *executor)
+            .await
+            .map_err(storage_error)?;
+        let floor =
+            floor.ok_or_else(|| Error::Storage("account not found in state database".into()))?;
+        let next = floor
+            .checked_add(1)
+            .map(|next| next.max(i64::from(at_least)))
+            .and_then(|next| u32::try_from(next).ok())
+            .ok_or_else(|| Error::Storage("UIDVALIDITY exhausted".into()))?;
+        sqlx::query(UPDATE_UIDVALIDITY_FLOOR_SQL)
+            .bind(i64::from(next))
+            .bind(account_id)
+            .execute(&mut *executor)
+            .await
+            .map_err(storage_error)?;
+        Ok(next)
     }
 
     /// Assign a stable UID or refresh an existing header on `executor`.
@@ -359,6 +459,11 @@ async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
             sqlx::query(statement).execute(&mut *transaction).await?;
         }
     }
+    if version < 4 {
+        for statement in UIDVALIDITY_FLOOR_STATEMENTS {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+    }
 
     // The caller switched foreign keys off for the table rebuild; nothing
     // may commit with a dangling reference.
@@ -406,6 +511,17 @@ const MAILBOX_AUTOINCREMENT_STATEMENTS: &[&str] = &[
     "ALTER TABLE mailboxes_rebuilt RENAME TO mailboxes",
 ];
 
+/// v4 migration: a per-account UIDVALIDITY high-water mark.
+///
+/// The mark starts at the highest value any stored mailbox carries, so
+/// existing mailboxes keep their UIDVALIDITY and every mailbox created or
+/// renamed from now on gets a greater one.
+const UIDVALIDITY_FLOOR_STATEMENTS: &[&str] = &[
+    "ALTER TABLE accounts ADD COLUMN uidvalidity_floor INTEGER NOT NULL DEFAULT 0",
+    "UPDATE accounts SET uidvalidity_floor = COALESCE(
+        (SELECT MAX(uidvalidity) FROM mailboxes WHERE account_id = accounts.id), 0)",
+];
+
 /// v2 migration: add the metadata-only `mime_structure` column.
 ///
 /// A database created at version 1 gains the column here; its rows keep
@@ -434,14 +550,19 @@ const SELECT_ACCOUNT_ID_SQL: &str = "SELECT id FROM accounts WHERE mail_address 
 
 const INSERT_MAILBOX_SQL: &str = "\
 INSERT INTO mailboxes (account_id, list_id, name, kind, uidvalidity, next_uid)
-VALUES (?, ?, ?, ?, ?, 1)
-ON CONFLICT(account_id, list_id) DO UPDATE SET
-    name = excluded.name,
-    kind = excluded.kind";
+VALUES (?, ?, ?, ?, ?, 1)";
 
-const SELECT_MAILBOX_SQL: &str = "\
-SELECT id, account_id, list_id, name, kind, uidvalidity, next_uid
-FROM mailboxes WHERE account_id = ? AND list_id = ?";
+const SELECT_MAILBOX_NAME_SQL: &str =
+    "SELECT id, name FROM mailboxes WHERE account_id = ? AND list_id = ?";
+
+const UPDATE_MAILBOX_SQL: &str = "UPDATE mailboxes SET name = ?, kind = ? WHERE id = ?";
+
+const RENAME_MAILBOX_SQL: &str =
+    "UPDATE mailboxes SET name = ?, kind = ?, uidvalidity = ? WHERE id = ?";
+
+const SELECT_UIDVALIDITY_FLOOR_SQL: &str = "SELECT uidvalidity_floor FROM accounts WHERE id = ?";
+
+const UPDATE_UIDVALIDITY_FLOOR_SQL: &str = "UPDATE accounts SET uidvalidity_floor = ? WHERE id = ?";
 
 const SELECT_MAILBOX_ID_SQL: &str = "SELECT id FROM mailboxes WHERE account_id = ? AND list_id = ?";
 
@@ -804,24 +925,12 @@ impl StateStore for SqliteStateStore {
         folder: &Folder,
         uidvalidity: u32,
     ) -> Result<MailboxId> {
-        sqlx::query(INSERT_MAILBOX_SQL)
-            .bind(account_id)
-            .bind(&folder.list_id)
-            .bind(&folder.name)
-            .bind(folder.kind.as_db_str())
-            .bind(i64::from(uidvalidity))
-            .execute(&self.pool)
-            .await
-            .map_err(storage_error)?;
-
-        let row = sqlx::query(SELECT_MAILBOX_SQL)
-            .bind(account_id)
-            .bind(&folder.list_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| Error::Storage("mailbox missing after upsert".into()))?;
-        Ok(stored_mailbox_from_row(&row)?.id)
+        let mut transaction = self.begin_write().await?;
+        let mailbox = self
+            .upsert_mailbox_in(&mut transaction, account_id, folder, uidvalidity)
+            .await?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(mailbox)
     }
 
     async fn mailboxes(&self, account_id: i64) -> Result<Vec<StoredMailbox>> {
@@ -862,27 +971,12 @@ impl StateStore for SqliteStateStore {
                 uidvalidity,
             } = change
             {
-                let result = sqlx::query(INSERT_MAILBOX_SQL)
-                    .bind(account_id)
-                    .bind(&folder.list_id)
-                    .bind(&folder.name)
-                    .bind(folder.kind.as_db_str())
-                    .bind(i64::from(*uidvalidity))
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
-                let mailbox = sqlx::query_scalar(SELECT_MAILBOX_ID_SQL)
-                    .bind(account_id)
-                    .bind(&folder.list_id)
-                    .fetch_optional(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?
-                    .ok_or_else(|| Error::Storage("mailbox missing after upsert".into()))?;
-                // The statement either created the row or ran its
-                // DO UPDATE; both count as a change.
-                if result.rows_affected() > 0 {
-                    touch_mailbox(&mut touched, MailboxId(mailbox));
-                }
+                let mailbox = self
+                    .upsert_mailbox_in(&mut transaction, account_id, folder, *uidvalidity)
+                    .await?;
+                // The upsert either created the row or refreshed its
+                // name and kind; both count as a change.
+                touch_mailbox(&mut touched, mailbox);
             }
         }
 
@@ -1222,7 +1316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_mailbox_updates_name_and_kind_without_touching_uid_state() {
+    async fn upsert_mailbox_updates_kind_without_touching_uid_state() {
         let store = SqliteStateStore::open_in_memory().await.unwrap();
         let (account, mailbox) = account_and_mailbox(&store).await;
         assert_eq!(
@@ -1236,7 +1330,7 @@ mod tests {
         let again = store
             .upsert_mailbox(
                 account,
-                &folder("entries", "Renamed", FolderKind::Archive),
+                &folder("entries", "Inbox", FolderKind::Archive),
                 999,
             )
             .await
@@ -1246,10 +1340,131 @@ mod tests {
         let boxes = store.mailboxes(account).await.unwrap();
         assert_eq!(boxes.len(), 1);
         assert_eq!(boxes[0].id, mailbox);
-        assert_eq!(boxes[0].name, "Renamed");
+        assert_eq!(boxes[0].name, "Inbox");
         assert_eq!(boxes[0].kind, FolderKind::Archive);
         assert_eq!(boxes[0].uidvalidity, 100);
         assert_eq!(boxes[0].next_uid, 2);
+    }
+
+    #[tokio::test]
+    async fn every_mailbox_gets_its_own_uidvalidity() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (account, first) = account_and_mailbox(&store).await;
+        // The same requested value, as one sync hands to every folder.
+        let second = store
+            .upsert_mailbox(account, &folder("other", "Other", FolderKind::Custom), 100)
+            .await
+            .unwrap();
+        // An older requested value never goes below the high-water mark.
+        let third = store
+            .upsert_mailbox(account, &folder("third", "Third", FolderKind::Custom), 5)
+            .await
+            .unwrap();
+
+        let validity = |boxes: &[StoredMailbox], id: MailboxId| {
+            boxes
+                .iter()
+                .find(|mailbox| mailbox.id == id)
+                .map(|mailbox| mailbox.uidvalidity)
+                .unwrap()
+        };
+        let boxes = store.mailboxes(account).await.unwrap();
+        assert_eq!(validity(&boxes, first), 100);
+        assert_eq!(validity(&boxes, second), 101);
+        assert_eq!(validity(&boxes, third), 102);
+    }
+
+    #[tokio::test]
+    async fn renaming_a_mailbox_gives_it_a_fresh_uidvalidity_and_keeps_its_uids() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (account, old_a) = account_and_mailbox(&store).await;
+        let b = store
+            .upsert_mailbox(account, &folder("b", "B", FolderKind::Custom), 100)
+            .await
+            .unwrap();
+        store.assign_uid(b, &header("mail", "e1")).await.unwrap();
+        let before = store.mailboxes(account).await.unwrap();
+
+        // Folder "Inbox" is deleted and "B" is renamed onto its name.
+        store.remove_mailbox(account, old_a).await.unwrap();
+        let renamed = store
+            .upsert_mailbox(account, &folder("b", "Inbox", FolderKind::Custom), 100)
+            .await
+            .unwrap();
+        assert_eq!(renamed, b);
+
+        let after = store.mailboxes(account).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].name, "Inbox");
+        // The name "Inbox" never shows a UIDVALIDITY it had before.
+        assert!(before
+            .iter()
+            .all(|mailbox| mailbox.uidvalidity != after[0].uidvalidity));
+        // The messages and the UID sequence are untouched.
+        assert_eq!(after[0].next_uid, 2);
+        assert_eq!(store.messages(b).await.unwrap()[0].uid, 1);
+    }
+
+    #[tokio::test]
+    async fn a_recreated_mailbox_never_repeats_a_uidvalidity() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        // One watch run stamps every folder event with the same value.
+        let event_uidvalidity = 700;
+        let changes = |list_id: &str| {
+            vec![StateChange::UpsertMailbox {
+                folder: folder(list_id, "Tmp", FolderKind::Custom),
+                uidvalidity: event_uidvalidity,
+            }]
+        };
+
+        store
+            .apply_batch(account, "group", "batch-1", &changes("tmp-1"))
+            .await
+            .unwrap();
+        let first = store.mailboxes(account).await.unwrap()[0].clone();
+        store.remove_mailbox(account, first.id).await.unwrap();
+
+        // The folder is created again under the same name.
+        store
+            .apply_batch(account, "group", "batch-2", &changes("tmp-2"))
+            .await
+            .unwrap();
+        let second = store.mailboxes(account).await.unwrap()[0].clone();
+        assert_eq!(second.name, first.name);
+        assert_ne!(second.uidvalidity, first.uidvalidity);
+
+        // A full reset does not forget the values already used either.
+        store.reset_account(account).await.unwrap();
+        store
+            .apply_batch(account, "group", "batch-3", &changes("tmp-3"))
+            .await
+            .unwrap();
+        let third = store.mailboxes(account).await.unwrap()[0].clone();
+        assert!(third.uidvalidity > second.uidvalidity);
+    }
+
+    #[tokio::test]
+    async fn migrated_mailboxes_keep_their_uidvalidity_and_new_ones_get_a_higher_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        version_two_database(&path).await;
+        let store = SqliteStateStore::open(&path).await.unwrap();
+
+        // A sync with an older requested value still lands above every
+        // value the legacy mailboxes share.
+        let created = store
+            .upsert_mailbox(1, &folder("entries-c", "New", FolderKind::Custom), 50)
+            .await
+            .unwrap();
+        let validities: Vec<(i64, u32)> = store
+            .mailboxes(1)
+            .await
+            .unwrap()
+            .iter()
+            .map(|mailbox| (mailbox.id.0, mailbox.uidvalidity))
+            .collect();
+        assert_eq!(validities, vec![(1, 100), (2, 100), (created.0, 101)]);
     }
 
     #[tokio::test]
@@ -2257,18 +2472,15 @@ mod tests {
         let path = dir.path().join("state.sqlite3");
         // A database that predates version stamping: tables exist, but
         // `user_version` is still 0.
+        version_two_database(&path).await;
         {
-            let store = SqliteStateStore::open(&path).await.unwrap();
-            let (_account, mailbox) = account_and_mailbox(&store).await;
-            store
-                .assign_uid(mailbox, &header("entries", "e1"))
-                .await
-                .unwrap();
+            let options = SqliteConnectOptions::new().filename(&path);
+            let pool = pool_options().connect_with(options).await.unwrap();
             sqlx::query("PRAGMA user_version = 0")
-                .execute(store.pool())
+                .execute(&pool)
                 .await
                 .unwrap();
-            store.pool().close().await;
+            pool.close().await;
         }
 
         let store = SqliteStateStore::open(&path).await.unwrap();
@@ -2279,9 +2491,9 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         let account = store.upsert_account("owner@example.invalid").await.unwrap();
         let mailboxes = store.mailboxes(account).await.unwrap();
-        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes.len(), 2);
         assert_eq!(mailboxes[0].uidvalidity, 100);
-        assert_eq!(mailboxes[0].next_uid, 2);
+        assert_eq!(mailboxes[0].next_uid, 8);
         assert_eq!(store.messages(mailboxes[0].id).await.unwrap().len(), 1);
     }
 

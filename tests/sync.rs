@@ -90,12 +90,27 @@ async fn sync_is_idempotent() {
     assert_eq!(uid(&store, &sent, "s1"), 1);
     let mailboxes = store.mailboxes(ACCOUNT_ID).await.unwrap();
     assert_eq!(mailboxes.len(), 2);
-    assert!(mailboxes
+    // Every mailbox gets its own UIDVALIDITY, starting at the requested one.
+    let validities: Vec<u32> = mailboxes
         .iter()
-        .all(|mailbox| mailbox.uidvalidity == UIDVALIDITY));
+        .map(|mailbox| mailbox.uidvalidity)
+        .collect();
+    assert_eq!(validities, vec![UIDVALIDITY, UIDVALIDITY + 1]);
 
-    let second = engine.sync(ACCOUNT_ID, &source, UIDVALIDITY).await.unwrap();
+    // A later sync asks for a newer value; stored mailboxes keep theirs.
+    let second = engine
+        .sync(ACCOUNT_ID, &source, UIDVALIDITY + 500)
+        .await
+        .unwrap();
     assert_eq!(second, first);
+    let after: Vec<u32> = store
+        .mailboxes(ACCOUNT_ID)
+        .await
+        .unwrap()
+        .iter()
+        .map(|mailbox| mailbox.uidvalidity)
+        .collect();
+    assert_eq!(after, validities);
     assert_eq!(uid(&store, &inbox, "e1"), 1);
     assert_eq!(uid(&store, &inbox, "e2"), 2);
     assert_eq!(uid(&store, &sent, "s1"), 1);

@@ -126,6 +126,8 @@ pub struct FakeStateStore {
     pub last_batches: Mutex<HashMap<(i64, String), String>>,
     next_account_id: Mutex<i64>,
     next_mailbox_id: Mutex<i64>,
+    /// Highest UIDVALIDITY ever handed out per account.
+    uidvalidity_floors: Mutex<HashMap<i64, u32>>,
 }
 
 impl FakeStateStore {
@@ -138,6 +140,7 @@ impl FakeStateStore {
             last_batches: Mutex::new(HashMap::new()),
             next_account_id: Mutex::new(1),
             next_mailbox_id: Mutex::new(1),
+            uidvalidity_floors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -173,6 +176,16 @@ impl FakeStateStore {
             .collect()
     }
 
+    /// Reserve a UIDVALIDITY the account never used: `at_least` or the
+    /// account's high-water mark plus one, whichever is greater. The mark
+    /// survives removed mailboxes and `reset_account`.
+    fn allocate_uidvalidity(&self, account_id: i64, at_least: u32) -> u32 {
+        let mut floors = self.uidvalidity_floors.lock().unwrap();
+        let floor = floors.entry(account_id).or_insert(0);
+        *floor = at_least.max(*floor + 1);
+        *floor
+    }
+
     /// Upsert without recording a call, shared by `upsert_mailbox` and
     /// `apply_batch`.
     fn upsert_mailbox_entry(
@@ -184,10 +197,15 @@ impl FakeStateStore {
         let key = (account_id, folder.list_id.clone());
         let mut mailboxes = self.mailboxes.lock().unwrap();
         if let Some(mailbox) = mailboxes.get_mut(&key) {
+            // A rename gets a fresh UIDVALIDITY, like the SQLite adapter.
+            if mailbox.name != folder.name && !mailbox.name.is_empty() {
+                mailbox.uidvalidity = self.allocate_uidvalidity(account_id, uidvalidity);
+            }
             mailbox.name = folder.name.clone();
             mailbox.kind = folder.kind.clone();
             return mailbox.id;
         }
+        let uidvalidity = self.allocate_uidvalidity(account_id, uidvalidity);
         let mut next_mailbox_id = self.next_mailbox_id.lock().unwrap();
         let mailbox = StoredMailbox {
             id: MailboxId(*next_mailbox_id),

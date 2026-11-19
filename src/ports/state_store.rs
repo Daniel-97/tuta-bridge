@@ -6,6 +6,13 @@ use crate::domain::{
 #[async_trait::async_trait]
 pub trait StateStore: Send + Sync {
     async fn upsert_account(&self, mail_address: &str) -> Result<i64>;
+    /// Create or refresh the mailbox of `folder`.
+    ///
+    /// `uidvalidity` is a lower bound, not the stored value: a new
+    /// mailbox, and one whose name changed, gets a UIDVALIDITY greater
+    /// than any the account ever used and at least `uidvalidity`; an
+    /// unchanged mailbox keeps its value and its UIDs. A name and
+    /// UIDVALIDITY pair therefore never denotes two different mailboxes.
     async fn upsert_mailbox(
         &self,
         account_id: i64,

@@ -41,6 +41,8 @@ pub struct MailPlacement {
 #[allow(clippy::large_enum_variant)]
 pub enum StateChange {
     /// Create or update a folder, preserving the existing UID sequence.
+    /// `uidvalidity` is a lower bound for a new or renamed folder; the
+    /// store raises it so no two folders of an account ever share one.
     UpsertMailbox { folder: Folder, uidvalidity: u32 },
     /// Add or refresh a mail's placement in the mailbox named by
     /// `mailbox_list_id` (the folder's entries list id). The header's own
