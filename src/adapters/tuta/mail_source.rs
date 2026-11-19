@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -153,6 +154,52 @@ pub fn resolve_folder<'a>(folders: &'a [Folder], requested: &str) -> Result<&'a 
     Err(Error::FolderNotFound(requested.to_string()))
 }
 
+/// Entries requested per range load: the page size the SDK's own `load_all`
+/// uses, so it is a count the server is known to accept.
+pub const ENTRY_PAGE_SIZE: usize = 1000;
+
+/// Load up to `limit` list elements in pages of at most `page_size`.
+///
+/// `load(start, count)` returns the elements after `start`; `id_of` yields
+/// the cursor of an element. Paging stops at `limit`, at a short or empty
+/// page (the end of the list), or — defensively — when the cursor stops
+/// advancing, so a misbehaving server cannot loop it forever. An element
+/// without a cursor in a full page is an error: the rest of the list would
+/// otherwise be dropped silently.
+pub async fn load_paged<T, F, Fut>(
+    limit: usize,
+    page_size: usize,
+    start: String,
+    mut load: F,
+    id_of: impl Fn(&T) -> Option<String>,
+) -> Result<Vec<T>>
+where
+    F: FnMut(String, usize) -> Fut,
+    Fut: Future<Output = Result<Vec<T>>>,
+{
+    let mut items: Vec<T> = Vec::new();
+    let mut cursor = start;
+    while items.len() < limit && page_size > 0 {
+        let count = (limit - items.len()).min(page_size);
+        let page = load(cursor.clone(), count).await?;
+        let full = page.len() >= count;
+        let next = page.last().map(&id_of);
+        items.extend(page);
+        if !full {
+            break;
+        }
+        match next {
+            Some(Some(next)) if next != cursor => cursor = next,
+            Some(None) if items.len() < limit => {
+                return Err(Error::Network("failed to load message entries".into()))
+            }
+            _ => break,
+        }
+    }
+    items.truncate(limit);
+    Ok(items)
+}
+
 /// Tuta implementation of the mail source: lists folders and message summaries.
 pub struct TutaMailSource {
     logged: Arc<LoggedInSdk>,
@@ -266,14 +313,11 @@ impl MailSource for TutaMailSource {
             .load_user_mailbox()
             .await
             .map_err(|_| Error::Network("failed to load mailbox".into()))?;
+        // `load_all` pages through the whole list: labels are MailSets too,
+        // so a single fixed-size range would silently drop folders.
         let sets: Vec<MailSet> = mail_facade
             .get_crypto_entity_client()
-            .load_range(
-                &mailbox.mailSets.mailSets,
-                &GeneratedId::min_id(),
-                100,
-                ListLoadDirection::ASC,
-            )
+            .load_all(&mailbox.mailSets.mailSets, ListLoadDirection::ASC)
             .await
             .map_err(|_| Error::Network("failed to load folders".into()))?;
 
@@ -288,15 +332,29 @@ impl MailSource for TutaMailSource {
         // A mail set's `entries` list contains MailSetEntry elements, each of
         // which references the actual Mail. Loading Mail directly from that
         // list returns an empty page.
-        let entries: Vec<MailSetEntry> = crypto_client
-            .load_range(
-                &GeneratedId(folder.list_id.clone()),
-                &CustomId(GeneratedId::max_id().to_string()),
-                limit,
-                ListLoadDirection::DESC,
-            )
-            .await
-            .map_err(|_| Error::Network("failed to load message entries".into()))?;
+        let list_id = GeneratedId(folder.list_id.clone());
+        let entries: Vec<MailSetEntry> = load_paged(
+            limit,
+            ENTRY_PAGE_SIZE,
+            GeneratedId::max_id().to_string(),
+            |start, count| {
+                let crypto_client = Arc::clone(&crypto_client);
+                let list_id = list_id.clone();
+                async move {
+                    crypto_client
+                        .load_range::<MailSetEntry, _>(
+                            &list_id,
+                            &CustomId(start),
+                            count,
+                            ListLoadDirection::DESC,
+                        )
+                        .await
+                        .map_err(|_| Error::Network("failed to load message entries".into()))
+                }
+            },
+            |entry: &MailSetEntry| entry._id.as_ref().map(|id| id.element_id.0.clone()),
+        )
+        .await?;
 
         let mut mails = Vec::with_capacity(entries.len());
         for entry in entries {
