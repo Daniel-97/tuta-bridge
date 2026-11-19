@@ -40,7 +40,11 @@
 //!   credentials, and argument vectors never reach a log line, and no
 //!   `Debug` printing exists for the types that carry them.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use secrecy::SecretString;
 use tokio::io::{
@@ -48,6 +52,7 @@ use tokio::io::{
     BufReader, BufWriter,
 };
 use tokio::sync::broadcast;
+use tokio::time::{sleep, sleep_until, timeout_at, Instant, Sleep};
 
 use super::codec::{self, BodySection, FetchItem, ImapArg, Request};
 use super::render;
@@ -63,9 +68,18 @@ use crate::ports::mailbox_events::MailboxChanged;
 /// LOGIN is always available.
 const CAPABILITIES: &str = "IMAP4rev1 IDLE ID";
 
+/// The text of the connection's own io error.
+const IO_FAILED: &str = "imap connection io failed";
+
 /// A fixed io error: connection failures carry no client data.
 fn io_failed(_: std::io::Error) -> Error {
-    Error::Network("imap connection io failed".into())
+    Error::Network(IO_FAILED.into())
+}
+
+/// Whether `error` is the connection failing rather than a command
+/// failing: nothing more can be said to this client.
+fn connection_failed(error: &Error) -> bool {
+    matches!(error, Error::Network(message) if message == IO_FAILED)
 }
 
 /// Bodies are written through the response writer in chunks of this
@@ -84,6 +98,101 @@ const MAX_LITERAL_BYTES: usize = 16 * 1024 * 1024;
 /// whole. Message bodies arrive through literals, never through a
 /// line.
 const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// The untagged BYE a connection that waited too long is closed with.
+const TIMEOUT_BYE: &str = "* BYE idle for too long; closing connection";
+
+/// The time bounds of one connection. Every wait on the client is
+/// bounded, so an unresponsive or hostile peer costs one task for a
+/// limited time and nothing more.
+#[derive(Clone)]
+pub struct SessionLimits {
+    /// How long a connection may stay unauthenticated, measured from
+    /// the greeting — the whole phase, not each command, so trickling
+    /// bytes buys nothing.
+    pub pre_auth_timeout: Duration,
+    /// How long an authenticated session may wait for its next command,
+    /// and how long one IDLE may run. RFC 3501 §5.4 requires at least
+    /// 30 minutes of inactivity before an autologout, and RFC 2177 has
+    /// clients re-issue IDLE at least every 29 minutes for that reason.
+    pub idle_timeout: Duration,
+    /// How long one write may make no progress: a client that stops
+    /// reading its socket ends the session instead of pinning it.
+    pub write_timeout: Duration,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self {
+            pre_auth_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(30 * 60),
+            write_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// A writer whose every operation fails once it has made no progress
+/// for `limit`: the peer is not reading, and the session ends on the
+/// io error.
+struct StallGuard<W> {
+    inner: W,
+    limit: Duration,
+    /// Armed while an operation is pending; reset on every progress.
+    stalled: Option<Pin<Box<Sleep>>>,
+}
+
+impl<W> StallGuard<W> {
+    fn new(inner: W, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            stalled: None,
+        }
+    }
+
+    /// Fold the stall timer into one poll result: progress disarms it,
+    /// a pending operation arms it (once) and fails when it fires.
+    fn guard<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        polled: Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        if polled.is_ready() {
+            self.stalled = None;
+            return polled;
+        }
+        let limit = self.limit;
+        let timer = self.stalled.get_or_insert_with(|| Box::pin(sleep(limit)));
+        match timer.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                self.stalled = None;
+                Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for StallGuard<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.guard(cx, polled)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        self.guard(cx, polled)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.guard(cx, polled)
+    }
+}
 
 /// The untagged BYE a stale snapshot sends before closing.
 const RESYNC_BYE: &str = "* BYE mailbox state was resynced; reconnect";
@@ -133,6 +242,7 @@ struct Session {
     state: State,
     backend: Arc<dyn ImapBackend>,
     watch: broadcast::Receiver<MailboxChanged>,
+    limits: SessionLimits,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,29 +250,49 @@ struct Session {
 // ---------------------------------------------------------------------------
 
 /// Serve one IMAP session over `stream` until the client logs out, the
-/// snapshot goes stale, or the stream ends.
+/// snapshot goes stale, a time bound of `limits` runs out, or the
+/// stream ends.
 pub async fn run_session<S>(
     stream: S,
     backend: Arc<dyn ImapBackend>,
     watch: broadcast::Receiver<MailboxChanged>,
+    limits: SessionLimits,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, writer) = split(stream);
     let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
+    let mut writer = BufWriter::new(StallGuard::new(writer, limits.write_timeout));
+    let pre_auth_deadline = Instant::now() + limits.pre_auth_timeout;
     let mut session = Session {
         state: State::NotAuthenticated,
         backend,
         watch,
+        limits,
     };
 
     write_line(&mut writer, &greeting()).await?;
     writer.flush().await.map_err(io_failed)?;
 
     loop {
-        match read_request(&mut reader, &mut writer).await? {
+        // Every wait for a command is bounded: the whole
+        // unauthenticated phase by one deadline, each later command by
+        // the inactivity timeout.
+        let deadline = if session.state.authenticated() {
+            Instant::now() + session.limits.idle_timeout
+        } else {
+            pre_auth_deadline
+        };
+        let incoming = match timeout_at(deadline, read_request(&mut reader, &mut writer)).await {
+            Ok(incoming) => incoming?,
+            Err(_) => {
+                tracing::debug!("connection timed out waiting for a command");
+                write_line(&mut writer, TIMEOUT_BYE).await?;
+                break;
+            }
+        };
+        match incoming {
             Incoming::Eof => break,
             Incoming::Invalid(tag) => {
                 write_line(&mut writer, &format!("{tag} BAD invalid command")).await?;
@@ -529,6 +659,9 @@ impl Session {
         let flow = self.dispatch_command(writer, &tag, &verb, &args).await;
         match flow {
             Ok(flow) => Ok(flow),
+            // A dead or stalled connection is not answered: a second
+            // write would only wait out the same timeout again.
+            Err(error) if connection_failed(&error) => Err(error),
             Err(error) => {
                 let text = match &error {
                     Error::Unsupported(message) => message.clone(),
@@ -1167,8 +1300,18 @@ impl Session {
         // Whether the watcher can still fire; once every sender is gone
         // only the command reader is left to wait on.
         let mut watching = true;
+        // One IDLE runs for the inactivity timeout at most, however
+        // many updates it carries: RFC 2177 has clients re-issue IDLE
+        // at least every 29 minutes so that this never fires on a live
+        // one.
+        let deadline = Instant::now() + self.limits.idle_timeout;
         loop {
             tokio::select! {
+                () = sleep_until(deadline) => {
+                    tracing::debug!("connection timed out in idle");
+                    write_line(writer, TIMEOUT_BYE).await?;
+                    return Ok(Flow::Close);
+                }
                 changed = self.watch.recv(), if watching => {
                     match changed {
                         Ok(MailboxChanged(changed)) if changed == mailbox => {

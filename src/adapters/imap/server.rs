@@ -10,18 +10,24 @@
 //!
 //! Hygiene: the certificate provider is pinned explicitly (this
 //! dependency graph compiles two crypto providers, so the process default
-//! is ambiguous), failures close one connection at most, and nothing
-//! logs peer data or file contents.
+//! is ambiguous), failures close one connection at most — a failed
+//! `accept` included — the number of live connections and the time a
+//! handshake may take are bounded, and nothing logs peer data or file
+//! contents.
 
 use std::fs;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
-use super::session::run_session;
+use super::session::{run_session, SessionLimits};
 use crate::domain::{Error, Result};
 use crate::ports::imap_backend::ImapBackend;
 use crate::ports::mailbox_events::MailboxEventSender;
@@ -132,37 +138,100 @@ pub fn tls_acceptor(cert_pem: &str, key_pem: &str) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// The TLS-only loopback accept loop.
+/// The bounds of the accept loop and of every connection it serves.
+#[derive(Clone)]
+pub struct ServeLimits {
+    /// Connections served at once, handshakes included. At the cap the
+    /// listener is not polled: further clients wait in the kernel's
+    /// backlog instead of costing a task and a descriptor each.
+    pub max_connections: usize,
+    /// How long a client may take to complete the TLS handshake.
+    pub handshake_timeout: Duration,
+    /// The pause after a failed `accept` before the next attempt, so a
+    /// persistent failure (descriptor exhaustion) cannot spin.
+    pub accept_retry_delay: Duration,
+    /// The time bounds of each session.
+    pub session: SessionLimits,
+}
+
+impl Default for ServeLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            handshake_timeout: Duration::from_secs(10),
+            accept_retry_delay: Duration::from_secs(1),
+            session: SessionLimits::default(),
+        }
+    }
+}
+
+/// A source of incoming connections: the loopback listener in
+/// production, an in-memory one in tests.
+pub trait Accept {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+
+    fn accept(&mut self) -> impl Future<Output = std::io::Result<Self::Stream>> + Send;
+}
+
+impl Accept for TcpListener {
+    type Stream = TcpStream;
+
+    async fn accept(&mut self) -> std::io::Result<TcpStream> {
+        TcpListener::accept(self)
+            .await
+            .map(|(stream, _peer)| stream)
+    }
+}
+
+/// The TLS-only accept loop. It runs until it is dropped.
 ///
 /// One `watch.subscribe()` receiver is created per connection, so every
 /// session sees the notifications published while it lives. A failed
-/// handshake or a session error ends that one connection; the loop ends
-/// only when the listener fails.
-pub async fn serve(
-    listener: TcpListener,
+/// handshake, a handshake that takes too long, or a session error ends
+/// that one connection. A failed `accept` ends nothing: it is logged
+/// and retried after a pause, because the usual causes — the process
+/// out of descriptors, a client that reset before being accepted — are
+/// transient and must not take the bridge down.
+pub async fn serve<A: Accept>(
+    mut listener: A,
     tls: TlsAcceptor,
     backend: Arc<dyn ImapBackend>,
     watch: MailboxEventSender,
-) -> Result<()> {
+    limits: ServeLimits,
+) {
+    let slots = Arc::new(Semaphore::new(limits.max_connections));
     loop {
-        let (stream, _peer) = listener.accept().await.map_err(accept_failed)?;
+        // A free slot first, then a connection for it.
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            return;
+        };
+        let stream = match listener.accept().await {
+            Ok(stream) => stream,
+            Err(_) => {
+                tracing::warn!("imap accept failed; retrying");
+                drop(slot);
+                tokio::time::sleep(limits.accept_retry_delay).await;
+                continue;
+            }
+        };
         let tls = tls.clone();
         let backend = Arc::clone(&backend);
         let watch = watch.subscribe();
+        let handshake_timeout = limits.handshake_timeout;
+        let session_limits = limits.session.clone();
         tokio::spawn(async move {
-            match tls.accept(stream).await {
-                Ok(tls_stream) => {
-                    let _ = run_session(tls_stream, backend, watch).await;
+            // The slot is held until the connection is over.
+            let _slot = slot;
+            match tokio::time::timeout(handshake_timeout, tls.accept(stream)).await {
+                Ok(Ok(tls_stream)) => {
+                    let _ = run_session(tls_stream, backend, watch, session_limits).await;
                 }
-                Err(_) => tracing::debug!("tls handshake failed"),
+                Ok(Err(_)) => tracing::debug!("tls handshake failed"),
+                Err(_) => tracing::debug!("tls handshake timed out"),
             }
             tracing::debug!("connection ended");
         });
     }
-}
-
-fn accept_failed(_: std::io::Error) -> Error {
-    Error::Network("listener accept failed".into())
 }
 
 #[cfg(test)]

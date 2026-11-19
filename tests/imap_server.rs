@@ -14,11 +14,15 @@
 mod support;
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::broadcast;
-use tuta_bridge::adapters::imap::server::{ensure_certificate, serve, tls_acceptor};
-use tuta_bridge::adapters::imap::session::run_session;
+use tokio::io::{split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::Instant;
+use tuta_bridge::adapters::imap::server::{
+    ensure_certificate, serve, tls_acceptor, Accept, ServeLimits,
+};
+use tuta_bridge::adapters::imap::session::{run_session, SessionLimits};
 use tuta_bridge::domain::{MailboxId, Result};
 use tuta_bridge::ports::imap_backend::ImapBackend;
 use tuta_bridge::ports::mailbox_events::MailboxChanged;
@@ -114,12 +118,26 @@ async fn spawn_session(
     tokio::task::JoinHandle<Result<()>>,
     broadcast::Sender<MailboxChanged>,
 ) {
+    spawn_session_with(backend, capacity, SessionLimits::default()).await
+}
+
+/// [`spawn_session`] with explicit limits.
+async fn spawn_session_with(
+    backend: Arc<FakeImapBackend>,
+    capacity: usize,
+    limits: SessionLimits,
+) -> (
+    DuplexWire,
+    tokio::task::JoinHandle<Result<()>>,
+    broadcast::Sender<MailboxChanged>,
+) {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sender, _) = broadcast::channel(capacity);
     let session = tokio::spawn(run_session(
         server,
         Arc::clone(&backend) as Arc<dyn ImapBackend>,
         sender.subscribe(),
+        limits,
     ));
     let (reader, writer) = split(client);
     (
@@ -1103,6 +1121,251 @@ async fn state_inappropriate_commands_answer_bad() {
 }
 
 // ---------------------------------------------------------------------------
+// Time bounds (paused clock: no test waits on a real timeout)
+// ---------------------------------------------------------------------------
+
+const TIMEOUT_BYE: &str = "* BYE idle for too long; closing connection";
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_connection_is_closed_at_its_deadline() {
+    let limits = SessionLimits::default();
+    let allowed = limits.pre_auth_timeout;
+    let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
+    let started = Instant::now();
+    wire.expect(GREETING).await;
+
+    // Commands do not extend the deadline: it bounds the whole phase,
+    // so a client trickling input gains nothing.
+    tokio::time::sleep(allowed / 2).await;
+    wire.send("a1 NOOP").await;
+    wire.expect("a1 OK NOOP completed").await;
+    wire.expect(TIMEOUT_BYE).await;
+    assert_eq!(started.elapsed(), allowed);
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_authenticated_session_times_out_only_after_long_inactivity() {
+    let limits = SessionLimits::default();
+    let (pre_auth, idle) = (limits.pre_auth_timeout, limits.idle_timeout);
+    assert!(idle >= Duration::from_secs(30 * 60), "RFC 3501 §5.4");
+    let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
+    login(&mut wire).await;
+
+    // Past the unauthenticated deadline the session is still served,
+    // and every command restarts the inactivity clock.
+    tokio::time::sleep(pre_auth * 2).await;
+    wire.send("a2 NOOP").await;
+    wire.expect("a2 OK NOOP completed").await;
+    let last_command = Instant::now();
+    wire.expect(TIMEOUT_BYE).await;
+    assert_eq!(last_command.elapsed(), idle);
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_runs_for_the_inactivity_timeout_at_most() {
+    let limits = SessionLimits::default();
+    let idle = limits.idle_timeout;
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session_with(Arc::clone(&scripted), 16, limits).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    let idling_since = Instant::now();
+
+    // A 29-minute IDLE, as RFC 2177 clients run them, is never cut,
+    // and updates keep flowing through it.
+    tokio::time::sleep(Duration::from_secs(29 * 60)).await;
+    scripted.add_message("Inbox", 4);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* 3 EXISTS").await;
+
+    // Updates do not extend it: a client that never re-issues IDLE
+    // is logged off when the timeout is reached.
+    wire.expect(TIMEOUT_BYE).await;
+    assert_eq!(idling_since.elapsed(), idle);
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_client_that_stops_reading_ends_its_session() {
+    // More body than the 64 KiB duplex buffer holds, and a client that
+    // never reads it: the write stalls, and the session ends on the
+    // write timeout instead of staying parked forever.
+    let scripted = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_fetch(
+                1,
+                FakeFetched {
+                    body: vec![b'x'; 200_000],
+                    ..bare_fetch()
+                },
+            ),
+    );
+    let limits = SessionLimits::default();
+    let allowed = limits.write_timeout;
+    let (mut wire, session, _) = spawn_session_with(scripted, 16, limits).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("a4 FETCH 1 (BODY.PEEK[])").await;
+    let stalled_since = Instant::now();
+
+    let outcome = session.await.unwrap();
+    assert!(outcome.is_err(), "a stalled write must end the session");
+    assert_eq!(stalled_since.elapsed(), allowed);
+}
+
+// ---------------------------------------------------------------------------
+// Accept loop
+// ---------------------------------------------------------------------------
+
+/// An in-memory listener: the test hands it connections — or accept
+/// errors — through a channel.
+struct ChannelListener(mpsc::UnboundedReceiver<std::io::Result<DuplexStream>>);
+
+impl Accept for ChannelListener {
+    type Stream = DuplexStream;
+
+    async fn accept(&mut self) -> std::io::Result<DuplexStream> {
+        match self.0.recv().await {
+            Some(accepted) => accepted,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// The accept loop over an in-memory listener, with the production
+/// certificate machinery and a test-only accept-all TLS client.
+struct ServeHarness {
+    incoming: mpsc::UnboundedSender<std::io::Result<DuplexStream>>,
+    connector: tokio_rustls::TlsConnector,
+    _dir: tempfile::TempDir,
+}
+
+type TlsWire = Wire<
+    tokio::io::ReadHalf<tokio_rustls::client::TlsStream<DuplexStream>>,
+    tokio::io::WriteHalf<tokio_rustls::client::TlsStream<DuplexStream>>,
+>;
+
+impl ServeHarness {
+    fn start(limits: ServeLimits) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = ensure_certificate(dir.path()).unwrap();
+        let tls = tls_acceptor(&cert_pem, &key_pem).unwrap();
+        let (incoming, accepted) = mpsc::unbounded_channel();
+        let (sender, _) = broadcast::channel(16);
+        tokio::spawn(serve(
+            ChannelListener(accepted),
+            tls,
+            backend() as Arc<dyn ImapBackend>,
+            sender,
+            limits,
+        ));
+        Self {
+            incoming,
+            connector: accept_all_connector(),
+            _dir: dir,
+        }
+    }
+
+    /// Hand the listener one connection and return the client's end.
+    fn dial(&self) -> DuplexStream {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        self.incoming.send(Ok(server)).unwrap();
+        client
+    }
+
+    /// Connect a TLS client and read the greeting.
+    async fn connect(&self) -> TlsWire {
+        greeted(self.connector.clone(), self.dial()).await
+    }
+}
+
+/// Complete the TLS handshake over `stream` and read the greeting.
+async fn greeted(connector: tokio_rustls::TlsConnector, stream: DuplexStream) -> TlsWire {
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+    let tls_client = connector.connect(server_name, stream).await.unwrap();
+    let (reader, writer) = split(tls_client);
+    let mut wire = Wire {
+        reader: BufReader::new(reader),
+        writer,
+    };
+    wire.expect(GREETING).await;
+    wire
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_accept_does_not_end_the_accept_loop() {
+    let limits = ServeLimits::default();
+    let pause = limits.accept_retry_delay;
+    let harness = ServeHarness::start(limits);
+
+    // The listener fails twice — out of descriptors, say — and the
+    // loop is still there for the next client, after one pause each.
+    let started = Instant::now();
+    for _ in 0..2 {
+        harness
+            .incoming
+            .send(Err(std::io::Error::other("too many open files")))
+            .unwrap();
+    }
+    let mut wire = harness.connect().await;
+    assert_eq!(started.elapsed(), pause * 2);
+    wire.send("a1 LOGOUT").await;
+    wire.expect("* BYE tuta-bridge signing off").await;
+    wire.expect("a1 OK LOGOUT completed").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_client_is_dropped_at_the_handshake_timeout() {
+    let limits = ServeLimits::default();
+    let allowed = limits.handshake_timeout;
+    let harness = ServeHarness::start(limits);
+
+    // Connected, and then nothing: no ClientHello ever arrives.
+    let mut silent = harness.dial();
+    let started = Instant::now();
+    let mut probe = [0u8; 1];
+    assert_eq!(silent.read(&mut probe).await.unwrap(), 0);
+    assert_eq!(started.elapsed(), allowed);
+
+    // The loop serves the next client as usual.
+    harness.connect().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn connections_beyond_the_cap_wait_for_a_free_slot() {
+    let harness = ServeHarness::start(ServeLimits {
+        max_connections: 2,
+        ..ServeLimits::default()
+    });
+    let mut first = harness.connect().await;
+    let _second = harness.connect().await;
+
+    // A third client is not served while both slots are taken …
+    let third = tokio::spawn(greeted(harness.connector.clone(), harness.dial()));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!third.is_finished(), "the cap must hold the third client");
+
+    // … and is served as soon as one of them ends.
+    first.send("a1 LOGOUT").await;
+    first.expect("* BYE tuta-bridge signing off").await;
+    first.expect("a1 OK LOGOUT completed").await;
+    third.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // TLS
 // ---------------------------------------------------------------------------
 
@@ -1146,6 +1409,18 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAll {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
+}
+
+/// A TLS client configuration whose verifier is test-only accept-all.
+fn accept_all_connector() -> tokio_rustls::TlsConnector {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAll(provider)))
+        .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
 }
 
 #[tokio::test]
@@ -1199,17 +1474,11 @@ async fn serves_a_full_client_round_over_tls() {
         tls,
         Arc::clone(&scripted) as Arc<dyn ImapBackend>,
         sender,
+        ServeLimits::default(),
     ));
 
     // 3. A TLS client whose verifier is test-only accept-all.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAll(provider)))
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let connector = accept_all_connector();
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();

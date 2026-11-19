@@ -202,6 +202,20 @@
   attachments as opaque bytes (the part header in the rendered message
   keeps the original type). A bare `BODY` item is answered as `BODY`
   with the extension data stripped from the stored string.
+- Connection bounds (`ServeLimits` / `SessionLimits`, all injectable):
+  the accept loop lives in `adapters::imap::server::serve` — the one
+  implementation `serve` and the tests share — and never ends on a
+  failed `accept` (warn, pause 1 s, retry: `EMFILE` and
+  `ECONNABORTED` are transient). A semaphore caps live connections at
+  64, handshake included; at the cap the listener is not polled and
+  clients wait in the kernel backlog. The TLS handshake has 10 s. The
+  whole unauthenticated phase shares one 60 s deadline (commands do
+  not extend it); an authenticated session may wait 30 minutes for a
+  command (RFC 3501 §5.4's minimum) and one `IDLE` may run 30 minutes
+  (RFC 2177 clients re-issue it every 29) — both end with `* BYE idle
+  for too long; closing connection`. Writes go through a stall guard:
+  60 s without progress fails the write and ends the session, and a
+  failed connection is never answered again.
 - IDLE literal edge: a tagged BAD during IDLE never answers a literal
   continuation, and RFC 3501 obliges the client not to send the octets
   its `{n}` token announced — the session reads none of them, and

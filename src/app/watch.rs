@@ -35,8 +35,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 
 use crate::adapters::imap::backend::TutaImapBackend;
-use crate::adapters::imap::server::{ensure_certificate, tls_acceptor};
-use crate::adapters::imap::session::run_session;
+use crate::adapters::imap::server::{self, ensure_certificate, tls_acceptor, ServeLimits};
 use crate::adapters::mime::MimeRenderer;
 use crate::adapters::sqlite_state::STATE_BUSY_MESSAGE;
 use crate::adapters::tuta::event_wire::is_invalid_event;
@@ -726,34 +725,26 @@ impl ServeUseCase {
         // 7. Accept until the stop future resolves, then end the
         //    watch loop and return its result. A watch that ended on
         //    its own — only a fatal error can — ends serve with that
-        //    error. Failures close one connection at most.
+        //    error. Failures close one connection at most, a failed
+        //    accept included: the accept loop itself never ends.
         let mut stop = pin!(stop);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut stop => break,
-                watched = &mut watch_task => {
-                    return match watched {
-                        Ok(result) => result,
-                        Err(_) => Err(Error::Storage("watch task failed".into())),
-                    };
-                }
-                accepted = listener.accept() => {
-                    let (stream, _peer) = accepted.map_err(accept_failed)?;
-                    let tls = tls.clone();
-                    let backend = Arc::clone(&backend);
-                    let events = sender.subscribe();
-                    tokio::spawn(async move {
-                        match tls.accept(stream).await {
-                            Ok(stream) => {
-                                let _ = run_session(stream, backend, events).await;
-                            }
-                            Err(_) => tracing::debug!("tls handshake failed"),
-                        }
-                        tracing::debug!("connection ended");
-                    });
-                }
+        let mut accepting = pin!(server::serve(
+            listener,
+            tls,
+            backend,
+            sender,
+            ServeLimits::default()
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut stop => {}
+            watched = &mut watch_task => {
+                return match watched {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Storage("watch task failed".into())),
+                };
             }
+            () = &mut accepting => {}
         }
         let _ = stop_watch.send(());
         match watch_task.await {
@@ -761,11 +752,6 @@ impl ServeUseCase {
             Err(_) => Err(Error::Storage("watch task failed".into())),
         }
     }
-}
-
-/// A failed accept ends the command: the listener is dead.
-fn accept_failed(_: std::io::Error) -> Error {
-    Error::Network("listener accept failed".into())
 }
 
 #[cfg(test)]
