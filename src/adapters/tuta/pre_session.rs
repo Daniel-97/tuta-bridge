@@ -17,7 +17,7 @@ use tutasdk::CLIENT_VERSION;
 
 use super::json::{
     create_session_body, parse_pending, parse_salt_response, parse_session_response, salt_query,
-    second_factor_body, second_factor_query, ChallengeType,
+    second_factor_body, second_factor_delete_body, second_factor_query, ChallengeType, SessionId,
 };
 use crate::domain::Error;
 use crate::ports::session::{NewSession, SessionRequest};
@@ -142,40 +142,24 @@ impl TutaPreSession {
             .await?;
         let mut session_resp = parse_session_response(&session_data)?;
 
-        // Step 7: Handle challenges. The server sends one challenge per
-        // registered second-factor type and any one of them completes the
-        // login, so — like the reference client, which looks for the TOTP
-        // challenge among them — answer the TOTP challenge when there is
-        // one and ignore the others. Only a login that offers no TOTP at
-        // all is unsupported.
+        // Step 7: Handle challenges, then (step 8) poll for approval.
         let session_id = super::json::session_id_from_access_token(&session_resp.access_token)?;
-        let mut need_poll = false;
 
-        if session_resp.challenges.contains(&ChallengeType::Totp) {
-            let code = (totp)()?;
-            let totp_body = second_factor_body(&session_id, &code);
-            let totp_url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
-            let mut totp_headers = self.common_headers(true);
-            totp_headers.insert("v".to_string(), "158".to_string());
-            self.request_json(
-                HttpMethod::POST,
-                &totp_url,
-                Some(totp_body),
-                totp_headers,
-                AuthFailure::SecondFactor,
-                "second factor request",
-            )
-            .await?;
-            need_poll = true;
-        } else if !session_resp.challenges.is_empty() {
-            return Err(Error::Unsupported(
-                "second factor type not supported".into(),
-            ));
+        // From here on the server holds a session waiting for its second
+        // factor. If the challenge cannot be completed, cancel it instead
+        // of leaving it pending.
+        if let Err(error) = self
+            .complete_challenges(&session_resp.challenges, &session_id, totp.as_ref())
+            .await
+        {
+            self.cancel_pending(&session_id).await;
+            return Err(error);
         }
-
-        // Step 8: Poll for approval
-        if need_poll {
-            self.poll_second_factor(&session_resp.access_token).await?;
+        if !session_resp.challenges.is_empty() {
+            if let Err(error) = self.poll_second_factor(&session_resp.access_token).await {
+                self.cancel_pending(&session_id).await;
+                return Err(error);
+            }
         }
 
         // Step 9: Build encrypted passphrase key
@@ -193,6 +177,97 @@ impl TutaPreSession {
             access_token: std::mem::take(&mut session_resp.access_token),
             encrypted_passphrase_key,
         })
+    }
+
+    /// Answer the session's second-factor challenges (step 7).
+    ///
+    /// The server sends one challenge per registered second-factor type and
+    /// any one of them completes the login, so — like the reference client,
+    /// which looks for the TOTP challenge among them — answer the TOTP
+    /// challenge when there is one and ignore the others. Only a login that
+    /// offers no TOTP at all is unsupported.
+    async fn complete_challenges(
+        &self,
+        challenges: &[ChallengeType],
+        session_id: &SessionId,
+        totp: &(dyn Fn() -> crate::domain::Result<String> + Send + Sync),
+    ) -> crate::domain::Result<()> {
+        if challenges.contains(&ChallengeType::Totp) {
+            let code = (totp)()?;
+            let totp_body = second_factor_body(session_id, &code);
+            let totp_url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
+            let mut totp_headers = self.common_headers(true);
+            totp_headers.insert("v".to_string(), "158".to_string());
+            self.request_json(
+                HttpMethod::POST,
+                &totp_url,
+                Some(totp_body),
+                totp_headers,
+                AuthFailure::SecondFactor,
+                "second factor request",
+            )
+            .await?;
+        } else if !challenges.is_empty() {
+            return Err(Error::Unsupported(
+                "second factor type not supported".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Best-effort cancel of a session still waiting for its second factor,
+    /// the same `SecondFactorAuthService` DELETE the reference client sends
+    /// when the user cancels. Failures are ignored: the login already failed
+    /// and that error is the one to report.
+    async fn cancel_pending(&self, session_id: &SessionId) {
+        let url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
+        let _ = self
+            .request_json(
+                HttpMethod::DELETE,
+                &url,
+                Some(second_factor_delete_body(session_id)),
+                self.common_headers(true),
+                AuthFailure::SecondFactor,
+                "second factor cancel",
+            )
+            .await;
+    }
+
+    /// Delete the server session behind `access_token`.
+    ///
+    /// For a session that was created and approved but will not be kept
+    /// (the login failed before it could be resumed and closed normally).
+    /// A session the server no longer knows (401/404) counts as deleted.
+    pub async fn delete_session(&self, access_token: &str) -> crate::domain::Result<()> {
+        let session_id = super::json::session_id_from_access_token(access_token)?;
+        let url = format!(
+            "{}/rest/sys/session/{}/{}",
+            self.base_url, session_id.list_id, session_id.element_id
+        );
+        let mut headers = self.common_headers(false);
+        headers.insert("accessToken".to_string(), access_token.to_string());
+        let options = RestClientOptions {
+            headers,
+            body: None,
+            suspension_behavior: Some(SuspensionBehavior::Suspend),
+        };
+        let response = self
+            .rest
+            .request_binary(url.clone(), HttpMethod::DELETE, options)
+            .await
+            .map_err(|_| Error::Network("failed to close session".into()))?;
+        debug_http(
+            self.debug,
+            "session delete",
+            "DELETE",
+            &url,
+            response.status,
+            response.body.as_deref(),
+        );
+        match response.status {
+            200..=299 | 401 | 404 => Ok(()),
+            _ => Err(Error::Network("failed to close session".into())),
+        }
     }
 
     /// Poll the second-factor auth service until approval is confirmed or timeout.

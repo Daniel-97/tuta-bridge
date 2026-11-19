@@ -62,4 +62,15 @@ pub trait Session: Send + Sync {
 pub trait SessionFactory: Send + Sync {
     async fn create(&self, request: SessionRequest) -> Result<NewSession>;
     async fn resume(&self, credentials: &StoredCredentials) -> Result<Box<dyn Session>>;
+
+    /// Remove a server session that was created but cannot be resumed, so
+    /// a login that fails half-way does not leave it behind.
+    ///
+    /// A resumed session is closed through [`Session::close`] instead; this
+    /// is only for the window where no [`Session`] exists yet. Defaults to
+    /// a no-op for adapters without server-side sessions.
+    async fn discard(&self, access_token: &str) -> Result<()> {
+        let _ = access_token;
+        Ok(())
+    }
 }

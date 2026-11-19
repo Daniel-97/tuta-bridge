@@ -6,7 +6,88 @@ use std::sync::Arc;
 use tuta_bridge::app::login::LoginUseCase;
 use tuta_bridge::config::Config;
 use tuta_bridge::domain::{AccountInfo, Error};
-use tuta_bridge::ports::session::NewSession;
+use tuta_bridge::domain::{Result, StoredCredentials};
+use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
+
+/// A factory whose fresh session cannot be resumed; records what is
+/// discarded.
+struct UnresumableFactory {
+    discarded: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl SessionFactory for UnresumableFactory {
+    async fn create(&self, _request: SessionRequest) -> Result<NewSession> {
+        Ok(NewSession {
+            user_id: "u".into(),
+            access_token: "fresh-token".into(),
+            encrypted_passphrase_key: vec![7],
+        })
+    }
+
+    async fn resume(&self, _credentials: &StoredCredentials) -> Result<Box<dyn Session>> {
+        Err(Error::Network("session resume failed".into()))
+    }
+
+    async fn discard(&self, access_token: &str) -> Result<()> {
+        self.discarded
+            .lock()
+            .unwrap()
+            .push(access_token.to_string());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn resume_failure_discards_the_fresh_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+
+    let prompt = Arc::new(support::FakePrompt::new("a@b.c", "pw", "123456"));
+    let factory = Arc::new(UnresumableFactory {
+        discarded: std::sync::Mutex::new(Vec::new()),
+    });
+    let store = Arc::new(support::FakeStore::new());
+
+    let uc = LoginUseCase::new(factory.clone(), store.clone(), prompt, config_path);
+    let result = uc.execute(None).await;
+
+    assert!(matches!(result, Err(Error::Network(_))));
+    assert_eq!(*factory.discarded.lock().unwrap(), vec!["fresh-token"]);
+    assert!(store.is_empty());
+}
+
+#[tokio::test]
+async fn unreadable_config_fails_before_a_session_or_credentials_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "this is = not [valid toml").unwrap();
+
+    let prompt = Arc::new(support::FakePrompt::new("a@b.c", "pw", "123456"));
+    let factory = Arc::new(support::FakeFactory::new(
+        Ok(NewSession {
+            user_id: "u".into(),
+            access_token: "t".into(),
+            encrypted_passphrase_key: vec![7],
+        }),
+        AccountInfo {
+            mail_address: "a@b.c".into(),
+            user_id: "u".into(),
+        },
+    ));
+    let store = Arc::new(support::FakeStore::new());
+
+    let uc = LoginUseCase::new(factory.clone(), store.clone(), prompt.clone(), config_path);
+    let result = uc.execute(None).await;
+
+    assert!(matches!(result, Err(Error::Config(_))));
+    assert!(
+        factory.calls.lock().unwrap().is_empty(),
+        "no session created"
+    );
+    assert!(store.calls.lock().unwrap().is_empty(), "nothing stored");
+    assert!(prompt.calls.lock().unwrap().is_empty(), "nothing prompted");
+}
 
 #[tokio::test]
 async fn login_saves_credentials_and_active_account() {

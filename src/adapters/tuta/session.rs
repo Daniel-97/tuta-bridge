@@ -47,6 +47,10 @@ impl SessionFactory for TutaSessionFactory {
         self.pre.create(request).await
     }
 
+    async fn discard(&self, access_token: &str) -> Result<()> {
+        self.pre.delete_session(access_token).await
+    }
+
     async fn resume(&self, credentials: &StoredCredentials) -> Result<Box<dyn Session>> {
         let creds = Credentials {
             login: credentials.login.clone(),

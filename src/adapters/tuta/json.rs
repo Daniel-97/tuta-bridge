@@ -180,6 +180,16 @@ pub fn second_factor_body(session_id: &SessionId, code: &str) -> Vec<u8> {
     serde_json::to_vec(&v).expect("second factor body serialization cannot fail")
 }
 
+/// Build the JSON body that cancels a pending second-factor login
+/// (`SecondFactorAuthDeleteData`).
+pub fn second_factor_delete_body(session_id: &SessionId) -> Vec<u8> {
+    let v = json!({
+        "1756": "0",
+        "1757": [[&session_id.list_id, &session_id.element_id]],
+    });
+    serde_json::to_vec(&v).expect("second factor delete body serialization cannot fail")
+}
+
 /// Build the JSON body for the second-factor-auth-get query.
 pub fn second_factor_query(access_token: &str) -> Vec<u8> {
     let v = json!({
@@ -259,6 +269,14 @@ mod tests {
         assert_eq!(v["1232"], serde_json::json!([["L", "E"]]));
         assert_eq!(v["1231"], serde_json::json!([]));
         assert_eq!(v["1905"], serde_json::json!([]));
+
+        let v: serde_json::Value = serde_json::from_slice(&second_factor_delete_body(&SessionId {
+            list_id: "L".into(),
+            element_id: "E".into(),
+        }))
+        .unwrap();
+        assert_eq!(v["1756"], "0");
+        assert_eq!(v["1757"], serde_json::json!([["L", "E"]]));
     }
 
     #[test]
