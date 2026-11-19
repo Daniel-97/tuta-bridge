@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::adapters::sqlite_state::{SchemaTooNew, SqliteStateStore};
+use crate::adapters::sqlite_state::{SchemaTooNew, SqliteStateStore, StateInUse};
 use crate::app::sync::{SyncEngine, SyncReport};
 use crate::config::{state_path, Config};
 use crate::domain::{AccountId, Error, Result};
@@ -67,18 +67,29 @@ impl StateSyncUseCase {
     }
 }
 
-/// Open the SQLite state store at the platform data path.
+/// Open the SQLite state store at the platform data path as its only
+/// writer.
+///
+/// `sync`, `resync`, `watch`, and `serve` all open the store through
+/// here, so only one of them runs at a time: the others fail with a
+/// message naming the conflict instead of corrupting each other's work.
 pub async fn open_state_store() -> Result<Arc<dyn StateStore>> {
     let path = state_path().map_err(|e| Error::Config(e.to_string()))?;
-    let store = SqliteStateStore::open(&path).await.map_err(open_error)?;
+    let store = SqliteStateStore::open_exclusive(&path)
+        .await
+        .map_err(open_error)?;
     Ok(Arc::new(store))
 }
 
 /// Map a failed open to a fixed message.
 ///
-/// A database written by a newer binary keeps its own explanation, which
-/// carries schema version numbers only; every other failure stays opaque.
+/// A database held by another process or written by a newer binary keeps
+/// its own explanation, which carries no data beyond schema version
+/// numbers; every other failure stays opaque.
 fn open_error(error: anyhow::Error) -> Error {
+    if let Some(in_use) = error.downcast_ref::<StateInUse>() {
+        return Error::Storage(in_use.to_string());
+    }
     match error.downcast_ref::<SchemaTooNew>() {
         Some(too_new) => Error::Storage(too_new.to_string()),
         None => Error::Storage("failed to open state database".into()),

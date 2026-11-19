@@ -100,9 +100,88 @@ const SCHEMA_STATEMENTS: &[&str] = &[
 /// stores bodies, attachments, inline images, or complete `.eml` messages.
 pub struct SqliteStateStore {
     pool: SqlitePool,
+    /// Held for the store's lifetime when it was opened exclusively.
+    _lock: Option<StateLock>,
+}
+
+/// Another process holds the state database's writer lock.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the state database is in use by another tuta-bridge process \
+     (sync, resync, watch or serve); stop it first"
+)]
+pub struct StateInUse;
+
+/// Exclusive advisory lock on the state database, released on drop.
+///
+/// `sync` compares a folder snapshot taken over many requests with the
+/// stored rows, and `watch` rewrites those rows from live events; run
+/// side by side, a sync deletes mail the watcher just filed and files
+/// mail it just removed. The commands that write the index therefore
+/// exclude each other through this lock on a `.lock` file beside the
+/// database. The kernel drops it when the process ends, however it
+/// ends, so a crash never leaves a stale lock behind.
+pub struct StateLock {
+    _file: fs::File,
+}
+
+impl StateLock {
+    /// Take the lock without waiting; [`StateInUse`] when it is held.
+    #[cfg(unix)]
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        // SAFETY: `flock` only takes the descriptor of the file opened
+        // above, which stays open for the duration of the call.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(StateInUse.into());
+            }
+            return Err(error).with_context(|| format!("failed to lock {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+
+    /// Platforms without `flock` run unlocked.
+    #[cfg(not(unix))]
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
 }
 
 impl SqliteStateStore {
+    /// Open the database at `path` as its only writer.
+    ///
+    /// Like [`Self::open`], but first takes the [`StateLock`] next to the
+    /// database and keeps it until the store is dropped. A second
+    /// exclusive open — from this or any other process — fails with
+    /// [`StateInUse`] instead of waiting.
+    pub async fn open_exclusive(path: &Path) -> anyhow::Result<Self> {
+        restrict_process_umask();
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = StateLock::acquire(Path::new(&lock_path))?;
+        let mut store = Self::open(path).await?;
+        store._lock = Some(lock);
+        Ok(store)
+    }
+
     /// Open the database at `path`, creating it and the schema if missing.
     ///
     /// On Unix this sets the process umask to `0o077` before SQLite creates
@@ -119,7 +198,7 @@ impl SqliteStateStore {
             .busy_timeout(Duration::from_secs(5));
         let pool = pool_options().connect_with(options).await?;
         tighten_state_files(path)?;
-        let store = Self { pool };
+        let store = Self { pool, _lock: None };
         store.apply_schema().await?;
         // SQLite creates the WAL/SHM sidecars itself; tighten them once the
         // schema has forced them into existence.
@@ -138,7 +217,7 @@ impl SqliteStateStore {
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
         let pool = pool_options().connect_with(options).await?;
-        let store = Self { pool };
+        let store = Self { pool, _lock: None };
         store.apply_schema().await?;
         Ok(store)
     }
@@ -2586,6 +2665,36 @@ mod tests {
             .execute(&other)
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exclusive_open_refuses_a_second_writer_until_the_first_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let first = SqliteStateStore::open_exclusive(&path).await.unwrap();
+        first.upsert_account("owner@example.invalid").await.unwrap();
+
+        // A second writer, as another process would be, is turned away
+        // at once with a message that names the commands involved.
+        let error = match SqliteStateStore::open_exclusive(&path).await {
+            Ok(_) => panic!("a second writer must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<StateInUse>().is_some());
+        assert!(error.to_string().contains("sync, resync, watch or serve"));
+
+        // The lock file is private like the database itself.
+        assert_private_file(&dir.path().join("state.sqlite3.lock"));
+
+        // Dropping the first store releases the lock.
+        drop(first);
+        let second = SqliteStateStore::open_exclusive(&path).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(second.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
