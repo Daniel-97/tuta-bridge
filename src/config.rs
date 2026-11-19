@@ -52,26 +52,49 @@ impl Config {
     }
 }
 
-/// Write `contents` to `path`, creating the file (and tightening an existing
-/// one) with mode `0600` on Unix so it is never world-readable.
+/// Write `contents` to `path` atomically, as a file with mode `0600` on Unix.
+///
+/// The bytes go to a fresh sibling file — created exclusively, so a planted
+/// symlink or a file someone else already holds open is never written
+/// through, and private from its first byte — which then replaces `path`
+/// in one rename. A crash leaves either the old file or the new one, never
+/// a truncated one.
 pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut temp_name = OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(format!(".tmp{}", std::process::id()));
+    let temp = path.with_file_name(temp_name);
+
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    use std::io::Write;
-    file.write_all(contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Tighten an already-existing file that may carry looser permissions.
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let mut file = match options.open(&temp) {
+        Ok(file) => file,
+        // A leftover of an interrupted run of this same pid: replace it.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&temp)?;
+            options.open(&temp)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    let written = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    Ok(())
+    written
 }
 
 pub fn validate_base_url(url: &str) -> std::result::Result<(), String> {
@@ -97,18 +120,30 @@ pub fn validate_base_url(url: &str) -> std::result::Result<(), String> {
         return Err(error());
     }
 
-    // http is only allowed for loopback hosts.
+    // http is only allowed for loopback hosts, optionally followed by
+    // one valid port and nothing else.
     let authority = rest;
-    let host = if authority.starts_with('[') {
-        authority
-            .find(']')
-            .map(|i| &authority[..=i])
-            .unwrap_or(authority)
+    let (host, port) = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(i) => (&authority[..=i], &authority[i + 1..]),
+            None => return Err(error()),
+        }
     } else {
-        authority.split(':').next().unwrap_or(authority)
+        match authority.find(':') {
+            Some(i) => (&authority[..i], &authority[i..]),
+            None => (authority, ""),
+        }
+    };
+    let port_ok = match port.strip_prefix(':') {
+        Some(digits) => {
+            !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && digits.parse::<u16>().is_ok_and(|port| port != 0)
+        }
+        None => port.is_empty(),
     };
 
-    if host == "127.0.0.1" || host == "localhost" || host == "[::1]" {
+    if port_ok && (host == "127.0.0.1" || host == "localhost" || host == "[::1]") {
         Ok(())
     } else {
         Err(error())
@@ -359,6 +394,17 @@ mod tests {
     }
 
     #[test]
+    fn validate_base_url_rejects_malformed_loopback_authorities() {
+        assert!(validate_base_url("http://localhost:").is_err());
+        assert!(validate_base_url("http://localhost:abc").is_err());
+        assert!(validate_base_url("http://localhost:0").is_err());
+        assert!(validate_base_url("http://localhost:70000").is_err());
+        assert!(validate_base_url("http://127.0.0.1:80:90").is_err());
+        assert!(validate_base_url("http://[::1]evil.example").is_err());
+        assert!(validate_base_url("http://[::1").is_err());
+    }
+
+    #[test]
     fn validate_base_url_rejects_http_non_loopback() {
         assert!(validate_base_url("http://example.com").is_err());
         assert!(validate_base_url("http://192.168.1.1").is_err());
@@ -369,6 +415,55 @@ mod tests {
         assert!(validate_base_url("ftp://example.com").is_err());
         assert!(validate_base_url("file:///etc/passwd").is_err());
         assert!(validate_base_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn write_private_file_replaces_the_file_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_private_file(&path, b"first").unwrap();
+        write_private_file(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_never_writes_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        let path = dir.path().join("mail.eml");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        write_private_file(&path, b"secret").unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert!(!fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&path).unwrap(), b"secret");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_tightens_a_loose_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_file(&path, b"new").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[cfg(unix)]
