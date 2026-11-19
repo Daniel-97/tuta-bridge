@@ -351,6 +351,22 @@ pub fn decrypt_chunks(key: &GenericAesKey, chunks: &[Vec<u8>]) -> Result<Vec<u8>
     Ok(out)
 }
 
+/// Check a decrypted attachment against the size its file declares.
+///
+/// `TutanotaFile.size` is the encrypted blob size (it includes the AES
+/// version/IV/MAC overhead), so the plaintext can only be upper-bounded
+/// by it, never compared for equality. A negative declared size is invalid
+/// and rejected outright; cast to `usize` it would become a huge bound and
+/// disable the check.
+pub fn check_attachment_size(decrypted_len: usize, declared_size: i64) -> Result<()> {
+    let error = || Error::Message("attachment size mismatch".into());
+    let declared = usize::try_from(declared_size).map_err(|_| error())?;
+    if decrypted_len > declared {
+        return Err(error());
+    }
+    Ok(())
+}
+
 /// Resolve the session key used to decrypt an attachment's blobs.
 async fn resolve_file_session_key(
     logged: &LoggedInSdk,
@@ -394,6 +410,8 @@ pub async fn load_attachment(
     if !file_is_intact(&file) {
         return Err(Error::Message("attachment file corrupted".into()));
     }
+    // Reject an invalid declared size before any blob is downloaded.
+    check_attachment_size(0, file.size)?;
 
     if file.blobs.is_empty() {
         return Ok(Attachment {
@@ -455,11 +473,7 @@ pub async fn load_attachment(
     }
 
     let data = decrypt_chunks(&key, &ciphertext_chunks)?;
-    // `TutanotaFile.size` is the encrypted blob size (it includes the AES
-    // version/IV/MAC overhead), so it is not equal to the decrypted length.
-    if data.len() > file.size as usize {
-        return Err(Error::Message("attachment size mismatch".into()));
-    }
+    check_attachment_size(data.len(), file.size)?;
 
     Ok(Attachment {
         name: file.name,

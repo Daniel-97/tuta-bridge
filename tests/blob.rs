@@ -2,8 +2,9 @@ use base64::Engine as _;
 use crypto_primitives::aes::InitializationVector;
 use crypto_primitives::key::GenericAesKey;
 use tuta_bridge::adapters::tuta::blob::{
-    blob_get_body, blob_url, decrypt_chunks, fetch_blob, parse_multiple_blobs,
-    request_archive_read_token, request_instance_read_token, validate_blob_server,
+    blob_get_body, blob_url, check_attachment_size, decrypt_chunks, fetch_blob,
+    parse_multiple_blobs, request_archive_read_token, request_instance_read_token,
+    validate_blob_server,
 };
 use tutasdk::net::native_rest_client::NativeRestClient;
 use tutasdk::util::BASE64_EXT;
@@ -118,4 +119,19 @@ async fn token_errors_carry_the_status_but_never_the_response_body() {
         instance.to_string(),
         "message error: attachment token failed: status 400"
     );
+}
+
+#[test]
+fn attachment_size_is_bounded_by_the_declared_size() {
+    assert!(check_attachment_size(0, 0).is_ok());
+    assert!(check_attachment_size(10, 10).is_ok());
+    assert!(check_attachment_size(10, 75).is_ok());
+    assert!(check_attachment_size(11, 10).is_err());
+}
+
+#[test]
+fn a_negative_declared_size_cannot_disable_the_check() {
+    assert!(check_attachment_size(0, -1).is_err());
+    assert!(check_attachment_size(10, -1).is_err());
+    assert!(check_attachment_size(10, i64::MIN).is_err());
 }
