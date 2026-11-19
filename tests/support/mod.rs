@@ -1373,6 +1373,8 @@ pub struct FakeImapBackend {
     pub search_scripts: Mutex<Vec<(Vec<SearchKey>, Vec<u32>)>>,
     /// The fallback non-ALL search answer.
     pub search_uids: Mutex<Vec<u32>>,
+    /// While set, reading a mailbox by id fails like a store error.
+    pub store_failing: Mutex<bool>,
 }
 
 impl FakeImapBackend {
@@ -1386,6 +1388,7 @@ impl FakeImapBackend {
             failing_fetches: Mutex::new(Vec::new()),
             search_scripts: Mutex::new(Vec::new()),
             search_uids: Mutex::new(Vec::new()),
+            store_failing: Mutex::new(false),
         }
     }
 
@@ -1470,6 +1473,12 @@ impl FakeImapBackend {
         });
     }
 
+    /// Simulate the state store failing (or recovering) under a live
+    /// session.
+    pub fn set_store_failing(&self, failing: bool) {
+        *self.store_failing.lock().unwrap() = failing;
+    }
+
     /// Simulate the folder being deleted: its id stops resolving.
     pub fn remove_mailbox(&self, name: &str) {
         self.snapshots.lock().unwrap().remove(name);
@@ -1540,6 +1549,9 @@ impl ImapBackend for FakeImapBackend {
     }
 
     async fn snapshot(&self, mailbox: MailboxId) -> Result<Option<SelectedMailbox>> {
+        if *self.store_failing.lock().unwrap() {
+            return Err(Error::Storage("state unavailable".into()));
+        }
         Ok(self
             .views
             .iter()

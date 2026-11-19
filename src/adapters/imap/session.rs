@@ -220,6 +220,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for StallGuard<W> {
     }
 }
 
+/// The untagged BYE a session that hit an internal error ends with.
+const INTERNAL_BYE: &str = "* BYE internal error; reconnect";
+
 /// The untagged BYE a stale snapshot sends before closing.
 const RESYNC_BYE: &str = "* BYE mailbox state was resynced; reconnect";
 
@@ -337,7 +340,23 @@ where
                 break;
             }
             Incoming::Request(request) => {
-                let flow = session.dispatch(&mut reader, &mut writer, request).await?;
+                let flow = match session.dispatch(&mut reader, &mut writer, request).await {
+                    Ok(flow) => flow,
+                    Err(error) if connection_failed(&error) => return Err(error),
+                    // A failure outside any command's own NO — the
+                    // store could not be read while validating the
+                    // snapshot or announcing changes. The session can
+                    // no longer vouch for its view, so it ends, but
+                    // the client is told to reconnect rather than
+                    // left with a dropped connection.
+                    Err(error) => {
+                        tracing::warn!("imap session ended on an internal error");
+                        let _ = write_line(&mut writer, INTERNAL_BYE).await;
+                        let _ = writer.flush().await;
+                        let _ = writer.shutdown().await;
+                        return Err(error);
+                    }
+                };
                 if matches!(flow, Flow::Close) {
                     break;
                 }

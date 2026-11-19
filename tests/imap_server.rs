@@ -879,6 +879,35 @@ async fn a_deleted_mailbox_ends_the_selected_session_with_bye() {
 }
 
 #[tokio::test]
+async fn a_store_error_ends_the_session_with_bye_not_a_bare_drop() {
+    const BYE: &str = "* BYE internal error; reconnect";
+
+    // The validity check before a command cannot read the store.
+    let scripted = backend();
+    let (mut wire, session, _sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    scripted.set_store_failing(true);
+    wire.send("a4 FETCH 1 (UID)").await;
+    wire.expect(BYE).await;
+    wire.expect_eof().await;
+    assert!(session.await.unwrap().is_err());
+
+    // Nor can the comparison a notification triggers during IDLE.
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    scripted.set_store_failing(true);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect(BYE).await;
+    wire.expect_eof().await;
+    assert!(session.await.unwrap().is_err());
+}
+
+#[tokio::test]
 async fn uidvalidity_change_resets_the_session_with_bye() {
     let scripted = backend();
     let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
