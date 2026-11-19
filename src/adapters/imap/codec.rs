@@ -192,41 +192,55 @@ pub fn pending_literal(line: &str) -> Option<usize> {
     inner.parse().ok()
 }
 
+/// One end of a sequence-set range: a concrete number or `*`, the
+/// largest number in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqBound {
+    Number(u32),
+    Star,
+}
+
+impl SeqBound {
+    fn resolve(self, max: u32) -> u32 {
+        match self {
+            SeqBound::Number(n) => n,
+            SeqBound::Star => max,
+        }
+    }
+}
+
 /// A parsed IMAP sequence set.
 ///
-/// `ranges` holds `(start, stop)` pairs where a `None` stop is the
-/// unbounded upper end produced by `*`. A pure codec cannot know the
-/// mailbox size, so the session resolves each range against it:
-/// `(x, Some(y))` selects the numbers both ends clamp to, `(x, None)`
-/// selects `x..max`, and `(0, None)` — produced only by a lone `*`
-/// (or `*:*`), never by a concrete start — selects exactly the last
-/// message, per RFC 3501 §6.4.8. The ALL set `1:*` is `(1, None)`.
-#[derive(Debug, Clone)]
+/// A pure codec cannot know the mailbox size, so `*` stays symbolic and
+/// [`SeqSet::contains`] resolves it against the largest number in use,
+/// in whatever space the caller works (message numbers or UIDs). `*` is
+/// an ordinary endpoint (RFC 3501 §9 `seq-number`): `2,*` names two
+/// messages, and a range is the span between its two ends whichever
+/// way round they were written.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeqSet {
-    ranges: Vec<(u32, Option<u32>)>,
+    ranges: Vec<(SeqBound, SeqBound)>,
 }
 
 impl SeqSet {
     /// The ALL set: every number from 1 up — the semantics of `1:*`.
     pub fn all() -> Self {
         Self {
-            ranges: vec![(1, None)],
+            ranges: vec![(SeqBound::Number(1), SeqBound::Star)],
         }
     }
 
-    /// The raw `(start, stop)` pairs, for a consumer that must resolve
-    /// star semantics against a concrete maximum instead of testing
-    /// membership with [`SeqSet::contains`].
-    pub fn ranges(&self) -> &[(u32, Option<u32>)] {
-        &self.ranges
-    }
-
-    /// True when `n` falls inside any range (a `None` stop is unbounded).
-    pub fn contains(&self, n: u32) -> bool {
-        self.ranges.iter().any(|&(start, stop)| match stop {
-            Some(stop) => start <= n && n <= stop,
-            None => n >= start,
-        })
+    /// True when `n` falls inside any range once `*` is resolved to
+    /// `max`. `7:*` with a `max` of 5 is the range `5:7`, so a
+    /// `<max+1>:*` probe still names the last message; in an empty
+    /// mailbox (`max` 0) nothing is contained.
+    pub fn contains(&self, n: u32, max: u32) -> bool {
+        n != 0
+            && n <= max
+            && self.ranges.iter().any(|&(first, second)| {
+                let (first, second) = (first.resolve(max), second.resolve(max));
+                first.min(second) <= n && n <= first.max(second)
+            })
     }
 }
 
@@ -234,75 +248,35 @@ fn invalid_sequence_set() -> Error {
     Error::Unsupported("invalid sequence set".into())
 }
 
-fn seq_number(raw: &str) -> Result<u32> {
-    let n: u32 = raw.parse().map_err(|_| invalid_sequence_set())?;
-    if n == 0 {
+fn seq_bound(raw: &str) -> Result<SeqBound> {
+    if raw == "*" {
+        return Ok(SeqBound::Star);
+    }
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(invalid_sequence_set());
     }
-    Ok(n)
+    match raw.parse::<u32>() {
+        Ok(n) if n != 0 => Ok(SeqBound::Number(n)),
+        _ => Err(invalid_sequence_set()),
+    }
 }
 
 /// Parse an IMAP sequence set such as `2,4:6,*`.
 ///
-/// `*` is the unbounded upper end wherever it appears: `4:*` covers every
-/// number from 4 up, and `*:4` is normalized to the same range. A lone `*`
-/// (or `*:*`) anchors at `(0, None)` — a start no concrete number can
-/// produce — so the session can resolve it to exactly the last message,
-/// while `1:*` stays the ALL set. Sequence number `0` and reversed finite
-/// ranges (`5:1`) are rejected with the fixed error
-/// `invalid sequence set`.
+/// Each comma-separated part is one number, `*`, or a range of two of
+/// them. Sequence number `0`, empty parts, and anything that is not a
+/// number are rejected with the fixed error `invalid sequence set`.
 pub fn parse_seq_set(raw: &str) -> Result<SeqSet> {
-    if raw.trim().is_empty() {
-        return Err(invalid_sequence_set());
-    }
-
-    let mut ranges: Vec<(u32, Option<u32>)> = Vec::new();
-    let mut stars = 0usize;
-    let mut highest: u32 = 0;
+    let mut ranges = Vec::new();
     for part in raw.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            return Err(invalid_sequence_set());
-        }
-        match part.split_once(':') {
+        let range = match part.split_once(':') {
             None => {
-                if part == "*" {
-                    stars += 1;
-                    continue;
-                }
-                let n = seq_number(part)?;
-                ranges.push((n, Some(n)));
-                highest = highest.max(n);
+                let bound = seq_bound(part)?;
+                (bound, bound)
             }
-            Some((raw_start, raw_end)) => match (raw_start.trim(), raw_end.trim()) {
-                ("*", "*") => stars += 1,
-                // `*` is the unbounded upper end wherever it appears.
-                ("*", finite) | (finite, "*") => {
-                    let n = seq_number(finite)?;
-                    ranges.push((n, None));
-                    highest = highest.max(n);
-                }
-                (start, end) => {
-                    let (start, end) = (seq_number(start)?, seq_number(end)?);
-                    if start > end {
-                        return Err(invalid_sequence_set());
-                    }
-                    ranges.push((start, Some(end)));
-                    highest = highest.max(end);
-                }
-            },
-        }
-    }
-    if ranges.is_empty() {
-        // A pure-star set names no concrete number: anchor at zero, the
-        // start no `x:*` range can ever produce.
-        for _ in 0..stars {
-            ranges.push((0, None));
-        }
-    } else {
-        for _ in 0..stars {
-            ranges.push((highest.max(1), None));
-        }
+            Some((first, second)) => (seq_bound(first)?, seq_bound(second)?),
+        };
+        ranges.push(range);
     }
     Ok(SeqSet { ranges })
 }
@@ -585,29 +559,62 @@ mod tests {
         assert_eq!(request.args, vec![ImapArg::Raw("\"name\" \"test\"".into())]);
     }
 
-    #[test]
-    fn sequence_sets_cover_ranges_and_star() {
-        let set = parse_seq_set("2,4:6,*").unwrap();
-        assert!(!set.contains(1) && set.contains(2) && !set.contains(3) && set.contains(999_999));
-        assert!(parse_seq_set("0").is_err());
-        assert!(parse_seq_set("5:1").is_err());
+    /// Every number in `1..=max` the set selects.
+    fn selected(raw: &str, max: u32) -> Vec<u32> {
+        let set = parse_seq_set(raw).unwrap();
+        (1..=max).filter(|n| set.contains(*n, max)).collect()
     }
 
     #[test]
-    fn sequence_sets_anchor_lone_star_and_all_ranges() {
-        let lone = parse_seq_set("*").unwrap();
-        assert!(lone.contains(1) && lone.contains(999_999));
-        let all = SeqSet::all();
-        assert!(all.contains(1) && all.contains(999_999));
-        let ranged = parse_seq_set("4:*").unwrap();
-        assert!(ranged.contains(4) && !ranged.contains(3));
-        let trailing = parse_seq_set("9:10,1,*").unwrap();
-        assert!(trailing.contains(1) && trailing.contains(9) && trailing.contains(999_999));
-        assert!(!trailing.contains(8));
-        let reversed_star = parse_seq_set("*:4").unwrap();
-        assert!(reversed_star.contains(4) && !reversed_star.contains(3));
-        let error = parse_seq_set("0").expect_err("zero must not parse");
-        assert!(matches!(error, Error::Unsupported(message) if message == "invalid sequence set"));
+    fn sequence_sets_treat_star_as_an_ordinary_endpoint() {
+        // `*` next to concrete numbers names the last message only —
+        // it never widens into a range.
+        assert_eq!(selected("2,4:6,*", 10), vec![2, 4, 5, 6, 10]);
+        assert_eq!(selected("1,*", 5), vec![1, 5]);
+        assert_eq!(selected("*", 5), vec![5]);
+        assert_eq!(selected("*:*", 5), vec![5]);
+        assert_eq!(selected("1:*", 5), vec![1, 2, 3, 4, 5]);
+        assert_eq!(selected("4:*", 5), vec![4, 5]);
+        assert_eq!(selected("*:4", 5), vec![4, 5]);
+        // A start beyond the end still names the last message: the
+        // range is `5:6` once `*` resolves.
+        assert_eq!(selected("6:*", 5), vec![5]);
+        // Finite ranges select what they name, nothing past the end.
+        assert_eq!(selected("2:4", 5), vec![2, 3, 4]);
+        assert!(selected("9:100", 5).is_empty());
+        // An empty mailbox selects nothing at all.
+        assert!(selected("*", 0).is_empty());
+        assert!(selected("1:*", 0).is_empty());
+        assert_eq!(SeqSet::all(), parse_seq_set("1:*").unwrap());
+    }
+
+    #[test]
+    fn sequence_sets_normalise_reversed_ranges() {
+        // RFC 3501 §9: `4:2` and `2:4` are the same set.
+        assert_eq!(selected("5:1", 6), vec![1, 2, 3, 4, 5]);
+        assert_eq!(selected("4:2,6", 6), vec![2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn sequence_sets_reject_malformed_input() {
+        for raw in [
+            "",
+            " ",
+            "0",
+            "1,",
+            ",1",
+            "1:",
+            ":1",
+            "a",
+            "1:2:3",
+            "+1",
+            "4294967296",
+        ] {
+            let error = parse_seq_set(raw).expect_err("malformed set must not parse");
+            assert!(
+                matches!(error, Error::Unsupported(message) if message == "invalid sequence set")
+            );
+        }
     }
 
     #[test]
@@ -665,29 +672,6 @@ mod tests {
         parse_continuation("", &mut args).unwrap();
         assert!(args.is_empty());
         assert!(parse_continuation(" (unclosed", &mut Vec::new()).is_err());
-    }
-
-    #[test]
-    fn lone_star_anchors_at_zero_for_the_session_to_clamp() {
-        // A lone `*` (or `*:*`) selects exactly the LAST message, so it
-        // anchors at `(0, None)` — a shape a concrete start can never
-        // produce — and the session resolves it against the mailbox.
-        let lone = parse_seq_set("*").unwrap();
-        assert_eq!(lone.ranges(), &[(0, None)]);
-        let stars = parse_seq_set("*,*:*").unwrap();
-        assert_eq!(stars.ranges(), &[(0, None), (0, None)]);
-
-        // Concrete starts keep their numbers: `1:*` is the ALL set and a
-        // trailing star anchors at the set's highest concrete number.
-        let all = parse_seq_set("1:*").unwrap();
-        assert_eq!(all.ranges(), &[(1, None)]);
-        let trailing = parse_seq_set("9:10,1,*").unwrap();
-        assert_eq!(
-            trailing.ranges(),
-            &[(9, Some(10)), (1, Some(1)), (10, None)]
-        );
-        let reversed = parse_seq_set("*:4").unwrap();
-        assert_eq!(reversed.ranges(), &[(4, None)]);
     }
 
     #[test]

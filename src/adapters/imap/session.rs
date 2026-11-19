@@ -39,7 +39,7 @@ use tokio::io::{
 };
 use tokio::sync::broadcast;
 
-use super::codec::{self, BodySection, FetchItem, ImapArg, Request, SeqSet};
+use super::codec::{self, BodySection, FetchItem, ImapArg, Request};
 use crate::domain::{Error, Result};
 use crate::ports::imap_backend::{FetchResponse, ImapBackend, MailboxView};
 use crate::ports::mailbox_events::MailboxChanged;
@@ -925,9 +925,9 @@ impl Session {
         for (index, uid) in uids.iter().enumerate() {
             let msn = u32::try_from(index + 1).unwrap_or(u32::MAX);
             let selected = if uid_command {
-                number_selected(&set, *uid, max_uid)
+                set.contains(*uid, max_uid)
             } else {
-                number_selected(&set, msn, u32::try_from(uids.len()).unwrap_or(u32::MAX))
+                set.contains(msn, u32::try_from(uids.len()).unwrap_or(u32::MAX))
             };
             if !selected {
                 continue;
@@ -1232,22 +1232,6 @@ fn normalize(command: &str, args: &[ImapArg]) -> String {
     }
 }
 
-/// Whether `n` falls inside the set, with the star semantics resolved
-/// against `max` (the largest number in use, in whatever space the
-/// caller works — positions or uids):
-///
-/// * a lone `*` (`(0, None)`) selects exactly the last number;
-/// * `x:*` selects `x..max`, and an `x` beyond `max` still selects the
-///   last number, so mbsync's `UID FETCH <max+1>:*` sees the newest mail;
-/// * finite ranges select what they name, nothing when past the end.
-fn number_selected(set: &SeqSet, n: u32, max: u32) -> bool {
-    set.ranges().iter().any(|&(start, stop)| match stop {
-        Some(stop) => start <= n && n <= stop,
-        None if start == 0 => n == max,
-        None => start <= n || n == max,
-    })
-}
-
 /// One argument as plain text: atoms and quoted strings as themselves, a
 /// literal as its bytes, a parenthesized group as its inner text.
 fn arg_string(arg: &ImapArg) -> String {
@@ -1442,16 +1426,8 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{parse_fetch_items, parse_seq_set};
+    use super::super::codec::parse_fetch_items;
     use super::*;
-
-    /// Every number in `1..=max` the set selects — the resolution the
-    /// handlers perform per message, spelled out for assertions.
-    fn numbers_selected(set: &SeqSet, max: u32) -> Vec<u32> {
-        (1..=max)
-            .filter(|n| number_selected(set, *n, max))
-            .collect()
-    }
 
     /// The rendered pieces as one comparable wire string.
     fn wire_of(pieces: Vec<Piece>) -> String {
@@ -1486,30 +1462,6 @@ mod tests {
             rfc822_size: Some(1234),
             body: Some(b"hello\r\nworld".to_vec()),
         }
-    }
-
-    #[test]
-    fn star_resolution_follows_rfc_3501() {
-        // A lone `*` selects exactly the last message.
-        let lone = parse_seq_set("*").unwrap();
-        assert_eq!(numbers_selected(&lone, 5), vec![5]);
-        // `1:*` is every message.
-        let all = parse_seq_set("1:*").unwrap();
-        assert_eq!(numbers_selected(&all, 5), vec![1, 2, 3, 4, 5]);
-        // `x:*` runs to the end …
-        let from_four = parse_seq_set("4:*").unwrap();
-        assert_eq!(numbers_selected(&from_four, 5), vec![4, 5]);
-        // … and an `x` beyond the end still selects the last message, so
-        // mbsync's `UID FETCH <max+1>:*` never misses the newest mail.
-        let mbsync = parse_seq_set("6:*").unwrap();
-        assert_eq!(numbers_selected(&mbsync, 5), vec![5]);
-        // Finite ranges clamp to the mailbox and select nothing past it.
-        let early = parse_seq_set("2:4").unwrap();
-        assert_eq!(numbers_selected(&early, 5), vec![2, 3, 4]);
-        let over = parse_seq_set("9:100").unwrap();
-        assert!(numbers_selected(&over, 5).is_empty());
-        // An empty mailbox selects nothing at all.
-        assert!(numbers_selected(&lone, 0).is_empty());
     }
 
     #[test]

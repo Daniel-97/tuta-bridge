@@ -451,27 +451,6 @@ fn stored_header_value(header: &MessageHeader, field: &str) -> Option<String> {
     }
 }
 
-/// Whether `n` falls inside the set, with the star semantics of
-/// RFC 3501 §6.4.8 resolved against `max` — the largest number in
-/// use in the caller's space (positions or uids):
-///
-/// * a lone `*` (`(0, None)`) selects exactly the last number;
-/// * `x:*` selects `x..max`, and an `x` beyond `max` still selects
-///   the last number, so a `UID <max+1>:*` probe never misses the
-///   newest mail;
-/// * finite ranges select what they name.
-///
-/// This mirrors the resolution the session applies on the FETCH
-/// path, kept backend-side on purpose: a shared helper would couple
-/// the two modules for a refinement that does not need it yet.
-fn number_in_set(set: &SeqSet, n: u32, max: u32) -> bool {
-    set.ranges().iter().any(|&(start, stop)| match stop {
-        Some(stop) => start <= n && n <= stop,
-        None if start == 0 => n == max,
-        None => start <= n || n == max,
-    })
-}
-
 /// Evaluate one key against a stored message; `msn` is the message's
 /// 1-based position in the mailbox, `len` the mailbox's message
 /// count, and `max_uid` its highest uid — the ends star ranges
@@ -487,8 +466,8 @@ fn search_key_matches(
         SearchKey::All => true,
         SearchKey::Unseen => message.header.unread,
         SearchKey::Seen => !message.header.unread,
-        SearchKey::Uid(set) => number_in_set(set, message.uid, max_uid),
-        SearchKey::Sequence(set) => number_in_set(set, msn, len),
+        SearchKey::Uid(set) => set.contains(message.uid, max_uid),
+        SearchKey::Sequence(set) => set.contains(msn, len),
         SearchKey::Since(start) => message.header.received_at_ms >= *start,
         SearchKey::Before(start) => message.header.received_at_ms < *start,
         SearchKey::On(start, end) => {
@@ -781,21 +760,6 @@ mod tests {
         // Folding is ASCII-only: non-ASCII bytes compare exactly.
         assert!(!constant_time_eq_ignore_ascii_case(&[0xC4], &[0xE4]));
         assert!(constant_time_eq_ignore_ascii_case(&[0xC4], &[0xC4]));
-    }
-
-    #[test]
-    fn search_star_ranges_resolve_against_the_mailbox_ends() {
-        // A lone `*` selects exactly the last number, never every
-        // number.
-        let lone = parse_seq_set("*").unwrap();
-        assert!(number_in_set(&lone, 5, 5) && !number_in_set(&lone, 4, 5));
-        // `x:*` runs to the end, and an `x` beyond the end still
-        // selects the last number: the `<max+1>:*` probe mbsync sends.
-        let mbsync = parse_seq_set("6:*").unwrap();
-        assert!(number_in_set(&mbsync, 5, 5) && !number_in_set(&mbsync, 4, 5));
-        // Finite ranges select what they name.
-        let finite = parse_seq_set("2:4").unwrap();
-        assert!(number_in_set(&finite, 3, 5) && !number_in_set(&finite, 5, 5));
     }
 
     #[test]
