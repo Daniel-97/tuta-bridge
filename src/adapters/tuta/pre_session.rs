@@ -14,6 +14,7 @@ use tutasdk::bindings::suspendable_rest_client::SuspensionBehavior;
 use tutasdk::crypto::crypto_facade::create_auth_verifier;
 use tutasdk::crypto::generate_key_from_passphrase;
 use tutasdk::CLIENT_VERSION;
+use zeroize::Zeroizing;
 
 use super::json::{
     create_session_body, parse_pending, parse_salt_response, parse_session_response, salt_query,
@@ -116,13 +117,16 @@ impl TutaPreSession {
         let key = generate_key_from_passphrase(password.expose_secret(), salt_resp.salt);
         drop(password);
 
-        // Step 4: Create auth verifier
-        let verifier = create_auth_verifier(key.clone());
+        // Step 4: Create auth verifier. It authenticates the account, so it
+        // is wiped when this function returns, like the access key below.
+        // (The request bodies built from them move into the REST client and
+        // are outside this function's control.)
+        let verifier = Zeroizing::new(create_auth_verifier(key.clone()));
 
         // Step 5: Generate access key (32 random bytes) and base64-encode it
-        let mut access_key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut access_key_bytes);
-        let access_key_b64 = BASE64_STANDARD.encode(access_key_bytes);
+        let mut access_key_bytes = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(access_key_bytes.as_mut_slice());
+        let access_key_b64 = Zeroizing::new(BASE64_STANDARD.encode(access_key_bytes.as_slice()));
 
         // Step 6: Create session
         let session_body =
@@ -163,7 +167,7 @@ impl TutaPreSession {
         }
 
         // Step 9: Build encrypted passphrase key
-        let access_key = Aes256Key::from_bytes(&access_key_bytes)
+        let access_key = Aes256Key::from_bytes(access_key_bytes.as_slice())
             .map_err(|_| Error::Login("invalid access key".into()))?;
         let mut random_iv_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut random_iv_bytes);
@@ -193,7 +197,7 @@ impl TutaPreSession {
         totp: &(dyn Fn() -> crate::domain::Result<String> + Send + Sync),
     ) -> crate::domain::Result<()> {
         if challenges.contains(&ChallengeType::Totp) {
-            let code = (totp)()?;
+            let code = Zeroizing::new((totp)()?);
             let totp_body = second_factor_body(session_id, &code);
             let totp_url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
             let mut totp_headers = self.common_headers(true);
