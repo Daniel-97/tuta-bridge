@@ -1324,51 +1324,44 @@ enum Piece {
 /// Items render in request order; the handler has already appended
 /// `FetchItem::Uid` for a UID command when the client did not list it.
 /// ENVELOPE and BODYSTRUCTURE use the backend's strings verbatim (they
-/// already carry their own literal framing). The body — at most one per
-/// response, per the port model — is taken out of the response and
-/// rendered at the last body item as `{n}\r\n` framing followed by the
-/// raw bytes: the client never round-trips a continuation, and only one
-/// copy of the message is ever in memory. Items the backend left
-/// unfilled are skipped, which the real backend never produces.
+/// already carry their own literal framing). Every body item takes the
+/// next of the response's bodies and renders it as `{n}\r\n` framing
+/// followed by the raw bytes: the client never round-trips a
+/// continuation, and the bytes move out of the response instead of
+/// being copied. Items the backend left unfilled are skipped, which the
+/// real backend never produces.
 fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> Vec<Piece> {
     let mut pieces: Vec<Piece> = Vec::new();
     let mut text = format!("* {msn} FETCH (");
-    let body_at = items.iter().rposition(|item| {
-        matches!(
-            item,
-            FetchItem::Body { .. }
-                | FetchItem::Rfc822
-                | FetchItem::Rfc822Header
-                | FetchItem::Rfc822Text
-        )
-    });
+    let mut bodies = std::mem::take(&mut response.bodies).into_iter();
 
-    let mut body_partial = None;
-    for (index, item) in items.iter().enumerate() {
-        let body_name = match item {
+    for item in items {
+        let (name, partial) = match item {
             FetchItem::Body {
                 section, partial, ..
-            } if body_at == Some(index) => {
+            } => {
                 // RFC 3501 §7.4.2: a partial answer names its origin
                 // octet, `BODY[]<0>`, and never the requested count.
                 let origin = partial.map_or_else(String::new, |(offset, _)| format!("<{offset}>"));
-                body_partial = *partial;
-                Some(format!("BODY[{}]{origin}", body_section_name(section)))
+                (
+                    format!("BODY[{}]{origin}", body_section_name(section)),
+                    *partial,
+                )
             }
-            FetchItem::Rfc822 if body_at == Some(index) => Some("RFC822".to_string()),
-            FetchItem::Rfc822Header if body_at == Some(index) => Some("RFC822.HEADER".to_string()),
-            FetchItem::Rfc822Text if body_at == Some(index) => Some("RFC822.TEXT".to_string()),
+            FetchItem::Rfc822 => ("RFC822".to_string(), None),
+            FetchItem::Rfc822Header => ("RFC822.HEADER".to_string(), None),
+            FetchItem::Rfc822Text => ("RFC822.TEXT".to_string(), None),
             FetchItem::Flags => {
                 text.push_str(&format!("FLAGS ({}) ", response.flags));
-                None
+                continue;
             }
             FetchItem::Uid => {
                 text.push_str(&format!("UID {} ", response.uid));
-                None
+                continue;
             }
             FetchItem::InternalDate => {
                 text.push_str(&format!("INTERNALDATE {} ", response.internal_date));
-                None
+                continue;
             }
             FetchItem::Envelope => {
                 if let Some(envelope) = response.envelope.as_ref() {
@@ -1376,7 +1369,7 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
                     text.push_str(envelope);
                     text.push(' ');
                 }
-                None
+                continue;
             }
             FetchItem::BodyStructure => {
                 if let Some(bodystructure) = response.bodystructure.as_ref() {
@@ -1384,23 +1377,19 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
                     text.push_str(bodystructure);
                     text.push(' ');
                 }
-                None
+                continue;
             }
             FetchItem::Rfc822Size => {
                 if let Some(size) = response.rfc822_size {
                     text.push_str(&format!("RFC822.SIZE {size} "));
                 }
-                None
+                continue;
             }
-            _ => None,
         };
-        let Some(name) = body_name else {
+        let Some(body) = bodies.next() else {
             continue;
         };
-        let Some(body) = response.body.take() else {
-            continue;
-        };
-        let body = partial_octets(body, body_partial);
+        let body = partial_octets(body, partial);
         pieces.push(Piece::Text(std::mem::take(&mut text)));
         pieces.push(Piece::Text(format!("{name} {{{}}}\r\n", body.len())));
         pieces.push(Piece::Body(body));
@@ -1463,15 +1452,15 @@ mod tests {
             envelope: Some("(NIL \"Hi\" NIL NIL NIL NIL NIL NIL NIL NIL)".into()),
             bodystructure: Some("(\"STRUCTURE\")".into()),
             rfc822_size: Some(1234),
-            body: Some(b"hello\r\nworld".to_vec()),
+            bodies: vec![b"hello\r\nworld".to_vec()],
         }
     }
 
     #[test]
     fn fetch_responses_render_with_inline_literals() {
         // UID auto-appends after the body literal. The body moves into
-        // the response stream — peak memory is one copy per message —
-        // so the response is left without one.
+        // the response stream instead of being copied, so the response
+        // is left without one.
         let mut response = sample_response();
         let items = uid_items(&parse_fetch_items("(FLAGS BODY[])").unwrap());
         let wire = wire_of(render_fetch(3, &mut response, &items));
@@ -1479,7 +1468,7 @@ mod tests {
             wire,
             "* 3 FETCH (FLAGS (\\Seen) BODY[] {12}\r\nhello\r\nworld UID 5)\r\n"
         );
-        assert!(response.body.is_none());
+        assert!(response.bodies.is_empty());
 
         // An explicit UID renders at its requested position; the RFC822
         // aliases frame their body the same way.
@@ -1488,8 +1477,7 @@ mod tests {
         let wire = wire_of(render_fetch(3, &mut response, &items));
         assert_eq!(wire, "* 3 FETCH (UID 5 RFC822 {12}\r\nhello\r\nworld)\r\n");
 
-        // Without a body item nothing frames a literal — and the body
-        // the request never read stays in the response.
+        // Without a body item nothing frames a literal.
         let mut response = sample_response();
         let items =
             parse_fetch_items("(FLAGS ENVELOPE BODYSTRUCTURE RFC822.SIZE INTERNALDATE)").unwrap();
@@ -1502,7 +1490,21 @@ mod tests {
               RFC822.SIZE 1234 \
               INTERNALDATE \"14-Nov-2023 22:13:20 +0000\")\r\n"
         );
-        assert!(response.body.is_some());
+    }
+
+    #[test]
+    fn every_body_item_renders_its_own_literal() {
+        // Several body items in one FETCH: each takes the next body,
+        // under its own name, in request order.
+        let mut response = sample_response();
+        response.bodies = vec![b"H: 1\r\n\r\n".to_vec(), b"text".to_vec()];
+        let items = parse_fetch_items("(BODY.PEEK[HEADER] FLAGS BODY.PEEK[TEXT]<0.2>)").unwrap();
+        let wire = wire_of(render_fetch(3, &mut response, &items));
+        assert_eq!(
+            wire,
+            "* 3 FETCH (BODY[HEADER] {8}\r\nH: 1\r\n\r\n FLAGS (\\Seen) \
+              BODY[TEXT]<0> {2}\r\nte)\r\n"
+        );
     }
 
     #[test]

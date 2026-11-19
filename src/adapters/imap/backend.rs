@@ -17,13 +17,14 @@ use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
 use time::Date;
+use tokio::sync::Mutex;
 
 use super::codec::{parse_seq_set, BodySection, FetchItem, SeqSet};
 use super::render;
 use crate::app::enrich::EnvelopeEnricher;
 use crate::domain::{
-    Address, Error, FolderKind, MailboxId, MessageHeader, MessageSummary, Result, StoredMailbox,
-    StoredMessage,
+    Address, Error, Folder, FolderKind, MailboxId, MessageContent, MessageHeader, MessagePage,
+    MessageSummary, Result, StoredMailbox, StoredMessage,
 };
 use crate::ports::imap_backend::{FetchResponse, ImapBackend, MailboxView, SelectedMailbox};
 use crate::ports::local_password::LocalPasswordStore;
@@ -496,45 +497,59 @@ fn search_key_matches(
 // Backend
 // ---------------------------------------------------------------------------
 
-impl TutaImapBackend {
-    /// Render one body section for `stored`, loading content exactly
-    /// once.
-    ///
-    /// Non-peek renders persist a still-missing `rfc822_size` (the
-    /// length is known the moment the bytes exist); PEEK renders but
-    /// never persists anything. Part sections are refused before any
-    /// load.
-    async fn body_section(
-        &self,
-        mailbox: MailboxId,
-        stored: &mut StoredMessage,
-        peek: bool,
-        section: &BodySection,
-    ) -> Result<Vec<u8>> {
-        if matches!(section, BodySection::Part(_)) {
-            return Err(unsupported_part_section());
+/// A [`MailSource`] view that loads one message's content at most
+/// once: the enricher and the body renderer of a single FETCH share
+/// it, so a request needing both costs one download, not two.
+struct OnceSource<'a> {
+    inner: &'a dyn MailSource,
+    loaded: Mutex<Option<MessageContent>>,
+}
+
+impl<'a> OnceSource<'a> {
+    fn new(inner: &'a dyn MailSource) -> Self {
+        Self {
+            inner,
+            loaded: Mutex::new(None),
         }
-
-        let content = self.source.content(&summary_of(stored)).await?;
-        let rendered = self.renderer.render(&content)?;
-
-        if !peek && stored.rfc822_size.is_none() {
-            let size = u64::try_from(rendered.len())
-                .map_err(|_| Error::Storage("message size out of range".into()))?;
-            self.store
-                .update_metadata(mailbox, stored.uid, &stored.header, Some(size))
-                .await?;
-            stored.rfc822_size = Some(size);
-        }
-
-        slice_body_section(&rendered, section)
     }
 
-    /// Enrich `stored` once, returning the enriched snapshot.
-    async fn enrich(&self, mailbox: MailboxId, stored: &StoredMessage) -> Result<StoredMessage> {
-        self.enricher
-            .enrich(mailbox, stored, self.source.as_ref())
-            .await
+    /// The content, handed over for good: the copy an earlier load
+    /// kept, or a first load.
+    async fn take(&self, message: &MessageSummary) -> Result<MessageContent> {
+        match self.loaded.lock().await.take() {
+            Some(content) => Ok(content),
+            None => self.inner.content(message).await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MailSource for OnceSource<'_> {
+    async fn folders(&self) -> Result<Vec<Folder>> {
+        self.inner.folders().await
+    }
+
+    async fn messages(&self, folder: &Folder, limit: usize) -> Result<Vec<MessageSummary>> {
+        self.inner.messages(folder, limit).await
+    }
+
+    async fn content(&self, message: &MessageSummary) -> Result<MessageContent> {
+        let mut loaded = self.loaded.lock().await;
+        if let Some(content) = loaded.as_ref() {
+            return Ok(content.clone());
+        }
+        let content = self.inner.content(message).await?;
+        *loaded = Some(content.clone());
+        Ok(content)
+    }
+
+    async fn headers_page(
+        &self,
+        folder: &Folder,
+        start: Option<&str>,
+        limit: usize,
+    ) -> Result<MessagePage> {
+        self.inner.headers_page(folder, start, limit).await
     }
 }
 
@@ -619,76 +634,101 @@ impl ImapBackend for TutaImapBackend {
             return Ok(None);
         };
 
-        // UID, FLAGS, and INTERNALDATE come free from the stored header.
-        let mut response = FetchResponse {
+        // Numeric part sections are refused before any load: a verdict
+        // about the request, not about this message.
+        if items.iter().any(|item| {
+            matches!(
+                item,
+                FetchItem::Body {
+                    section: BodySection::Part(_),
+                    ..
+                }
+            )
+        }) {
+            return Err(unsupported_part_section());
+        }
+
+        let wants_body = items.iter().any(FetchItem::is_body);
+        let wants_structure = items.contains(&FetchItem::BodyStructure);
+        let wants_size = items.contains(&FetchItem::Rfc822Size);
+
+        // One content load serves the whole request: the enricher and
+        // the body renderer read through the same once-only source.
+        let source = OnceSource::new(self.source.as_ref());
+
+        // The structure and the size answer from the store; a missing
+        // one costs exactly one enrichment, already persisted. A stale
+        // row — marked complete, zero sent date — heals through the
+        // same enrichment before anything is rendered from it.
+        if (wants_structure && stored.mime_structure.is_none())
+            || (wants_size && stored.rfc822_size.is_none())
+            || ((wants_structure || wants_size || wants_body) && stale_complete(&stored))
+        {
+            stored = self.enricher.enrich(mailbox, &stored, &source).await?;
+        }
+
+        // Bodies always re-render — there is no stored body — but once
+        // per request, however many sections it asks for.
+        let mut bodies = Vec::new();
+        if wants_body {
+            let content = source.take(&summary_of(&stored)).await?;
+            let rendered = self.renderer.render(&content)?;
+            drop(content);
+
+            // RFC822 and RFC822.TEXT are the non-peek equivalents of
+            // BODY[]/BODY[TEXT] (RFC 3501 §6.4.5). RFC822.HEADER is
+            // functionally equivalent to BODY.PEEK[HEADER] — §6.4.5
+            // says so outright, and §7.4.2's "Equivalent to
+            // BODY[HEADER]" is response-data naming whose own note
+            // says \Seen is not set — so it never persists anything.
+            let non_peek = items.iter().any(|item| {
+                matches!(
+                    item,
+                    FetchItem::Body { peek: false, .. } | FetchItem::Rfc822 | FetchItem::Rfc822Text
+                )
+            });
+            // A non-peek render persists a still-missing size (the
+            // length is known the moment the bytes exist); PEEK renders
+            // but never persists anything.
+            if non_peek && stored.rfc822_size.is_none() {
+                let size = u64::try_from(rendered.len())
+                    .map_err(|_| Error::Storage("message size out of range".into()))?;
+                self.store
+                    .update_metadata(mailbox, stored.uid, &stored.header, Some(size))
+                    .await?;
+                stored.rfc822_size = Some(size);
+            }
+
+            for item in items {
+                let section = match item {
+                    FetchItem::Body { section, .. } => section,
+                    FetchItem::Rfc822 => &BodySection::Empty,
+                    FetchItem::Rfc822Text => &BodySection::Text,
+                    FetchItem::Rfc822Header => &BodySection::Header,
+                    _ => continue,
+                };
+                bodies.push(slice_body_section(&rendered, section)?);
+            }
+        }
+
+        // UID, FLAGS, and INTERNALDATE come free from the stored
+        // header, and the envelope renders from it as-is — partial or
+        // complete — never a network load.
+        Ok(Some(FetchResponse {
             uid: stored.uid,
             flags: render::flags(stored.header.unread),
             internal_date: render::internal_date(stored.header.received_at_ms),
-            envelope: None,
-            bodystructure: None,
-            rfc822_size: None,
-            body: None,
-        };
-
-        for item in items {
-            match item {
-                FetchItem::Uid | FetchItem::Flags | FetchItem::InternalDate => {}
-                // The envelope renders from the stored header as-is —
-                // partial or complete — and never a network load.
-                FetchItem::Envelope => {
-                    response.envelope = Some(render::envelope(&stored.header));
-                }
-                // The structure answers from the store; a missing one
-                // costs exactly one enrichment, already persisted. A
-                // stale row — marked complete, zero sent date — heals
-                // through the same enrichment, exactly once.
-                FetchItem::BodyStructure => {
-                    if stored.mime_structure.is_none() || stale_complete(&stored) {
-                        stored = self.enrich(mailbox, &stored).await?;
-                    }
-                    response.bodystructure = stored.mime_structure.clone();
-                }
-                // The size answers from the store; a missing one costs
-                // exactly one enrichment, without re-rendering here. A
-                // stale row heals the same way.
-                FetchItem::Rfc822Size => {
-                    if stored.rfc822_size.is_none() || stale_complete(&stored) {
-                        stored = self.enrich(mailbox, &stored).await?;
-                    }
-                    response.rfc822_size = stored.rfc822_size;
-                }
-                FetchItem::Body { peek, section, .. } => {
-                    // A stale row heals before the by-design re-render;
-                    // partial rows keep the body-only path.
-                    if stale_complete(&stored) {
-                        stored = self.enrich(mailbox, &stored).await?;
-                    }
-                    let bytes = self
-                        .body_section(mailbox, &mut stored, *peek, section)
-                        .await?;
-                    response.body = Some(bytes);
-                }
-                // RFC822 and RFC822.TEXT are the non-peek equivalents of
-                // BODY[]/BODY[TEXT] (RFC 3501 §6.4.5). RFC822.HEADER is
-                // functionally equivalent to BODY.PEEK[HEADER] — §6.4.5
-                // says so outright, and §7.4.2's "Equivalent to
-                // BODY[HEADER]" is response-data naming whose own note
-                // says \Seen is not set — so it renders and slices but
-                // never persists.
-                FetchItem::Rfc822 | FetchItem::Rfc822Text | FetchItem::Rfc822Header => {
-                    let (peek, section) = match item {
-                        FetchItem::Rfc822 => (false, BodySection::Empty),
-                        FetchItem::Rfc822Text => (false, BodySection::Text),
-                        _ => (true, BodySection::Header),
-                    };
-                    let bytes = self
-                        .body_section(mailbox, &mut stored, peek, &section)
-                        .await?;
-                    response.body = Some(bytes);
-                }
-            }
-        }
-        Ok(Some(response))
+            envelope: items
+                .contains(&FetchItem::Envelope)
+                .then(|| render::envelope(&stored.header)),
+            bodystructure: if wants_structure {
+                stored.mime_structure.clone()
+            } else {
+                None
+            },
+            rfc822_size: if wants_size { stored.rfc822_size } else { None },
+            bodies,
+        }))
     }
 
     async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>> {

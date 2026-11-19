@@ -400,7 +400,7 @@ async fn fetch_serves_envelopes_from_the_index_and_enriches_structure_once() {
     assert!(envelope.ends_with(" NIL NIL NIL NIL NIL)"));
     assert_eq!(response.bodystructure, None);
     assert_eq!(response.rfc822_size, None);
-    assert_eq!(response.body, None);
+    assert!(response.bodies.is_empty());
 
     // BODYSTRUCTURE enriches once: one content load, the persisted
     // structure is returned, and the row gains the complete envelope.
@@ -466,7 +466,10 @@ async fn fetch_serves_envelopes_from_the_index_and_enriches_structure_once() {
         .unwrap()
         .expect("row exists");
     assert_eq!(world.source.content_calls(), 2);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
     assert_eq!(response.rfc822_size, Some(expected_bytes.len() as u64));
 
     // A following RFC822.SIZE answers from the store, no new render.
@@ -500,7 +503,10 @@ async fn fetch_serves_envelopes_from_the_index_and_enriches_structure_once() {
         .unwrap()
         .expect("row exists");
     assert_eq!(world.source.content_calls(), 4);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
     let stored = world
         .store
         .message_by_uid(world.inbox, uid_two)
@@ -547,7 +553,10 @@ async fn body_peek_does_not_persist_anything() {
         .unwrap()
         .expect("row exists");
     assert_eq!(world.source.content_calls(), 1);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
     let stored = world
         .store
         .message_by_uid(world.inbox, uid)
@@ -579,7 +588,7 @@ async fn body_peek_does_not_persist_anything() {
         .unwrap()
         .expect("row exists");
     assert_eq!(
-        response.body.as_deref(),
+        response.bodies.first().map(Vec::as_slice),
         Some(b"Subject: full subject\r\n\r\n".as_slice())
     );
     let stored = world
@@ -629,7 +638,11 @@ async fn body_sections_slice_and_parts_are_refused() {
         .await
         .unwrap()
         .expect("row exists");
-    let header = response.body.expect("header section renders");
+    let header = response
+        .bodies
+        .into_iter()
+        .next()
+        .expect("header section renders");
     let header_text = String::from_utf8_lossy(&header);
     assert!(header_text.contains("Subject: full subject\r\n"));
     assert!(header.ends_with(b"\r\n\r\n"));
@@ -643,7 +656,11 @@ async fn body_sections_slice_and_parts_are_refused() {
         .await
         .unwrap()
         .expect("row exists");
-    let text = response.body.expect("text section renders");
+    let text = response
+        .bodies
+        .into_iter()
+        .next()
+        .expect("text section renders");
     assert!(!text.is_empty());
     assert_eq!(
         [header.as_slice(), text.as_slice()].concat(),
@@ -659,7 +676,10 @@ async fn body_sections_slice_and_parts_are_refused() {
         .await
         .unwrap()
         .expect("row exists");
-    assert_eq!(response.body.as_deref(), Some(header.as_slice()));
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(header.as_slice())
+    );
 
     // Numeric part sections are refused with the fixed message, before
     // any content load. `FetchResponse` deliberately has no `Debug`
@@ -702,7 +722,11 @@ async fn rfc822_header_is_peek_and_persists_nothing() {
         .await
         .unwrap()
         .expect("row exists");
-    let body = response.body.expect("header section renders");
+    let body = response
+        .bodies
+        .into_iter()
+        .next()
+        .expect("header section renders");
     assert!(String::from_utf8_lossy(&body).contains("Subject: full subject\r\n"));
     assert!(body.ends_with(b"\r\n\r\n"));
     assert!(
@@ -1004,8 +1028,8 @@ async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
         .expect("row exists");
     assert_eq!(stored.header.sent_at_ms, 1_700_000_000_000);
 
-    // BODY[] heals too — one enrich load plus the by-design render —
-    // and only the render is repeated afterwards.
+    // BODY[] heals too, and the enrichment and the by-design render
+    // share one content load; later fetches load once each.
     let items = parse_fetch_items("(BODY[])").unwrap();
     let response = world
         .backend
@@ -1013,8 +1037,11 @@ async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
         .await
         .unwrap()
         .expect("row exists");
-    assert_eq!(world.source.content_calls(), 4);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(world.source.content_calls(), 3);
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
     let stored = world
         .store
         .message_by_uid(world.inbox, uid_body)
@@ -1030,6 +1057,46 @@ async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
         .await
         .unwrap()
         .expect("row exists");
-    assert_eq!(world.source.content_calls(), 5);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(world.source.content_calls(), 4);
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
+}
+
+#[tokio::test]
+async fn one_fetch_returns_every_body_item_from_a_single_content_load() {
+    let world = world().await;
+    let uid = world
+        .store
+        .assign_uid(
+            world.inbox,
+            &partial_header("e1", "list subject", 1_700_000_000_000, true),
+        )
+        .await
+        .unwrap();
+    let rendered = MimeRenderer.render(&full_content()).unwrap();
+
+    // A still-partial row asked for its size, its structure, and two
+    // sections at once: one download serves the enrichment and both
+    // sections, and every body item gets its own answer, in order.
+    let items = parse_fetch_items(
+        "(RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER] BODY.PEEK[TEXT] RFC822.HEADER)",
+    )
+    .unwrap();
+    let response = world
+        .backend
+        .fetch(world.inbox, uid, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(world.source.content_calls(), 1);
+    assert_eq!(response.rfc822_size, Some(rendered.len() as u64));
+    assert!(response.bodystructure.is_some());
+    assert_eq!(response.bodies.len(), 3);
+    let (header, text) = (&response.bodies[0], &response.bodies[1]);
+    assert!(header.ends_with(b"\r\n\r\n"));
+    assert!(!text.is_empty());
+    assert_eq!([header.as_slice(), text.as_slice()].concat(), rendered);
+    assert_eq!(&response.bodies[2], header);
 }

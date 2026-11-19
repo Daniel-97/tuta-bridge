@@ -26,13 +26,15 @@ pub struct SelectedMailbox {
 
 /// One FETCH response, built from the requested item list.
 ///
-/// `envelope`, `bodystructure`, `rfc822_size`, and `body` stay `None`
-/// when the request did not ask for them. The port models a single body
-/// per response: with several body items in one request the last one
-/// wins — real clients request one body section per FETCH. The strings
-/// are already IMAP-encoded (literals framed as `{n}\r\n<bytes>` where
-/// needed), so the session writes them verbatim. No `Debug`: envelopes
-/// and bodies are personal data that must never reach a log line.
+/// `envelope`, `bodystructure`, and `rfc822_size` stay `None` when the
+/// request did not ask for them. `bodies` holds one entry per body
+/// item of the request (`BODY[...]`, `BODY.PEEK[...]`, `RFC822`,
+/// `RFC822.HEADER`, `RFC822.TEXT`), in request order: the whole
+/// section, before any partial `<offset.count>` cut, which is the
+/// session's job. The strings are already IMAP-encoded (literals framed
+/// as `{n}\r\n<bytes>` where needed), so the session writes them
+/// verbatim. No `Debug`: envelopes and bodies are personal data that
+/// must never reach a log line.
 pub struct FetchResponse {
     pub uid: u32,
     pub flags: String,
@@ -40,7 +42,7 @@ pub struct FetchResponse {
     pub envelope: Option<String>,
     pub bodystructure: Option<String>,
     pub rfc822_size: Option<u64>,
-    pub body: Option<Vec<u8>>,
+    pub bodies: Vec<Vec<u8>>,
 }
 
 /// The read-only backend seam a session talks to.

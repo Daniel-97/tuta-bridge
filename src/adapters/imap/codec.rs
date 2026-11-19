@@ -420,6 +420,20 @@ pub enum FetchItem {
     Uid,
 }
 
+impl FetchItem {
+    /// Whether the item answers with message bytes — the items a
+    /// backend returns one body for.
+    pub fn is_body(&self) -> bool {
+        matches!(
+            self,
+            FetchItem::Body { .. }
+                | FetchItem::Rfc822
+                | FetchItem::Rfc822Header
+                | FetchItem::Rfc822Text
+        )
+    }
+}
+
 fn invalid_fetch_items() -> Error {
     Error::Unsupported("invalid fetch items".into())
 }

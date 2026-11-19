@@ -1543,7 +1543,11 @@ impl ImapBackend for FakeImapBackend {
             envelope: fetched.envelope.clone(),
             bodystructure: fetched.bodystructure.clone(),
             rfc822_size: fetched.rfc822_size,
-            body: Some(fetched.body.clone()),
+            bodies: items
+                .iter()
+                .filter(|item| item.is_body())
+                .map(|_| fetched.body.clone())
+                .collect(),
         }))
     }
 
