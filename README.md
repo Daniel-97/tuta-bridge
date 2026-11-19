@@ -30,9 +30,24 @@ tuta-bridge watch
 - `sync` is idempotent: known mail keeps its UID; new mail gets the next one.
 - Mail deleted or moved in Tuta is removed from the index on the next sync.
 - `resync` deliberately changes `UIDVALIDITY`, so IMAP clients redownload
-  headers. Use it only when the state is suspect.
+  headers. Use it only when the state is suspect. It loads the folders and
+  headers before it deletes anything, so a `resync` that cannot reach Tuta
+  fails and leaves the index as it was.
+- Every mailbox has its own `UIDVALIDITY`, and a folder renamed in Tuta gets
+  a new one (its UIDs are kept): a mailbox name and `UIDVALIDITY` never
+  refer to two different folders.
+- Only one of `sync`, `resync`, `watch`, and `serve` can run at a time. They
+  share a lock file (`state.sqlite3.lock`); starting a second one fails
+  immediately (exit code 2) with `error: storage error: the state database
+  is in use by another tuta-bridge process (sync, resync, watch or serve);
+  stop it first`. Stop
+  `watch`/`serve` before running `sync` or `resync`. The lock is released
+  when the process ends, however it ends. (On non-Unix platforms there is
+  no lock.)
 - The state database is `$XDG_DATA_HOME/tuta-bridge/state.sqlite3`
-  (`0600`), inside a `0700` directory.
+  (`0600`), inside a `0700` directory. It is upgraded in place when a newer
+  `tuta-bridge` opens it; an older `tuta-bridge` refuses a database written
+  by a newer one instead of modifying it.
 
 ### Watch
 
@@ -41,27 +56,44 @@ the Tuta event bus and applies incoming events to the header index
 incrementally, with no polling and no second backend. It resumes the stored
 session (run `login` first) and runs until Ctrl-C.
 
-- On startup it runs a baseline `sync` when the index is empty or an event
-  group has no stored batch marker, and a full `resync` when a stored batch
-  marker is older than 45 days, because the server can no longer replay
-  batches that old.
+- On startup it runs the same non-destructive `sync` when the index is
+  empty, an event group has no stored batch marker, or a stored marker is
+  older than 45 days (the server can no longer replay batches that old).
+  It prints that sync's counters. `watch` never resets the index: UIDs and
+  `UIDVALIDITY` survive every recovery, and only the explicit `resync`
+  command changes them.
 - Each batch is applied in the same transaction that stores its batch
   marker, so a restart or a replayed batch neither duplicates nor skips
   changes.
-- A dropped connection reconnects with a capped backoff (5 s, 20 s, then
-  60 s) and resumes from the stored batch markers.
+- A batch whose lookups fail is not applied and its marker does not move;
+  it is retried with the backoff. After ten failed attempts `watch` falls
+  back to the non-destructive `sync` and resumes the stream from just
+  before that sync started. The same sync takes over when the server keeps
+  replaying an event message that cannot be parsed (three reconnects in a
+  row).
+- A dropped connection, and a sync that cannot reach Tuta, retry with a
+  capped backoff (5 s, 20 s, then 60 s); the stream resumes from the
+  stored batch markers.
+- A folder deleted in Tuta is removed from the index when its deletion
+  event arrives: `watch` reloads the folder list and drops the mailboxes
+  that are gone. If the list cannot be loaded, it tries again after the
+  next batch or reconnect. No separate `sync` is needed (and none can run
+  while `watch`/`serve` holds the lock).
 - Authentication and session closes are fatal: `watch` stops and tells the
   user to run `login` again. A rate-limited close reconnects like any
   other network error.
+- Ctrl-C takes effect at once, also during a sync or while a batch is
+  being applied or retried.
 - The output is fixed text and counters only; ids, tokens, subjects, and
   addresses never appear in it.
 
 Limits:
 
-- A folder deleted in Tuta is removed from the index by the next `sync`;
-  `watch` does not act on folder-deletion events.
 - A `MailSetEntry` deletion is reconciled by the accompanying `Mail` update
   in the same batch, or by the next `sync`.
+- A folder deletion that happened while `watch` was not running is
+  reconciled by the next `sync` (run it before starting `watch`/`serve`
+  again), or by the next folder-deletion event.
 - `watch` never fetches or stores message bodies, attachments, or `.eml`
   files; event lookups reload header metadata only.
 

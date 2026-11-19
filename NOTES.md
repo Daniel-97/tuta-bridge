@@ -51,9 +51,14 @@
 - SQLite (`sqlx`) stores only protocol state and header metadata: accounts, mailboxes (`uidvalidity`, `next_uid`), messages (`uid`, Tuta ids, subject/from/first recipient/date/flags), and `sync_state`.
 - Bodies, attachments, inline images, and `.eml` files are never stored.
 - `assign_uid` is transactional: known mail keeps its UID, new mail gets `next_uid`, and `next_uid` increments atomically.
-- `sync` sorts headers by `received_at_ms` ascending before assigning UIDs and reconciles deletions/moves; it skips unreadable mails/folders and reports counts.
-- `resync` clears the account state and chooses a strictly different `UIDVALIDITY`, restarting UIDs at 1.
+- `sync` sorts headers by `received_at_ms` ascending before assigning UIDs and reconciles deletions/moves; it skips unreadable mails/folders and reports counts. Each folder page is stored and reconciled in one transaction (`store_page`).
+- `resync` clears the account state and chooses a strictly different `UIDVALIDITY`, restarting UIDs at 1. It loads the folder list and every page before the reset and aborts, index untouched, when the listing or every folder fails.
 - State DB permissions: directory `0700`, database and WAL/SHM `0600`; pool recycling is disabled and the process umask is restricted.
+- Schema versioning: `user_version` is read on open; an older database is migrated forward in one `BEGIN IMMEDIATE` transaction and a newer one is refused. Version 3 rebuilds `mailboxes` with an `AUTOINCREMENT` id (ids are never reused), 4 adds `accounts.uidvalidity_floor`, 5 adds the `messages_by_element` index, 6 clears stored enrichment. No migration changes a UID, a `UIDVALIDITY`, or a mailbox id.
+- UIDVALIDITY is unique per mailbox: the `uidvalidity` passed to the store is a lower bound, and a new or renamed mailbox takes `max(bound, floor + 1)`, where the per-account floor survives deleted mailboxes and `reset_account`. Mailboxes that shared one value before version 4 keep it; a rename gives the mailbox a fresh value and keeps its UIDs.
+- The version 6 step resets `envelope_complete`, `rfc822_size` and `mime_structure` on every message, because rows enriched before the mail-details decoder fix lack To/Cc/Bcc and were measured without them. Each message is re-enriched on its next body-class fetch, so the `RFC822.SIZE` of an already-cached message can change once; clients re-fetch on the mismatch.
+- Write transactions use `BEGIN IMMEDIATE`: every one reads before it writes, and a deferred transaction fails its write immediately (ignoring the busy timeout) when another connection commits in between.
+- `sync`, `resync`, `watch` and `serve` take an exclusive `flock` on `state.sqlite3.lock` for the lifetime of the store. A sync beside a running watch is not safe — it reconciles a snapshot taken over many requests against rows the watcher keeps changing — so the second process fails instead. Non-Unix builds run without the lock.
 - Manual acceptance (2026-11-17): `sync` indexed 18 folders and 1,617 messages; later runs saw new mail arrive (1,620). A repeat sync compared 1,620 existing mappings with **0 UID changes**; `next_uid = max(uid)+1` held for every mailbox. `resync` changed `uidvalidity` for every mailbox and restarted UIDs at 1. The DB has no body/attachment/`.eml` columns; directory is `0700`, database/WAL/SHM `0600`. 1–2 individual messages could not be loaded and were skipped; reconciliation is disabled for incomplete pages so they are not deleted.
 
 ## M4 event bus
@@ -73,9 +78,29 @@
   counted. Subscribed groups are the user's memberships plus the user
   group; the mailing-list group type (`2`) is not subscribed.
 - The server replays batches only for a limited window: a stored marker
-  older than 45 days triggers a resync, and a group without a marker
-  resumes from `timestamp_to_generated_id(now - 5000)`, a stamp that is
-  persisted so a restart does not replay from the beginning.
+  older than 45 days, a missing marker, or an empty index triggers the
+  ordinary non-destructive `sync` (never a reset), after which every
+  group resumes from `timestamp_to_generated_id(now - 5000)` with `now`
+  taken before the sync, a stamp that is persisted so a restart does not
+  replay from the beginning.
+- Markers only advance when a batch of their group is applied, so on
+  `initialSyncDone` every marker older than five seconds before the
+  connect is re-stamped to that instant; otherwise a group without
+  events would age out of the replay window. This assumes the server
+  sends `initialSyncDone` only after replaying everything the connect's
+  markers were missing — not verified against a live account. If the
+  frame never arrives the only cost is a `sync` at a later start.
+- A batch with a failed entity lookup is not persisted and its marker
+  does not move. It is retried in place with the backoff; after
+  `lookup_failure_threshold` (10) attempts the loop runs the same `sync`
+  and reconnects from the fresh stamps. A busy state database retries
+  the batch the same way but ends `watch` if it stays busy.
+- An `entityUpdate` frame that does not parse ends the stream; the server
+  replays it on reconnect. Three connections in a row ending that way
+  trigger the `sync`, which moves the markers past the frame.
+- A `MailSet` delete event cannot be resolved to a stored folder (the
+  index keys folders by their entries list), so it triggers a reload of
+  the folder list and the removal of mailboxes that are gone.
 - Close-code mapping: `4403`, `4440`, `4470`, `4471`, `4472` are fatal for
   the session (the user must run `login` again); `4429` is rate limited;
   every other close is a reconnectable network error. Network errors retry
