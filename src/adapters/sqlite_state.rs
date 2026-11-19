@@ -19,7 +19,7 @@ use crate::ports::StateStore;
 /// Opening migrates an older database forward inside one transaction and
 /// refuses a newer one: a binary that does not know a later schema must
 /// not write to it.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The database carries a schema version newer than [`SCHEMA_VERSION`].
 #[derive(Debug, thiserror::Error)]
@@ -161,7 +161,18 @@ impl SqliteStateStore {
             return Ok(());
         }
         let mut connection = self.pool.acquire().await?;
-        migrate(&mut connection).await
+        // Rebuilding a table that other tables reference needs foreign
+        // keys off, and the pragma is ignored inside a transaction, so it
+        // brackets the migration. `migrate` checks the references itself
+        // before it commits.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await?;
+        let migrated = migrate(&mut connection).await;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *connection)
+            .await?;
+        migrated
     }
 
     /// Assign a stable UID or refresh an existing header on `executor`.
@@ -328,6 +339,21 @@ async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
     if version < 2 {
         add_mime_structure_column(&mut transaction).await?;
     }
+    if version < 3 {
+        for statement in MAILBOX_AUTOINCREMENT_STATEMENTS {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+    }
+
+    // The caller switched foreign keys off for the table rebuild; nothing
+    // may commit with a dangling reference.
+    let violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *transaction)
+        .await?;
+    anyhow::ensure!(
+        violations.is_empty(),
+        "state database migration left dangling references"
+    );
 
     // PRAGMA arguments cannot be bound; the value is a constant.
     sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
@@ -336,6 +362,34 @@ async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
     transaction.commit().await?;
     Ok(())
 }
+
+/// v3 migration: rebuild `mailboxes` with an `AUTOINCREMENT` id.
+///
+/// A plain `INTEGER PRIMARY KEY` hands the id of a deleted mailbox to the
+/// next one created, so anything still holding the old id — an IMAP
+/// session, a queued change notification — would silently address a
+/// different folder. `AUTOINCREMENT` cannot be added in place, so the
+/// table is copied with every id, `uidvalidity`, and `next_uid` intact;
+/// `messages` keeps referencing the table by name.
+const MAILBOX_AUTOINCREMENT_STATEMENTS: &[&str] = &[
+    "CREATE TABLE mailboxes_rebuilt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        list_id TEXT NOT NULL,              -- entry list of the folder
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL,                 -- inbox/sent/drafts/trash/junk/archive/custom
+        parent_list_id TEXT,
+        uidvalidity INTEGER NOT NULL,
+        next_uid INTEGER NOT NULL,
+        UNIQUE (account_id, list_id)
+    )",
+    "INSERT INTO mailboxes_rebuilt
+        (id, account_id, list_id, name, kind, parent_list_id, uidvalidity, next_uid)
+     SELECT id, account_id, list_id, name, kind, parent_list_id, uidvalidity, next_uid
+     FROM mailboxes",
+    "DROP TABLE mailboxes",
+    "ALTER TABLE mailboxes_rebuilt RENAME TO mailboxes",
+];
 
 /// v2 migration: add the metadata-only `mime_structure` column.
 ///
@@ -1954,6 +2008,123 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// Create a database exactly as the version 2 binary left it: two
+    /// mailboxes sharing one UIDVALIDITY, two messages, and a batch
+    /// marker.
+    async fn version_two_database(path: &std::path::Path) {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = pool_options().connect_with(options).await.unwrap();
+        for statement in SCHEMA_STATEMENTS {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        for statement in [
+            "INSERT INTO accounts (id, mail_address) VALUES (1, 'owner@example.invalid')",
+            "INSERT INTO mailboxes (id, account_id, list_id, name, kind, uidvalidity, next_uid)
+             VALUES (1, 1, 'entries-a', 'Inbox', 'inbox', 100, 8),
+                    (2, 1, 'entries-b', 'Work', 'custom', 100, 4)",
+            "INSERT INTO messages (mailbox_id, uid, tuta_list_id, tuta_element_id,
+                 received_at_ms, subject, from_address, unread, references_json, mime_structure)
+             VALUES (1, 7, 'mail-list', 'e1', 1700000000000, 'first',
+                     'sender@example.invalid', 1, '[]', 'structure'),
+                    (2, 3, 'mail-list', 'e2', 1700000000001, 'second',
+                     'sender@example.invalid', 0, '[]', NULL)",
+            "INSERT INTO sync_state (account_id, group_id, last_batch_id)
+             VALUES (1, 'group1', 'batch-1')",
+            "PRAGMA user_version = 2",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn migrating_a_version_two_database_keeps_ids_uids_and_uidvalidity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        version_two_database(&path).await;
+
+        let store = SqliteStateStore::open(&path).await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Nothing a client can see moved: ids, UIDVALIDITY, UIDNEXT, UIDs.
+        let mailboxes = store.mailboxes(1).await.unwrap();
+        let seen: Vec<(i64, &str, u32, u32)> = mailboxes
+            .iter()
+            .map(|mailbox| {
+                (
+                    mailbox.id.0,
+                    mailbox.name.as_str(),
+                    mailbox.uidvalidity,
+                    mailbox.next_uid,
+                )
+            })
+            .collect();
+        assert_eq!(seen, vec![(1, "Inbox", 100, 8), (2, "Work", 100, 4)]);
+        let first = store.message_by_uid(MailboxId(1), 7).await.unwrap().unwrap();
+        assert_eq!(first.header.element_id, "e1");
+        assert_eq!(first.mime_structure.as_deref(), Some("structure"));
+        let second = store.message_by_uid(MailboxId(2), 3).await.unwrap().unwrap();
+        assert_eq!(second.header.element_id, "e2");
+        assert_eq!(
+            store.last_batch(1, "group1").await.unwrap().as_deref(),
+            Some("batch-1")
+        );
+
+        // Foreign keys are back on and still point at the rebuilt table.
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        sqlx::query("DELETE FROM mailboxes WHERE id = 2")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(store.messages(MailboxId(2)).await.unwrap().is_empty());
+        assert_eq!(store.messages(MailboxId(1)).await.unwrap().len(), 1);
+
+        // The deleted mailbox's id is not handed out again.
+        let created = store
+            .upsert_mailbox(1, &folder("entries-c", "New", FolderKind::Custom), 200)
+            .await
+            .unwrap();
+        assert_eq!(created, MailboxId(3));
+    }
+
+    #[tokio::test]
+    async fn mailbox_ids_are_never_reused() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (account, first) = account_and_mailbox(&store).await;
+        let second = store
+            .upsert_mailbox(account, &folder("other", "Other", FolderKind::Custom), 100)
+            .await
+            .unwrap();
+
+        // Removing the newest mailbox must not free its id...
+        store.remove_mailbox(account, second).await.unwrap();
+        let third = store
+            .upsert_mailbox(account, &folder("third", "Third", FolderKind::Custom), 100)
+            .await
+            .unwrap();
+        assert!(third.0 > second.0);
+
+        // ...and neither must a full account reset.
+        store.reset_account(account).await.unwrap();
+        let after_reset = store
+            .upsert_mailbox(account, &folder("entries", "Inbox", FolderKind::Inbox), 100)
+            .await
+            .unwrap();
+        assert!(after_reset.0 > third.0);
+        assert_ne!(after_reset, first);
+    }
+
     #[tokio::test]
     async fn refuses_a_database_newer_than_the_binary() {
         let dir = tempfile::tempdir().unwrap();
@@ -2233,7 +2404,8 @@ mod tests {
                 .fetch_all(store.pool())
                 .await
                 .unwrap();
-        assert_eq!(tables.len(), 4);
+        // The four schema tables plus SQLite's own `sqlite_sequence`.
+        assert_eq!(tables.len(), 5);
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(store.pool())
             .await
