@@ -106,6 +106,14 @@
   the session (the user must run `login` again); `4429` is rate limited;
   every other close is a reconnectable network error. Network errors retry
   with a 5 s / 20 s / 60 s-capped backoff; all other errors end `watch`.
+- Liveness: after 60 s without any frame the stream sends a websocket
+  ping, and a second silent 60 s (no pong either) ends it as a
+  reconnectable network error, so a half-open connection is noticed
+  within two minutes. This relies on the server answering pings, which
+  RFC 6455 requires but was not checked against the live event bus.
+- REST calls have no timeout in the SDK client; `TimeoutRestClient` bounds
+  each exchange at 60 s, and blob-service downloads (a whole attachment
+  per response) at 10 minutes. A timeout surfaces as a network error.
 - `clientVersion` is `369.261113.0` and must be bumped together with the
   SDK pin, otherwise the server rejects the connection as an outdated
   client.

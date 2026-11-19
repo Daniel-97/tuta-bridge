@@ -4,8 +4,9 @@
 //! frames; no real Tuta server is ever contacted and the access token in
 //! the URL is a dummy value.
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -99,4 +100,74 @@ async fn auth_close_code_maps_to_a_login_error() {
         panic!("expected a login error");
     };
     assert_eq!(message, "event stream not authorized; run login again");
+}
+
+/// Connect with a short idle-probe interval so the tests run in
+/// milliseconds.
+async fn connect_with_idle(url: &str, idle: Duration) -> TutaEventStream {
+    let url = event_url(url, "user1", "token", &[], "1.2", "3.4").unwrap();
+    TutaEventStream::connect_with_idle(&url, idle)
+        .await
+        .unwrap()
+}
+
+/// A half-open connection: the socket stays open but the peer never reads
+/// or writes again, so the client's ping is never answered.
+async fn go_silent(socket: ServerSocket) {
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    drop(socket);
+}
+
+/// A quiet but healthy server: it keeps reading (which answers pings) and
+/// sends one batch well after several idle intervals.
+async fn stay_quiet_then_send_batch(mut socket: ServerSocket) {
+    let quiet = tokio::time::sleep(Duration::from_millis(400));
+    tokio::pin!(quiet);
+    loop {
+        tokio::select! {
+            () = &mut quiet => break,
+            message = socket.next() => {
+                if message.is_none() {
+                    return;
+                }
+            }
+        }
+    }
+    socket
+        .send(Message::Text(format!("entityUpdate;{BATCH_JSON}")))
+        .await
+        .unwrap();
+    // Keep serving until the client goes away.
+    while socket.next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn a_half_open_connection_surfaces_as_a_network_error() {
+    let base = loopback_server(go_silent).await;
+    let mut stream = connect_with_idle(&base, Duration::from_millis(50)).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), stream.next_frame())
+        .await
+        .expect("a dead connection must not hang the stream");
+    let Err(Error::Network(message)) = result else {
+        panic!("expected a reconnectable network error");
+    };
+    assert_eq!(message, "event stream timed out");
+}
+
+#[tokio::test]
+async fn a_quiet_but_live_connection_is_kept_open() {
+    let base = loopback_server(stay_quiet_then_send_batch).await;
+    // Eight idle intervals pass before the batch: every probe is answered,
+    // so the stream must still be there to deliver it.
+    let mut stream = connect_with_idle(&base, Duration::from_millis(50)).await;
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), stream.next_frame())
+        .await
+        .expect("the batch must arrive")
+        .expect("a live connection must not be dropped");
+    let EventFrame::Batch(batch) = frame else {
+        panic!("expected an event batch");
+    };
+    assert_eq!(batch.batch_id, "batch1");
 }

@@ -8,4 +8,5 @@ pub mod json;
 pub mod mail_source;
 pub mod pre_session;
 pub mod session;
+pub mod timeout_rest_client;
 pub mod wire;
