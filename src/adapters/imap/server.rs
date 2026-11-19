@@ -38,25 +38,43 @@ const KEY_FILE: &str = "imap-key.pem";
 
 /// Load or generate the bridge's TLS certificate.
 ///
-/// When both files exist and are non-empty they are reused verbatim;
-/// otherwise a fresh pair is generated and persisted with mode 0600.
-/// The returned strings are the PEM material [`tls_acceptor`] takes.
+/// When both files exist as regular, non-empty files they are reused
+/// verbatim — after their mode is set to 0600, on every start, so a
+/// pair that was created or left with looser permissions does not stay
+/// that way. Otherwise a fresh pair is generated and persisted with
+/// mode 0600. The returned strings are the PEM material
+/// [`tls_acceptor`] takes.
 pub fn ensure_certificate(dir: &Path) -> Result<(String, String)> {
     let cert_path = dir.join(CERTIFICATE_FILE);
     let key_path = dir.join(KEY_FILE);
-    if let (Ok(cert_pem), Ok(key_pem)) = (
-        fs::read_to_string(&cert_path),
-        fs::read_to_string(&key_path),
-    ) {
-        if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
-            return Ok((cert_pem, key_pem));
-        }
+    if let (Some(cert_pem), Some(key_pem)) = (stored_pem(&cert_path)?, stored_pem(&key_path)?) {
+        return Ok((cert_pem, key_pem));
     }
 
     let (cert_pem, key_pem) = generate_certificate()?;
     write_private(&cert_path, &cert_pem)?;
     write_private(&key_path, &key_pem)?;
     Ok((cert_pem, key_pem))
+}
+
+/// The PEM text stored at `path`, private again before it is read, or
+/// `None` when there is nothing reusable there: no file, an empty one,
+/// or something that is not a regular file — a symlink is never
+/// followed, and the pair is regenerated over it instead.
+fn stored_pem(path: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return Ok(None),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| Error::Config("certificate permissions could not be set".into()))?;
+    }
+    Ok(fs::read_to_string(path)
+        .ok()
+        .filter(|pem| !pem.trim().is_empty()))
 }
 
 /// Generate the self-signed loopback certificate pair.
@@ -85,27 +103,10 @@ fn certificate_failed(_: rcgen::Error) -> Error {
     Error::Config("certificate generation failed".into())
 }
 
-/// Write one PEM file with owner-only permissions from the first byte.
+/// Write one PEM file: atomically, with owner-only permissions from
+/// the first byte, and never through a symlink.
 fn write_private(path: &Path, contents: &str) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(pem_write_failed)?;
-        file.write_all(contents.as_bytes())
-            .map_err(pem_write_failed)?;
-    }
-    #[cfg(not(unix))]
-    fs::write(path, contents).map_err(pem_write_failed)?;
-    Ok(())
+    crate::config::write_private_file(path, contents.as_bytes()).map_err(pem_write_failed)
 }
 
 fn pem_write_failed(_: std::io::Error) -> Error {
@@ -263,6 +264,60 @@ mod tests {
         let (cert_again, key_again) = ensure_certificate(dir.path()).unwrap();
         assert_eq!(cert_again, cert_pem);
         assert_eq!(key_again, key_pem);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_files_are_made_private_again_on_every_start() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = ensure_certificate(dir.path()).unwrap();
+        let mode = |name: &str| {
+            fs::metadata(dir.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        // Someone loosened the files after they were written.
+        for name in [CERTIFICATE_FILE, KEY_FILE] {
+            fs::set_permissions(dir.path().join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let (cert_again, key_again) = ensure_certificate(dir.path()).unwrap();
+        assert_eq!((cert_again, key_again), (cert_pem, key_pem));
+        assert_eq!(mode(CERTIFICATE_FILE), 0o600);
+        assert_eq!(mode(KEY_FILE), 0o600);
+
+        // A world-readable empty key is regenerated private, not
+        // rewritten in place with the permissions it had.
+        fs::write(dir.path().join(KEY_FILE), "").unwrap();
+        fs::set_permissions(dir.path().join(KEY_FILE), fs::Permissions::from_mode(0o644)).unwrap();
+        let (_, fresh_key) = ensure_certificate(dir.path()).unwrap();
+        assert!(fresh_key.contains("BEGIN PRIVATE KEY"));
+        assert_eq!(mode(KEY_FILE), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_key_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_certificate(dir.path()).unwrap();
+        let elsewhere = dir.path().join("elsewhere.pem");
+        fs::rename(dir.path().join(KEY_FILE), &elsewhere).unwrap();
+        let planted = fs::read_to_string(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join(KEY_FILE)).unwrap();
+
+        // The link is not reused and not written through: a fresh pair
+        // replaces it, and the file it pointed at is untouched.
+        let (cert_pem, key_pem) = ensure_certificate(dir.path()).unwrap();
+        assert_ne!(key_pem, planted);
+        assert_eq!(fs::read_to_string(&elsewhere).unwrap(), planted);
+        assert!(fs::symlink_metadata(dir.path().join(KEY_FILE))
+            .unwrap()
+            .is_file());
+        tls_acceptor(&cert_pem, &key_pem).unwrap();
     }
 
     #[test]
