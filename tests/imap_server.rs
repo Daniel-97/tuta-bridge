@@ -336,6 +336,53 @@ async fn login_accepts_client_literals() {
 }
 
 #[tokio::test]
+async fn literals_are_capped_per_command_and_tightly_before_login() {
+    // Before login a client has a user name and a password to send:
+    // anything larger is refused without a continuation, and the
+    // connection closes.
+    let (mut wire, session, _) = spawn_session(backend(), 16).await;
+    wire.expect(GREETING).await;
+    wire.send("a1 LOGIN {5000}").await;
+    wire.expect("a1 NO literal too large").await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+
+    // The cap is on the command, not on each literal: chaining small
+    // ones stops at the same total, before the continuation that
+    // would cross it.
+    let limits = SessionLimits {
+        pre_auth_literal_bytes: 24,
+        command_literal_bytes: 12,
+        ..SessionLimits::default()
+    };
+    let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
+    wire.expect(GREETING).await;
+    wire.send("a1 LOGIN {20}").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"user@example.invalid {7}\r\n").await;
+    wire.expect("a1 NO literal too large").await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+
+    // Logged in, the larger budget applies — and is one total too.
+    let limits = SessionLimits {
+        command_literal_bytes: 12,
+        ..SessionLimits::default()
+    };
+    let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("a4 SEARCH SUBJECT {6}").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"abcdef SUBJECT {6}\r\n").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"ghijkl SUBJECT {1}\r\n").await;
+    wire.expect("a4 NO literal too large").await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn select_reports_counts_and_read_only_flags() {
     let (mut wire, session, _) = spawn_session(backend(), 16).await;
     login(&mut wire).await;

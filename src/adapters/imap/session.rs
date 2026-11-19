@@ -87,10 +87,17 @@ fn connection_failed(error: &Error) -> bool {
 /// whole (the backend already holds at most one in memory).
 const BODY_CHUNK: usize = 64 * 1024;
 
-/// A client literal announcement beyond this bound is refused without a
-/// continuation and the session ends: `pending_literal` parses `usize`,
-/// so the guard exists to bound the allocation, not the parse.
+/// The literal bytes one command may carry once the client has logged
+/// in: an announcement that would take the command past it is refused
+/// without a continuation and the session ends. `pending_literal`
+/// parses `usize`, so the guard exists to bound the allocation, not
+/// the parse.
 const MAX_LITERAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// The literal bytes one command may carry before login. The only
+/// literals a client has reason to send then are a user name and a
+/// password.
+const MAX_PRE_AUTH_LITERAL_BYTES: usize = 4 * 1024;
 
 /// A command line beyond this bound is refused, and the read is
 /// bounded with it: lines are scanned window by window and discarded
@@ -119,6 +126,11 @@ pub struct SessionLimits {
     /// How long one write may make no progress: a client that stops
     /// reading its socket ends the session instead of pinning it.
     pub write_timeout: Duration,
+    /// The literal bytes one command may carry before login, all of
+    /// its literals together.
+    pub pre_auth_literal_bytes: usize,
+    /// The same bound once logged in.
+    pub command_literal_bytes: usize,
 }
 
 impl Default for SessionLimits {
@@ -127,6 +139,8 @@ impl Default for SessionLimits {
             pre_auth_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(30 * 60),
             write_timeout: Duration::from_secs(60),
+            pre_auth_literal_bytes: MAX_PRE_AUTH_LITERAL_BYTES,
+            command_literal_bytes: MAX_LITERAL_BYTES,
         }
     }
 }
@@ -279,12 +293,18 @@ where
         // Every wait for a command is bounded: the whole
         // unauthenticated phase by one deadline, each later command by
         // the inactivity timeout.
-        let deadline = if session.state.authenticated() {
-            Instant::now() + session.limits.idle_timeout
+        // So is the memory a command may claim, with far less
+        // granted to a client that has not logged in.
+        let (deadline, literal_budget) = if session.state.authenticated() {
+            (
+                Instant::now() + session.limits.idle_timeout,
+                session.limits.command_literal_bytes,
+            )
         } else {
-            pre_auth_deadline
+            (pre_auth_deadline, session.limits.pre_auth_literal_bytes)
         };
-        let incoming = match timeout_at(deadline, read_request(&mut reader, &mut writer)).await {
+        let reading = read_request(&mut reader, &mut writer, literal_budget);
+        let incoming = match timeout_at(deadline, reading).await {
             Ok(incoming) => incoming?,
             Err(_) => {
                 tracing::debug!("connection timed out waiting for a command");
@@ -346,7 +366,16 @@ enum Incoming {
 /// literal that never arrives is an EOF: the client is gone. A line
 /// that can never be part of a valid command answers BAD before any
 /// continuation is sent, with the command's own tag.
-async fn read_request<R, W>(reader: &mut R, writer: &mut W) -> Result<Incoming>
+///
+/// `literal_budget` bounds the literal bytes of the whole command, not
+/// of each literal: an announcement that would exceed what is left is
+/// refused before its continuation, so chaining literals cannot make
+/// the session hold more than the budget.
+async fn read_request<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    mut literal_budget: usize,
+) -> Result<Incoming>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -373,9 +402,10 @@ where
         // A client literal: answer the continuation and read the
         // announced bytes exactly; the rest of the command follows on
         // the next line, which may announce another literal.
-        if count > MAX_LITERAL_BYTES {
-            return Ok(Incoming::LiteralTooLarge(command_tag(&lines)));
-        }
+        literal_budget = match literal_budget.checked_sub(count) {
+            Some(left) => left,
+            None => return Ok(Incoming::LiteralTooLarge(command_tag(&lines))),
+        };
         write_line(writer, "+ ").await?;
         writer.flush().await.map_err(io_failed)?;
 

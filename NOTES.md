@@ -148,8 +148,10 @@
   - Server-sent literals are inline `{n}\r\n<bytes>` — no continuation
     round-trip; bodies stream in 64 KiB chunks with at most one
     rendered message in memory. Client literals get a `+ ` continuation
-    and are capped at 16 MiB (an oversized announcement answers NO and
-    ends the connection); command lines are capped at 64 KiB, and a
+    and are capped per command, all literals of the command together:
+    4 KiB before login, 16 MiB after (an announcement that would cross
+    the cap answers NO before any continuation and ends the
+    connection); command lines are capped at 64 KiB, and a
     longer line is answered BAD and discarded while being read, never
     buffered whole.
   - `ID` is answered with `* ID ("name" "tuta-bridge")` without
