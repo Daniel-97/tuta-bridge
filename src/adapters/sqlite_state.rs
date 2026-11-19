@@ -175,6 +175,21 @@ impl SqliteStateStore {
         migrated
     }
 
+    /// Start a write transaction that holds the write lock from its first
+    /// statement.
+    ///
+    /// Every transaction here reads before it writes. A deferred `BEGIN`
+    /// would take a read snapshot first and fail the later write at once —
+    /// without honouring the busy timeout — whenever another connection
+    /// committed in between. `BEGIN IMMEDIATE` waits for the lock up
+    /// front instead, so the read and the write see the same state.
+    async fn begin_write(&self) -> Result<sqlx::Transaction<'static, Sqlite>> {
+        self.pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(storage_error)
+    }
+
     /// Assign a stable UID or refresh an existing header on `executor`.
     ///
     /// Callers own the transaction and its commit, which lets
@@ -567,7 +582,25 @@ fn serialize_header(header: &MessageHeader) -> Result<(String, String)> {
     Ok((recipients, references))
 }
 
-fn storage_error(_error: sqlx::Error) -> Error {
+/// Message of the storage error for a database another connection keeps
+/// locked past the busy timeout.
+pub const STATE_BUSY_MESSAGE: &str = "state database is busy";
+
+/// Map a database failure to a fixed message.
+///
+/// SQL text and bound values never appear in it. A lock held by another
+/// connection (`SQLITE_BUSY`, `SQLITE_LOCKED`) gets its own message
+/// because it is transient, unlike every other failure.
+fn storage_error(error: sqlx::Error) -> Error {
+    let busy = error
+        .as_database_error()
+        .and_then(|database| database.code())
+        .and_then(|code| code.parse::<i64>().ok())
+        // The low byte of an extended result code is the primary code.
+        .is_some_and(|code| matches!(code & 0xff, 5 | 6));
+    if busy {
+        return Error::Storage(STATE_BUSY_MESSAGE.into());
+    }
     Error::Storage("state database error".into())
 }
 
@@ -801,7 +834,7 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn assign_uid(&self, mailbox: MailboxId, header: &MessageHeader) -> Result<u32> {
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let mut transaction = self.begin_write().await?;
         let uid = self
             .assign_uid_in(&mut transaction, mailbox, header)
             .await?;
@@ -816,7 +849,7 @@ impl StateStore for SqliteStateStore {
         batch_id: &str,
         changes: &[StateChange],
     ) -> Result<BatchOutcome> {
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let mut transaction = self.begin_write().await?;
         // Mailboxes whose rows this transaction changes, deduplicated
         // and in first-touch order.
         let mut touched: Vec<MailboxId> = Vec::new();
@@ -936,7 +969,7 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let mut transaction = self.begin_write().await?;
         sqlx::query(DELETE_MAILBOX_MESSAGES_SQL)
             .bind(mailbox.0)
             .bind(account_id)
@@ -1033,7 +1066,7 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn reset_account(&self, account_id: i64) -> Result<()> {
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let mut transaction = self.begin_write().await?;
         sqlx::query(DELETE_ACCOUNT_MESSAGES_SQL)
             .bind(account_id)
             .execute(&mut *transaction)
@@ -2096,6 +2129,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created, MailboxId(3));
+    }
+
+    #[tokio::test]
+    async fn write_transactions_hold_the_write_lock_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let store = SqliteStateStore::open(&path).await.unwrap();
+        let (_account, mailbox) = account_and_mailbox(&store).await;
+
+        // A second connection, as another process would hold one; it
+        // gives up at once instead of waiting.
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .busy_timeout(Duration::ZERO);
+        let other = pool_options().connect_with(options).await.unwrap();
+
+        // The store's transaction has only read so far...
+        let mut transaction = store.begin_write().await.unwrap();
+        let next_uid: i64 = sqlx::query_scalar(SELECT_NEXT_UID_SQL)
+            .bind(mailbox.0)
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        assert_eq!(next_uid, 1);
+
+        // ...yet no other connection can commit a write behind its back,
+        // which is what used to fail the transaction's own later write.
+        let error = sqlx::query(INCREMENT_NEXT_UID_SQL)
+            .bind(mailbox.0)
+            .execute(&other)
+            .await
+            .unwrap_err();
+        // The lock is reported with its own, transient message.
+        match storage_error(error) {
+            Error::Storage(message) => assert_eq!(message, STATE_BUSY_MESSAGE),
+            _ => panic!("a busy database is a storage error"),
+        }
+
+        // The store's write then succeeds on the state it read.
+        store
+            .assign_uid_in(&mut transaction, mailbox, &header("entries", "e1"))
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(store.messages(mailbox).await.unwrap()[0].uid, 1);
+
+        // Once it committed, the other connection gets through.
+        sqlx::query(INCREMENT_NEXT_UID_SQL)
+            .bind(mailbox.0)
+            .execute(&other)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
