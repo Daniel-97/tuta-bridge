@@ -195,8 +195,11 @@ would only produce errors. The `Far`/`Near` names require mbsync ≥ 1.3
   `UNSUBSCRIBE`) answer `NO`; write support is planned for a later
   milestone.
 - `SEARCH BODY` and `SEARCH TEXT` are unsupported — bodies are never
-  stored. `NEW`/`OLD` are unsupported too (`RECENT` is always zero).
-  Unsupported keys answer `NO`.
+  stored. `NEW`/`OLD` are unsupported too (`RECENT` is always zero), as
+  are `ANSWERED`, `DELETED`, `DRAFT`, `FLAGGED`, and keyword keys: the
+  bridge stores none of those flags, so their `UN…` forms match every
+  mail. Unsupported keys answer `NO`. `SEARCH CHARSET` accepts `UTF-8`
+  and `US-ASCII` only.
 - Numeric `BODY[n]` part sections are unsupported; only whole-message
   `BODY[]`, `HEADER`, `TEXT`, and `HEADER.FIELDS` sections are served.
 - Mailbox changes are announced at `NOOP`, `CHECK`, and during `IDLE`

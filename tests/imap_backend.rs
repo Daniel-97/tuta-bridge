@@ -12,8 +12,9 @@ use std::sync::Mutex;
 
 use secrecy::{ExposeSecret, SecretString};
 use tuta_bridge::adapters::imap::backend::TutaImapBackend;
-use tuta_bridge::adapters::imap::codec;
+use tuta_bridge::adapters::imap::codec::{self, ImapArg};
 use tuta_bridge::adapters::imap::render::bodystructure;
+use tuta_bridge::adapters::imap::search::parse_search;
 use tuta_bridge::adapters::mime::MimeRenderer;
 use tuta_bridge::app::enrich::EnvelopeEnricher;
 use tuta_bridge::domain::{
@@ -190,6 +191,23 @@ async fn world() -> TestWorld {
     world_with(Arc::new(FakePasswordStore::with("bridge-password"))).await
 }
 
+/// Run `a SEARCH <raw>` over `backend`, tokenized like the session
+/// tokenizes it, with every stored message in view.
+async fn search_line(backend: &TutaImapBackend, mailbox: MailboxId, raw: &str) -> Vec<u32> {
+    let request = codec::parse_line(&format!("a SEARCH {raw}"))
+        .unwrap_or_else(|_| panic!("search line must tokenize"));
+    let keys = parse_search(&request.args).unwrap_or_else(|_| panic!("criteria must parse"));
+    let view: Vec<u32> = backend
+        .store
+        .message_uids(mailbox)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(uid, _)| uid)
+        .collect();
+    backend.search(mailbox, &keys, &view).await.unwrap()
+}
+
 /// Run one SEARCH over `backend` with `&str` criteria for brevity.
 /// The FETCH items of `raw`, parsed the way the session parses them:
 /// tokenized as a command first.
@@ -199,8 +217,21 @@ fn parse_fetch_items(raw: &str) -> Result<Vec<codec::FetchItem>> {
 }
 
 async fn search(backend: &TutaImapBackend, mailbox: MailboxId, criteria: &[&str]) -> Vec<u32> {
-    let owned: Vec<String> = criteria.iter().map(|c| c.to_string()).collect();
-    backend.search(mailbox, &owned).await.unwrap()
+    let args: Vec<ImapArg> = criteria
+        .iter()
+        .map(|token| ImapArg::Atom(token.to_string()))
+        .collect();
+    let keys = parse_search(&args).unwrap_or_else(|_| panic!("criteria must parse"));
+    // The session's view: every stored uid, in order.
+    let view: Vec<u32> = backend
+        .store
+        .message_uids(mailbox)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(uid, _)| uid)
+        .collect();
+    backend.search(mailbox, &keys, &view).await.unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -901,28 +932,66 @@ async fn search_covers_index_keys() {
         search(backend, inbox, &["OR", "SEEN", "SUBJECT", "offer"]).await,
         vec![2, 3]
     );
+
+    // Groups, NOT, and OR keep their structure: NOT negates the whole
+    // group, and OR takes the group as one of its two keys.
+    assert_eq!(
+        search_line(backend, inbox, "NOT (SEEN SUBJECT lunch)").await,
+        vec![1, 3]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "OR (UNSEEN SUBJECT quarterly) SEEN").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "(UNSEEN (OR SUBJECT offer SUBJECT lunch))").await,
+        vec![3]
+    );
+    // Negations of flags the bridge never sets match everything, so a
+    // client's habitual UNDELETED prefix changes nothing.
+    assert_eq!(
+        search_line(backend, inbox, "UNDELETED UNANSWERED SUBJECT offer").await,
+        vec![3]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "CHARSET UTF-8 SUBJECT \"quarterly\"").await,
+        vec![1]
+    );
+    // SENT* keys compare the sent date, which is the received time
+    // until a row is enriched; BCC reads the stored (empty) field.
+    assert_eq!(
+        search_line(backend, inbox, "SENTSINCE 15-Nov-2023").await,
+        vec![2]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "SENTON 14-Nov-2023").await,
+        vec![1]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "SENTBEFORE 14-Nov-2023").await,
+        vec![3]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "BCC example").await,
+        Vec::<u32>::new()
+    );
+
     // Search never enriches: it reads only the stored index.
     assert_eq!(world.source.content_calls(), 0);
 
-    // Body/text search needs a body cache the bridge deliberately keeps
-    // out of the store; keywords, NEW/OLD (\Recent-based, no faithful
-    // reduction), and unknown keys answer the same fixed unsupported
-    // string.
-    for criteria in [
-        ["BODY", "x"],
-        ["TEXT", "x"],
-        ["KEYWORD", "flag"],
-        ["NEW", ""],
-        ["OLD", ""],
-        ["BOGUS", ""],
-    ] {
-        let owned: Vec<String> = criteria.iter().map(|c| c.to_string()).collect();
-        let error = backend.search(inbox, &owned).await.unwrap_err();
-        assert!(
-            matches!(error, Error::Unsupported(message) if message == "search key not supported"),
-            "criteria {criteria:?} must answer the fixed unsupported string"
-        );
-    }
+    // Only the searching session's view is searched, and numbers
+    // resolve against it: with uid 1 not (yet) part of the view, `1`
+    // is uid 2 and uid 1 never matches.
+    let keys = parse_search(&[ImapArg::Atom("1".into())]).unwrap_or_else(|_| panic!());
+    assert_eq!(
+        backend.search(inbox, &keys, &[2, 3]).await.unwrap(),
+        vec![2]
+    );
+    let keys = parse_search(&[ImapArg::Atom("ALL".into())]).unwrap_or_else(|_| panic!());
+    assert_eq!(
+        backend.search(inbox, &keys, &[2, 3]).await.unwrap(),
+        vec![2, 3]
+    );
 }
 
 /// Seed one row shaped like the M2-era zero-date population: marked

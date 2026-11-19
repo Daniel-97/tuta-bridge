@@ -1015,6 +1015,20 @@ async fn search_returns_uids() {
     wire.expect("* SEARCH").await;
     wire.expect("a7 OK UID SEARCH completed").await;
 
+    // UTF-8 and US-ASCII are the searchable charsets; anything else
+    // is refused with the response code naming what is.
+    wire.send("a8 UID SEARCH CHARSET UTF-8 SEEN").await;
+    wire.expect("* SEARCH 2 5").await;
+    wire.expect("a8 OK UID SEARCH completed").await;
+    wire.send("a9 UID SEARCH CHARSET KOI8-R SEEN").await;
+    wire.expect("a9 NO [BADCHARSET (UTF-8)] charset not supported")
+        .await;
+    // A key the index cannot answer is a NO, a bare SEARCH a BAD.
+    wire.send("b1 SEARCH BODY x").await;
+    wire.expect("b1 NO search key not supported").await;
+    wire.send("b2 SEARCH").await;
+    wire.expect("b2 BAD invalid SEARCH").await;
+
     drop(wire);
     session.await.unwrap().unwrap();
 }

@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::{ExposeSecret, SecretString};
-use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem};
+use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem, ImapArg};
+use tuta_bridge::adapters::imap::search::{parse_search, SearchKey};
 use tuta_bridge::domain::{
     AccountId, AccountInfo, BatchOutcome, Error, EventFrame, Folder, MailPlacement, MailboxId,
     MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
@@ -1368,8 +1369,8 @@ pub struct FakeImapBackend {
     /// Uids whose FETCH answers a fixed error: the row exists but its
     /// details cannot be loaded.
     pub failing_fetches: Mutex<Vec<u32>>,
-    /// Non-ALL search answers, keyed by the exact criteria.
-    pub search_scripts: Mutex<HashMap<Vec<String>, Vec<u32>>>,
+    /// Non-ALL search answers, keyed by the exact parsed keys.
+    pub search_scripts: Mutex<Vec<(Vec<SearchKey>, Vec<u32>)>>,
     /// The fallback non-ALL search answer.
     pub search_uids: Mutex<Vec<u32>>,
 }
@@ -1383,7 +1384,7 @@ impl FakeImapBackend {
             snapshots: Mutex::new(HashMap::new()),
             fetches: Mutex::new(HashMap::new()),
             failing_fetches: Mutex::new(Vec::new()),
-            search_scripts: Mutex::new(HashMap::new()),
+            search_scripts: Mutex::new(Vec::new()),
             search_uids: Mutex::new(Vec::new()),
         }
     }
@@ -1420,10 +1421,12 @@ impl FakeImapBackend {
 
     /// Script the exact `SEARCH` result for one criteria list.
     pub fn with_search_result(self, criteria: &[&str], uids: Vec<u32>) -> Self {
-        self.search_scripts.lock().unwrap().insert(
-            criteria.iter().map(|token| token.to_string()).collect(),
-            uids,
-        );
+        let args: Vec<ImapArg> = criteria
+            .iter()
+            .map(|token| ImapArg::Atom(token.to_string()))
+            .collect();
+        let keys = parse_search(&args).unwrap_or_else(|_| panic!("criteria must parse"));
+        self.search_scripts.lock().unwrap().push((keys, uids));
         self
     }
 
@@ -1589,16 +1592,23 @@ impl ImapBackend for FakeImapBackend {
         }))
     }
 
-    async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>> {
-        // The session enumerates a mailbox with the ALL criteria.
-        if criteria.len() == 1 && criteria[0].eq_ignore_ascii_case("ALL") {
-            if let Some(view) = self.views.iter().find(|view| view.id == mailbox) {
-                if let Some(snapshot) = self.snapshots.lock().unwrap().get(&view.name) {
-                    return Ok(snapshot.uids.clone());
-                }
-            }
+    async fn search(
+        &self,
+        _mailbox: MailboxId,
+        keys: &[SearchKey],
+        view: &[u32],
+    ) -> Result<Vec<u32>> {
+        // ALL is every message of the searching session's view.
+        if keys == [SearchKey::All] {
+            return Ok(view.to_vec());
         }
-        if let Some(scripted) = self.search_scripts.lock().unwrap().get(criteria) {
+        if let Some((_, scripted)) = self
+            .search_scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(scripted, _)| scripted == keys)
+        {
             return Ok(scripted.clone());
         }
         Ok(self.search_uids.lock().unwrap().clone())

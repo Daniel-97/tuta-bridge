@@ -51,6 +51,7 @@ use tokio::sync::broadcast;
 
 use super::codec::{self, BodySection, FetchItem, ImapArg, Request};
 use super::render;
+use super::search;
 use crate::domain::MailboxId;
 use crate::domain::{Error, Result};
 use crate::ports::imap_backend::{FetchResponse, ImapBackend};
@@ -998,11 +999,12 @@ impl Session {
         uid_command: bool,
         args: &[ImapArg],
     ) -> Result<()> {
-        let criteria = flatten_criteria(args);
-        if criteria.is_empty() {
+        if args.is_empty() {
             write_line(writer, &format!("{tag} BAD invalid SEARCH")).await?;
             return Ok(());
         }
+        // A refused key or charset is a tagged NO with its fixed text.
+        let keys = search::parse_search(args)?;
         let Some((mailbox, uids)) = self.selected_view() else {
             write_line(
                 writer,
@@ -1015,7 +1017,7 @@ impl Session {
         // view are reported — one the client has not been told about
         // has no number yet — and a plain SEARCH reports the positions
         // the uids occupy in that view.
-        let matched = self.backend.search(mailbox, &criteria).await?;
+        let matched = self.backend.search(mailbox, &keys, &uids).await?;
         let numbers: Vec<String> = matched
             .iter()
             .filter_map(|uid| uids.binary_search(uid).ok().map(|position| (position, uid)))
@@ -1249,20 +1251,6 @@ fn arg_string(arg: &ImapArg) -> String {
         ImapArg::Literal(bytes) => String::from_utf8_lossy(bytes).into_owned(),
         ImapArg::List(_) => String::new(),
     }
-}
-
-/// SEARCH criteria as backend tokens: atoms, quoted values, and literal
-/// bytes pass through as themselves; a parenthesized group contributes
-/// its tokens in place.
-fn flatten_criteria(args: &[ImapArg]) -> Vec<String> {
-    let mut criteria = Vec::new();
-    for arg in args {
-        match arg {
-            ImapArg::List(list) => criteria.extend(flatten_criteria(list)),
-            other => criteria.push(arg_string(other)),
-        }
-    }
-    criteria
 }
 
 /// One-level LIST matching: a pattern containing a wildcard (`*` or `%`)
@@ -1651,25 +1639,6 @@ mod tests {
         assert!(pattern_matches("Inbo*", "Archive"));
         assert!(pattern_matches("Inbox", "Inbox"));
         assert!(!pattern_matches("Inbox", "Archive"));
-    }
-
-    #[test]
-    fn criteria_flatten_groups_and_keep_quoted_values() {
-        let criteria = flatten_criteria(&[
-            ImapArg::Atom("UNSEEN".into()),
-            ImapArg::List(vec![
-                ImapArg::Atom("OR".into()),
-                ImapArg::Atom("FROM".into()),
-                ImapArg::Quoted("a b".into()),
-                ImapArg::Atom("TO".into()),
-                ImapArg::Atom("c".into()),
-            ]),
-            ImapArg::Literal(b"lit".to_vec()),
-        ]);
-        assert_eq!(
-            criteria,
-            vec!["UNSEEN", "OR", "FROM", "a b", "TO", "c", "lit"]
-        );
     }
 
     #[test]

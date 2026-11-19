@@ -7,5 +7,6 @@
 pub mod backend;
 pub mod codec;
 pub mod render;
+pub mod search;
 pub mod server;
 pub mod session;

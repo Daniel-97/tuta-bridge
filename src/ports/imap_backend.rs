@@ -1,6 +1,7 @@
 use secrecy::SecretString;
 
 use crate::adapters::imap::codec::FetchItem;
+use crate::adapters::imap::search::SearchKey;
 use crate::domain::{MailboxId, Result};
 
 /// One mailbox as `LIST`/`LSUB` answer it.
@@ -91,7 +92,16 @@ pub trait ImapBackend: Send + Sync {
         uid: u32,
         items: &[FetchItem],
     ) -> Result<Option<FetchResponse>>;
-    /// Evaluate SEARCH criteria over the stored index; the returned
-    /// numbers are UIDs.
-    async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>>;
+    /// Evaluate SEARCH keys — every one must match — over the stored
+    /// index; the returned numbers are UIDs, ascending.
+    ///
+    /// `view` is the searching session's uid list in message-number
+    /// order: only its messages are candidates, and sequence-number
+    /// keys and `*` resolve against it, never against the live store.
+    async fn search(
+        &self,
+        mailbox: MailboxId,
+        keys: &[SearchKey],
+        view: &[u32],
+    ) -> Result<Vec<u32>>;
 }

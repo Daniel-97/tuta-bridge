@@ -16,11 +16,11 @@
 use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
-use time::Date;
 use tokio::sync::Mutex;
 
-use super::codec::{parse_seq_set, BodySection, FetchItem, SeqSet};
+use super::codec::{BodySection, FetchItem};
 use super::render;
+use super::search::SearchKey;
 use crate::app::enrich::EnvelopeEnricher;
 use crate::domain::{
     Address, Error, Folder, FolderKind, MailboxId, MessageContent, MessageHeader, MessagePage,
@@ -211,193 +211,6 @@ fn slice_body_section(rendered: &[u8], section: &BodySection) -> Result<Vec<u8>>
 // SEARCH
 // ---------------------------------------------------------------------------
 
-/// One parsed SEARCH criterion.
-enum SearchKey {
-    All,
-    Unseen,
-    Seen,
-    /// `UID <set>`.
-    Uid(SeqSet),
-    /// A bare sequence set: message numbers, 1-based positions.
-    Sequence(SeqSet),
-    /// `SINCE <date>`: received on or after the UTC day start.
-    Since(i64),
-    /// `BEFORE <date>`: received strictly before the UTC day start.
-    Before(i64),
-    /// `ON <date>`: received within the UTC day `[start, end)`.
-    On(i64, i64),
-    /// `SUBJECT/FROM/TO/CC/HEADER <field> <value>`: case-insensitive
-    /// substring match over the stored (partial or enriched) header
-    /// field.
-    Header {
-        field: String,
-        value: String,
-    },
-    /// `LARGER <n>`: stored RFC 822 size strictly larger than `n`.
-    Larger(u64),
-    /// `SMALLER <n>`: stored RFC 822 size strictly smaller than `n`.
-    Smaller(u64),
-    Not(Box<SearchKey>),
-    Or(Box<SearchKey>, Box<SearchKey>),
-}
-
-fn invalid_search_criteria() -> Error {
-    Error::Unsupported("invalid search criteria".into())
-}
-
-fn unsupported_search_key() -> Error {
-    Error::Unsupported("search key not supported".into())
-}
-
-fn invalid_search_date() -> Error {
-    Error::Unsupported("invalid search date".into())
-}
-
-/// Consume the next criterion token or fail with the fixed message.
-fn next_token<'a>(criteria: &'a [String], cursor: &mut usize) -> Result<&'a str> {
-    match criteria.get(*cursor) {
-        Some(token) => {
-            *cursor += 1;
-            Ok(token.as_str())
-        }
-        None => Err(invalid_search_criteria()),
-    }
-}
-
-/// Parse an IMAP date `dd-Mmm-yyyy`.
-///
-/// RFC 3501 spells the month `Nov`, but clients send any casing; the
-/// fixed `time` format matches the month case-sensitively by default,
-/// so the component parses with `case_sensitive=false`, which accepts
-/// `nov`, `NOV`, and `Nov` alike. RFC 3501 date-days carry one or two
-/// digits; the one-digit form retries zero-padded.
-fn parse_search_date(raw: &str) -> Result<Date> {
-    let format =
-        time::macros::format_description!("[day]-[month repr:short case_sensitive:false]-[year]");
-    let trimmed = raw.trim();
-    if let Ok(date) = Date::parse(trimmed, &format) {
-        return Ok(date);
-    }
-    let padded = match trimmed.split_once('-') {
-        Some((day, rest)) if day.len() == 1 && day.bytes().all(|b| b.is_ascii_digit()) => {
-            format!("0{day}-{rest}")
-        }
-        _ => return Err(invalid_search_date()),
-    };
-    Date::parse(&padded, &format).map_err(|_| invalid_search_date())
-}
-
-/// UTC milliseconds at the start of the given day.
-fn day_start_ms(date: Date) -> i64 {
-    date.midnight()
-        .assume_utc()
-        .unix_timestamp()
-        .saturating_mul(1000)
-}
-
-/// UTC milliseconds at the start of the day after `date`.
-fn next_day_start_ms(date: Date) -> i64 {
-    match date.next_day() {
-        Some(next) => day_start_ms(next),
-        None => i64::MAX,
-    }
-}
-
-/// Parse one key at `cursor`, consuming its argument tokens.
-fn parse_search_key(criteria: &[String], cursor: &mut usize, depth: usize) -> Result<SearchKey> {
-    if depth > MAX_SEARCH_KEY_DEPTH {
-        return Err(invalid_search_criteria());
-    }
-    let token = next_token(criteria, cursor)?;
-    match token.to_ascii_uppercase().as_str() {
-        "ALL" => Ok(SearchKey::All),
-        "UNSEEN" => Ok(SearchKey::Unseen),
-        "SEEN" => Ok(SearchKey::Seen),
-        "UID" => Ok(SearchKey::Uid(parse_seq_set(next_token(
-            criteria, cursor,
-        )?)?)),
-        "SINCE" => Ok(SearchKey::Since(day_start_ms(parse_search_date(
-            next_token(criteria, cursor)?,
-        )?))),
-        "BEFORE" => Ok(SearchKey::Before(day_start_ms(parse_search_date(
-            next_token(criteria, cursor)?,
-        )?))),
-        "ON" => {
-            let date = parse_search_date(next_token(criteria, cursor)?)?;
-            Ok(SearchKey::On(day_start_ms(date), next_day_start_ms(date)))
-        }
-        "SUBJECT" => Ok(SearchKey::Header {
-            field: "Subject".into(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "FROM" => Ok(SearchKey::Header {
-            field: "From".into(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "TO" => Ok(SearchKey::Header {
-            field: "To".into(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "CC" => Ok(SearchKey::Header {
-            field: "Cc".into(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "HEADER" => Ok(SearchKey::Header {
-            field: next_token(criteria, cursor)?.to_string(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "LARGER" => Ok(SearchKey::Larger(
-            next_token(criteria, cursor)?
-                .parse()
-                .map_err(|_| invalid_search_criteria())?,
-        )),
-        "SMALLER" => Ok(SearchKey::Smaller(
-            next_token(criteria, cursor)?
-                .parse()
-                .map_err(|_| invalid_search_criteria())?,
-        )),
-        "NOT" => Ok(SearchKey::Not(Box::new(parse_search_key(
-            criteria,
-            cursor,
-            depth + 1,
-        )?))),
-        "OR" => {
-            let first = parse_search_key(criteria, cursor, depth + 1)?;
-            let second = parse_search_key(criteria, cursor, depth + 1)?;
-            Ok(SearchKey::Or(Box::new(first), Box::new(second)))
-        }
-        // Body/text search needs decrypted bodies in the store, which the
-        // bridge deliberately never keeps. Keyword and remaining flag
-        // keys have no Tuta equivalent — NEW/OLD are \Recent-based, and
-        // their only faithful reductions (nothing / everything) would be
-        // a lie, so they are refused like the rest.
-        "BODY" | "TEXT" | "KEYWORD" | "UNKEYWORD" | "ANSWERED" | "DELETED" | "DRAFT"
-        | "FLAGGED" | "RECENT" | "NEW" | "OLD" => Err(unsupported_search_key()),
-        _ => match parse_seq_set(token) {
-            // A bare sequence set (SEARCH 1:2) selects message numbers.
-            Ok(set) => Ok(SearchKey::Sequence(set)),
-            Err(_) => Err(unsupported_search_key()),
-        },
-    }
-}
-
-/// Deepest NOT/OR nesting accepted; deeper trees fail with the fixed
-/// criteria error instead of recursing without bound.
-const MAX_SEARCH_KEY_DEPTH: usize = 16;
-
-/// Parse the full criterion list into the keys every message must match.
-fn parse_search_criteria(criteria: &[String]) -> Result<Vec<SearchKey>> {
-    if criteria.is_empty() {
-        return Err(invalid_search_criteria());
-    }
-    let mut cursor = 0;
-    let mut keys = Vec::new();
-    while cursor < criteria.len() {
-        keys.push(parse_search_key(criteria, &mut cursor, 0)?);
-    }
-    Ok(keys)
-}
-
 /// One address as searchable text: name and address both match.
 fn address_text(address: &Address) -> String {
     match &address.name {
@@ -452,8 +265,19 @@ fn stored_header_value(header: &MessageHeader, field: &str) -> Option<String> {
     }
 }
 
+/// The time the `SENT*` keys compare: the `Date:` header once the row
+/// is enriched, the received time until then — the same fallback the
+/// stored sent date itself uses for undated mail.
+fn sent_ms(header: &MessageHeader) -> i64 {
+    if header.sent_at_ms > 0 {
+        header.sent_at_ms
+    } else {
+        header.received_at_ms
+    }
+}
+
 /// Evaluate one key against a stored message; `msn` is the message's
-/// 1-based position in the mailbox, `len` the mailbox's message
+/// number in the searching session's view, `len` that view's message
 /// count, and `max_uid` its highest uid — the ends star ranges
 /// resolve against in each space.
 fn search_key_matches(
@@ -474,6 +298,12 @@ fn search_key_matches(
         SearchKey::On(start, end) => {
             message.header.received_at_ms >= *start && message.header.received_at_ms < *end
         }
+        SearchKey::SentSince(start) => sent_ms(&message.header) >= *start,
+        SearchKey::SentBefore(start) => sent_ms(&message.header) < *start,
+        SearchKey::SentOn(start, end) => {
+            let sent = sent_ms(&message.header);
+            sent >= *start && sent < *end
+        }
         SearchKey::Header { field, value } => {
             match stored_header_value(&message.header, field) {
                 // A case-insensitive substring over the stored field.
@@ -490,6 +320,9 @@ fn search_key_matches(
             search_key_matches(first, msn, len, max_uid, message)
                 || search_key_matches(second, msn, len, max_uid, message)
         }
+        SearchKey::And(keys) => keys
+            .iter()
+            .all(|key| search_key_matches(key, msn, len, max_uid, message)),
     }
 }
 
@@ -751,26 +584,29 @@ impl ImapBackend for TutaImapBackend {
         }))
     }
 
-    async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>> {
-        let keys = parse_search_criteria(criteria)?;
+    async fn search(
+        &self,
+        mailbox: MailboxId,
+        keys: &[SearchKey],
+        view: &[u32],
+    ) -> Result<Vec<u32>> {
         let messages = self.store.messages(mailbox).await?;
-        // Star ranges resolve against the ends actually in use: the
-        // message count in MSN space, the highest uid in UID space.
-        let len = u32::try_from(messages.len()).unwrap_or(u32::MAX);
-        let max_uid = messages
-            .iter()
-            .map(|message| message.uid)
-            .max()
-            .unwrap_or(0);
+        // Numbers and star ranges resolve against the session's view:
+        // its message count in number space, its highest uid in UID
+        // space. A stored message outside the view is not a candidate.
+        let len = u32::try_from(view.len()).unwrap_or(u32::MAX);
+        let max_uid = view.last().copied().unwrap_or(0);
         Ok(messages
             .iter()
-            .enumerate()
-            .filter(|(index, message)| {
-                let msn = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            .filter(|message| {
+                let Ok(position) = view.binary_search(&message.uid) else {
+                    return false;
+                };
+                let msn = u32::try_from(position + 1).unwrap_or(u32::MAX);
                 keys.iter()
                     .all(|key| search_key_matches(key, msn, len, max_uid, message))
             })
-            .map(|(_, message)| message.uid)
+            .map(|message| message.uid)
             .collect())
     }
 }
@@ -861,107 +697,6 @@ mod tests {
         // Nothing matched: just the blank terminator.
         let out = header_fields(header, &["\"X-Missing\"".to_string()]);
         assert_eq!(out, b"\r\n".to_vec());
-    }
-
-    #[test]
-    fn search_dates_map_to_utc_day_boundaries() {
-        // 14-Nov-2023 00:00 UTC, and the day after.
-        let date = parse_search_date("14-Nov-2023").unwrap();
-        assert_eq!(day_start_ms(date), 1_699_920_000_000);
-        assert_eq!(next_day_start_ms(date), 1_700_006_400_000);
-        // One-digit days parse too (RFC 3501 date-day is unpadded).
-        assert_eq!(
-            day_start_ms(parse_search_date("4-Nov-2023").unwrap()),
-            1_699_056_000_000
-        );
-        // The month parses in any casing: `nov` and `NOV` alike.
-        for raw in ["14-nov-2023", "14-NOV-2023"] {
-            assert_eq!(
-                day_start_ms(parse_search_date(raw).unwrap()),
-                1_699_920_000_000,
-                "{raw} must parse in any casing"
-            );
-        }
-        // The one-digit-day retry path keeps that behavior too.
-        assert_eq!(
-            day_start_ms(parse_search_date("4-nOV-2023").unwrap()),
-            1_699_056_000_000
-        );
-        // Fixed error strings, no client input echoed.
-        assert!(matches!(
-            parse_search_date("2023-11-14"),
-            Err(Error::Unsupported(message)) if message == "invalid search date"
-        ));
-        assert!(matches!(
-            parse_search_date("99-Xxx-9999"),
-            Err(Error::Unsupported(message)) if message == "invalid search date"
-        ));
-    }
-
-    #[test]
-    fn search_criteria_parse_index_keys_and_refuse_bodies() {
-        let parse = |criteria: &[&str]| {
-            let owned: Vec<String> = criteria.iter().map(|c| c.to_string()).collect();
-            parse_search_criteria(&owned)
-        };
-
-        assert!(matches!(parse(&["ALL"]).unwrap()[0], SearchKey::All));
-        assert!(matches!(parse(&["UNSEEN"]).unwrap()[0], SearchKey::Unseen));
-        assert!(matches!(parse(&["SEEN"]).unwrap()[0], SearchKey::Seen));
-        assert!(matches!(
-            parse(&["UID", "1:2"]).unwrap()[0],
-            SearchKey::Uid(_)
-        ));
-        assert!(matches!(
-            parse(&["1:2"]).unwrap()[0],
-            SearchKey::Sequence(_)
-        ));
-        assert!(matches!(
-            parse(&["NOT", "SEEN"]).unwrap()[0],
-            SearchKey::Not(_)
-        ));
-        assert!(matches!(
-            parse(&["OR", "UNSEEN", "SUBJECT", "x"]).unwrap()[0],
-            SearchKey::Or(_, _)
-        ));
-        assert!(matches!(
-            parse(&["SINCE", "15-Nov-2023"]).unwrap()[0],
-            SearchKey::Since(start) if start == 1_700_006_400_000
-        ));
-
-        // Structural failures answer the fixed criteria string.
-        assert!(parse(&[]).is_err());
-        assert!(parse(&["SUBJECT"]).is_err());
-        assert!(parse(&["UID", "0"]).is_err());
-        assert!(matches!(
-            parse(&["HEADER", "Subject"]),
-            Err(Error::Unsupported(message)) if message == "invalid search criteria"
-        ));
-
-        // Unsupported keys answer the fixed unsupported string — NEW/OLD
-        // included: they are \Recent-based, and their only faithful
-        // reductions (nothing / everything) would be a lie.
-        for criteria in [
-            ["BODY", "x"],
-            ["TEXT", "x"],
-            ["KEYWORD", "f"],
-            ["FLAGGED", ""],
-            ["NEW", ""],
-            ["OLD", ""],
-        ] {
-            assert!(
-                matches!(parse(&criteria), Err(Error::Unsupported(message)) if message == "search key not supported"),
-                "{criteria:?} must be refused"
-            );
-        }
-
-        // Deep NOT nesting is refused instead of recursing without bound.
-        let mut deep: Vec<String> = (0..20).map(|_| "NOT".to_string()).collect();
-        deep.push("SEEN".to_string());
-        assert!(matches!(
-            parse_search_criteria(&deep),
-            Err(Error::Unsupported(message)) if message == "invalid search criteria"
-        ));
     }
 
     #[test]
