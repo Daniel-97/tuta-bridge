@@ -1,4 +1,4 @@
-use tuta_bridge::adapters::mime::MimeRenderer;
+use tuta_bridge::adapters::mime::{deterministic_boundary, MimeRenderer};
 use tuta_bridge::domain::{Address, Attachment, MessageContent, MessageSummary};
 use tuta_bridge::ports::MessageRenderer;
 
@@ -130,4 +130,53 @@ fn cid_attachment_without_html_is_emitted_inline() {
     let raw = String::from_utf8_lossy(&bytes);
     assert!(raw.contains("Content-ID: <img1>"));
     assert!(raw.contains("Content-Disposition: inline"));
+}
+
+/// The boundary parameter the rendered message declares for `subtype`.
+fn declared_boundary(raw: &str, subtype: &str) -> String {
+    let header = raw
+        .find(&format!("multipart/{subtype}"))
+        .expect("multipart header present");
+    let rest = &raw[header..];
+    let start = rest.find("boundary=\"").expect("boundary parameter") + "boundary=\"".len();
+    let end = rest[start..].find('"').expect("closing quote");
+    rest[start..start + end].to_string()
+}
+
+#[test]
+fn planted_boundary_cannot_forge_the_structure() {
+    // The sender picks the Message-ID, so the boundaries derived from it
+    // alone are predictable; an ASCII body is written unencoded.
+    let mut c = fixture();
+    c.body_html = None;
+    c.attachments.clear();
+    let predicted = deterministic_boundary("<id@example>", "alt");
+    c.body_text = Some(format!(
+        "hello\r\n--{predicted}\r\nContent-Type: text/html\r\n\r\n<b>forged</b>\r\n--{predicted}--\r\n"
+    ));
+
+    let bytes = MimeRenderer.render(&c).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(raw.contains(&format!("--{predicted}")), "body is verbatim");
+
+    // No declared boundary occurs in the body the sender wrote, and the
+    // rendering stays deterministic.
+    for subtype in ["mixed", "alternative"] {
+        let declared = declared_boundary(&raw, subtype);
+        assert_ne!(declared, predicted);
+        assert!(!c.body_text.as_ref().unwrap().contains(&declared));
+    }
+    assert_eq!(bytes, MimeRenderer.render(&c).unwrap());
+}
+
+#[test]
+fn ordinary_mail_keeps_the_message_id_boundaries() {
+    // Stored sizes and client caches depend on the rendering of mail
+    // that never mentions a bridge boundary staying byte-identical.
+    let bytes = MimeRenderer.render(&fixture()).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert_eq!(
+        declared_boundary(&raw, "alternative"),
+        deterministic_boundary("<id@example>", "alt")
+    );
 }

@@ -14,7 +14,9 @@ use time::format_description::well_known::Rfc2822;
 use time::OffsetDateTime;
 
 use super::codec::{encode_string, ImapString};
-use crate::adapters::mime::{deterministic_boundary, sanitize_cid, sanitize_media_type};
+use crate::adapters::mime::{
+    boundary_seed, deterministic_boundary, sanitize_cid, sanitize_media_type,
+};
 use crate::domain::{Address, Attachment, FolderKind, MessageContent, MessageHeader};
 
 /// The three-letter month names an INTERNALDATE carries, `Jan..Dec`.
@@ -221,10 +223,7 @@ fn multipart(parts: &[String], subtype: &str, boundary: &str) -> String {
 /// `build_message` derives, so the structure names the exact
 /// boundaries the rendered MIME bytes carry.
 pub fn bodystructure(content: &MessageContent) -> String {
-    let seed = content
-        .message_id
-        .clone()
-        .unwrap_or_else(|| format!("{}/{}", content.summary.list_id, content.summary.element_id));
+    let seed = boundary_seed(content);
 
     // Partition attachments exactly like `build_message`: a
     // sanitize-able cid makes an attachment inline.

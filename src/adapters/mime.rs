@@ -25,7 +25,7 @@ pub struct MimeRenderer;
 pub fn deterministic_boundary(seed: &str, label: &str) -> String {
     let hash = tutasdk::crypto::sha256(seed.as_bytes());
     format!(
-        "=_tuta_bridge_{}_{}",
+        "{BOUNDARY_PREFIX}{}_{}",
         label,
         URL_SAFE_NO_PAD.encode(&hash[..9])
     )
@@ -125,17 +125,16 @@ fn convert_list(addrs: &[Address]) -> MbAddress<'static> {
     MbAddress::new_list(addrs.iter().map(convert_address).collect())
 }
 
-fn build_message(content: &MessageContent) -> Result<Vec<u8>> {
-    let seed = content
-        .message_id
-        .clone()
-        .unwrap_or_else(|| format!("{}/{}", content.summary.list_id, content.summary.element_id));
+/// Prefix shared by every boundary this renderer emits.
+const BOUNDARY_PREFIX: &str = "=_tuta_bridge_";
 
-    let mixed_boundary = deterministic_boundary(&seed, "mixed");
-    let alt_boundary = deterministic_boundary(&seed, "alt");
-    let related_boundary = deterministic_boundary(&seed, "related");
+/// Labels of the three multipart levels `build_message` writes.
+const BOUNDARY_LABELS: [&str; 3] = ["mixed", "alt", "related"];
 
-    let plain_text = content
+/// The plain-text alternative: the stored text body, the HTML body
+/// flattened to text, or nothing.
+fn plain_text_of(content: &MessageContent) -> String {
+    content
         .body_text
         .clone()
         .or_else(|| {
@@ -144,7 +143,86 @@ fn build_message(content: &MessageContent) -> Result<Vec<u8>> {
                 .as_ref()
                 .map(|html| mail_parser::html_to_text(html))
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// True when `needle` occurs in any byte the renderer may write verbatim.
+fn content_contains(content: &MessageContent, plain_text: &str, needle: &str) -> bool {
+    plain_text.contains(needle)
+        || content
+            .body_html
+            .as_deref()
+            .is_some_and(|html| html.contains(needle))
+        || content
+            .attachments
+            .iter()
+            .any(|attachment| contains_bytes(&attachment.data, needle.as_bytes()))
+}
+
+/// The seed every boundary of `content` is derived from.
+///
+/// The base seed is the Message-ID (or the Tuta ids), which the sender
+/// chooses, and ASCII text parts are written unencoded — so a sender could
+/// precompute the boundaries and plant one in a body to forge the MIME
+/// structure. When the content mentions a bridge boundary at all, the seed
+/// is extended with a digest of that content (and a counter, until no
+/// derived boundary occurs in it), which the sender cannot aim at. Mail
+/// that never mentions one keeps the plain seed, so its rendering is
+/// unchanged. The result is still a pure function of the content.
+///
+/// Crate-shared: the IMAP BODYSTRUCTURE renderer derives its boundary
+/// parameters from the same seed so they match the rendered message.
+pub(crate) fn boundary_seed(content: &MessageContent) -> String {
+    pick_boundary_seed(content, &plain_text_of(content))
+}
+
+fn pick_boundary_seed(content: &MessageContent, plain_text: &str) -> String {
+    let base = content
+        .message_id
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}", content.summary.list_id, content.summary.element_id));
+    if !content_contains(content, plain_text, BOUNDARY_PREFIX) {
+        return base;
+    }
+
+    let mut hashed = Vec::new();
+    for part in [plain_text, content.body_html.as_deref().unwrap_or_default()] {
+        hashed.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        hashed.extend_from_slice(part.as_bytes());
+    }
+    for attachment in &content.attachments {
+        hashed.extend_from_slice(&(attachment.data.len() as u64).to_be_bytes());
+        hashed.extend_from_slice(&attachment.data);
+    }
+    let digest = URL_SAFE_NO_PAD.encode(tutasdk::crypto::sha256(&hashed));
+
+    let mut counter = 0u32;
+    loop {
+        let seed = format!("{base}\n{digest}\n{counter}");
+        let collides = BOUNDARY_LABELS.iter().any(|label| {
+            content_contains(content, plain_text, &deterministic_boundary(&seed, label))
+        });
+        if !collides {
+            return seed;
+        }
+        counter += 1;
+    }
+}
+
+fn build_message(content: &MessageContent) -> Result<Vec<u8>> {
+    let plain_text = plain_text_of(content);
+    let seed = pick_boundary_seed(content, &plain_text);
+
+    let mixed_boundary = deterministic_boundary(&seed, "mixed");
+    let alt_boundary = deterministic_boundary(&seed, "alt");
+    let related_boundary = deterministic_boundary(&seed, "related");
 
     // Partition attachments: those with a valid Content-ID become inline parts,
     // everything else (no cid, or an invalid cid) is a regular attachment.
