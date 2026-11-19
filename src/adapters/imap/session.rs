@@ -184,38 +184,45 @@ enum Incoming {
     Eof,
 }
 
-/// Read one full command: the line, every announced literal (continuation
-/// `+ `, exact byte count, continuation line), and nothing else.
+/// Read one full command: its first line, and for every announced
+/// literal the continuation `+ `, the exact byte count, and the line
+/// that follows. The whole command is tokenized once it is complete.
 ///
 /// A line beyond [`MAX_LINE_BYTES`] is refused exactly as it always
 /// was, but never buffered whole: the bounded read scans the stream
 /// window by window and discards a line once it crosses the cap. A
-/// literal that never arrives is an EOF: the client is gone. A tail
-/// line that fails to parse answers BAD with the command's own tag.
+/// literal that never arrives is an EOF: the client is gone. A line
+/// that can never be part of a valid command answers BAD before any
+/// continuation is sent, with the command's own tag.
 async fn read_request<R, W>(reader: &mut R, writer: &mut W) -> Result<Incoming>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut bytes = Vec::new();
-    let mut line = match read_line(reader, &mut bytes).await? {
-        Some(LineRead::Line(line)) => line,
-        // An over-cap line: the fixed refusal, with the connection
-        // left at the start of the next line.
-        Some(LineRead::TooLong) => return Ok(Incoming::Invalid("*".into())),
-        None => return Ok(Incoming::Eof),
-    };
-    let mut request = match codec::parse_line(&line) {
-        Ok(request) => request,
-        Err(_) => return Ok(Incoming::Invalid(bad_tag(&line))),
-    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut literals: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let line = match read_line(reader, &mut bytes).await? {
+            Some(LineRead::Line(line)) => line,
+            // An over-cap line: the fixed refusal, with the connection
+            // left at the start of the next line.
+            Some(LineRead::TooLong) => return Ok(Incoming::Invalid(command_tag(&lines))),
+            None => return Ok(Incoming::Eof),
+        };
+        let pending = codec::pending_literal(&line);
+        lines.push(line);
+        let count = match pending {
+            Ok(Some(count)) => count,
+            Ok(None) => break,
+            Err(_) => return Ok(Incoming::Invalid(command_tag(&lines))),
+        };
 
-    // A client literal: answer the continuation, read the announced
-    // bytes exactly, fill the placeholder, and parse the rest of the
-    // line — which may announce the next literal.
-    while let Some(count) = codec::pending_literal(&line) {
+        // A client literal: answer the continuation and read the
+        // announced bytes exactly; the rest of the command follows on
+        // the next line, which may announce another literal.
         if count > MAX_LITERAL_BYTES {
-            return Ok(Incoming::LiteralTooLarge(request.tag.clone()));
+            return Ok(Incoming::LiteralTooLarge(command_tag(&lines)));
         }
         write_line(writer, "+ ").await?;
         writer.flush().await.map_err(io_failed)?;
@@ -224,25 +231,20 @@ where
         if reader.read_exact(&mut data).await.is_err() {
             return Ok(Incoming::Eof);
         }
-        // The marker is always the last argument so far; fill it.
-        for arg in request.args.iter_mut().rev() {
-            if let ImapArg::Literal(slot) = arg {
-                *slot = data;
-                break;
-            }
-        }
-
-        // The rest of the line follows the literal bytes.
-        line = match read_line(reader, &mut bytes).await? {
-            Some(LineRead::Line(line)) => line,
-            Some(LineRead::TooLong) => return Ok(Incoming::Invalid(request.tag.clone())),
-            None => return Ok(Incoming::Eof),
-        };
-        if codec::parse_continuation(&line, &mut request.args).is_err() {
-            return Ok(Incoming::Invalid(request.tag.clone()));
-        }
+        literals.push(data);
     }
-    Ok(Incoming::Request(request))
+    match codec::parse_command(&lines, literals) {
+        Ok(request) => Ok(Incoming::Request(request)),
+        Err(_) => Ok(Incoming::Invalid(command_tag(&lines))),
+    }
+}
+
+/// The tag a refused command is answered with: the first token of its
+/// first line when that is safe to echo, `*` otherwise.
+fn command_tag(lines: &[String]) -> String {
+    lines
+        .first()
+        .map_or_else(|| "*".to_string(), |line| bad_tag(line))
 }
 
 /// What one bounded line read produced.
@@ -826,15 +828,19 @@ impl Session {
                 return Ok(());
             }
         };
-        let items = match items_arg {
-            ImapArg::Raw(inner) => inner
-                .split_whitespace()
-                .map(|item| item.to_ascii_uppercase())
-                .collect::<Vec<String>>(),
-            _ => {
-                write_line(writer, &format!("{tag} BAD invalid STATUS")).await?;
-                return Ok(());
-            }
+        let items: Option<Vec<String>> = match items_arg {
+            ImapArg::List(list) => list
+                .iter()
+                .map(|item| match item {
+                    ImapArg::Atom(item) => Some(item.to_ascii_uppercase()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        };
+        let Some(items) = items else {
+            write_line(writer, &format!("{tag} BAD invalid STATUS")).await?;
+            return Ok(());
         };
         for item in &items {
             if !matches!(
@@ -893,7 +899,7 @@ impl Session {
                 return Ok(());
             }
         };
-        let mut items = match codec::parse_fetch_items(&join_args(&args[1.min(args.len())..])) {
+        let mut items = match codec::parse_fetch_items(&args[1.min(args.len())..]) {
             Ok(items) => items,
             Err(_) => {
                 write_line(writer, &format!("{tag} BAD invalid fetch items")).await?;
@@ -1232,62 +1238,29 @@ fn normalize(command: &str, args: &[ImapArg]) -> String {
     }
 }
 
-/// One argument as plain text: atoms and quoted strings as themselves, a
-/// literal as its bytes, a parenthesized group as its inner text.
+/// One argument as plain text: atoms and quoted strings as themselves,
+/// a literal as its bytes. A list has no text and reads as empty.
 fn arg_string(arg: &ImapArg) -> String {
     match arg {
         ImapArg::Atom(atom) => atom.clone(),
         ImapArg::Quoted(value) => value.clone(),
         ImapArg::Literal(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        ImapArg::Raw(inner) => inner.clone(),
+        ImapArg::List(_) => String::new(),
     }
 }
 
-/// The FETCH item list as one string: the arguments after the sequence
-/// set, joined with spaces so a parenthesized list stays one group.
-fn join_args(args: &[ImapArg]) -> String {
-    args.iter()
-        .map(arg_string)
-        .collect::<Vec<String>>()
-        .join(" ")
-}
-
 /// SEARCH criteria as backend tokens: atoms, quoted values, and literal
-/// bytes pass through as themselves; a parenthesized group splits into
-/// its tokens, keeping quoted values with spaces whole.
+/// bytes pass through as themselves; a parenthesized group contributes
+/// its tokens in place.
 fn flatten_criteria(args: &[ImapArg]) -> Vec<String> {
     let mut criteria = Vec::new();
     for arg in args {
         match arg {
-            ImapArg::Raw(inner) => criteria.extend(split_raw(inner)),
+            ImapArg::List(list) => criteria.extend(flatten_criteria(list)),
             other => criteria.push(arg_string(other)),
         }
     }
     criteria
-}
-
-/// Whitespace-split a parenthesized group's inner text, honoring double
-/// quotes around values with spaces (the quotes are stripped, like
-/// top-level quoted arguments).
-fn split_raw(inner: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for c in inner.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            c if c.is_whitespace() && !quoted => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
 }
 
 /// One-level LIST matching: a pattern containing a wildcard (`*` or `%`)
@@ -1426,7 +1399,6 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::parse_fetch_items;
     use super::*;
 
     /// The rendered pieces as one comparable wire string.
@@ -1439,6 +1411,13 @@ mod tests {
             }
         }
         wire
+    }
+
+    /// The FETCH items of `raw`, parsed the way the handler parses
+    /// them: tokenized as a command first.
+    fn parse_fetch_items(raw: &str) -> Result<Vec<FetchItem>> {
+        let request = codec::parse_line(&format!("a FETCH 1 {raw}"))?;
+        codec::parse_fetch_items(&request.args[1..])
     }
 
     /// The item list a UID command carries: the client's items plus the
@@ -1515,7 +1494,13 @@ mod tests {
     fn criteria_flatten_groups_and_keep_quoted_values() {
         let criteria = flatten_criteria(&[
             ImapArg::Atom("UNSEEN".into()),
-            ImapArg::Raw("OR FROM \"a b\" TO c".into()),
+            ImapArg::List(vec![
+                ImapArg::Atom("OR".into()),
+                ImapArg::Atom("FROM".into()),
+                ImapArg::Quoted("a b".into()),
+                ImapArg::Atom("TO".into()),
+                ImapArg::Atom("c".into()),
+            ]),
             ImapArg::Literal(b"lit".to_vec()),
         ]);
         assert_eq!(

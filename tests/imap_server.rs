@@ -370,6 +370,17 @@ async fn fetch_streams_bodies_and_skips_expunged_uids() {
     .await;
     wire.expect("a7 OK FETCH completed").await;
 
+    // A bare item with a bracketed list is one item, with or without
+    // the surrounding parentheses.
+    wire.send("a8 FETCH 1 BODY.PEEK[HEADER.FIELDS (DATE FROM)]")
+        .await;
+    let bytes = wire
+        .literal("* 1 FETCH (BODY[HEADER.FIELDS (DATE FROM)] ")
+        .await;
+    assert_eq!(bytes, body);
+    wire.expect(")").await;
+    wire.expect("a8 OK FETCH completed").await;
+
     drop(wire);
     session.await.unwrap().unwrap();
 }

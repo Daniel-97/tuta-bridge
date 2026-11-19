@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use secrecy::{ExposeSecret, SecretString};
 use tuta_bridge::adapters::imap::backend::TutaImapBackend;
-use tuta_bridge::adapters::imap::codec::parse_fetch_items;
+use tuta_bridge::adapters::imap::codec;
 use tuta_bridge::adapters::imap::render::bodystructure;
 use tuta_bridge::adapters::mime::MimeRenderer;
 use tuta_bridge::app::enrich::EnvelopeEnricher;
@@ -191,6 +191,13 @@ async fn world() -> TestWorld {
 }
 
 /// Run one SEARCH over `backend` with `&str` criteria for brevity.
+/// The FETCH items of `raw`, parsed the way the session parses them:
+/// tokenized as a command first.
+fn parse_fetch_items(raw: &str) -> Result<Vec<codec::FetchItem>> {
+    let request = codec::parse_line(&format!("a FETCH 1 {raw}"))?;
+    codec::parse_fetch_items(&request.args[1..])
+}
+
 async fn search(backend: &TutaImapBackend, mailbox: MailboxId, criteria: &[&str]) -> Vec<u32> {
     let owned: Vec<String> = criteria.iter().map(|c| c.to_string()).collect();
     backend.search(mailbox, &owned).await.unwrap()
