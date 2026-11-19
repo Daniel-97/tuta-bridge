@@ -31,7 +31,19 @@ use tutasdk::entities::generated::tutanota::{
 
 use crate::domain::{Error, Result};
 
+/// The fixed error for a value that is present but cannot be decoded.
+fn undecodable() -> Error {
+    Error::Message("mail details decrypt failed".into())
+}
+
 /// Decrypt the `details` aggregation of a `MailDetailsBlob` wire object.
+///
+/// Fails closed: a value that is present but does not decode — wrong JSON
+/// type, bad base64, failed MAC or decryption, invalid LZ4 or UTF-8 — is an
+/// error, never an empty field. Otherwise a mail whose body failed to
+/// decrypt would be rendered, sized, and cached as an empty message. Only
+/// an absent or `null` value, and the empty string the server stores for a
+/// default value, decode to "nothing".
 pub fn decrypt_mail_details(raw: &Value, key: &GenericAesKey) -> Result<MailDetails> {
     let blob = raw
         .as_object()
@@ -39,28 +51,33 @@ pub fn decrypt_mail_details(raw: &Value, key: &GenericAesKey) -> Result<MailDeta
     let details =
         nested(blob, "1305").ok_or_else(|| Error::Message("mail details parse failed".into()))?;
 
-    let sent_at = plain_number(details.get("1284")).unwrap_or(0);
-    let body = nested(details, "1288")
-        .map(|body| parse_body(body, key))
-        .unwrap_or(Body {
+    let sent_at = plain_number(details.get("1284"))?.unwrap_or(0);
+    let body = match nested(details, "1288") {
+        Some(body) => parse_body(body, key)?,
+        None => Body {
             _id: None,
             text: None,
             compressedText: None,
             _errors: Default::default(),
-        });
-    let headers = nested(details, "1287").and_then(|headers| parse_headers(headers, key));
-    let recipients = nested(details, "1286")
-        .map(|recipients| parse_recipients(recipients, key))
-        .unwrap_or(Recipients {
+        },
+    };
+    let headers = match nested(details, "1287") {
+        Some(headers) => parse_headers(headers, key)?,
+        None => None,
+    };
+    let recipients = match nested(details, "1286") {
+        Some(recipients) => parse_recipients(recipients, key)?,
+        None => Recipients {
             _id: None,
             toRecipients: Vec::new(),
             ccRecipients: Vec::new(),
             bccRecipients: Vec::new(),
-        });
+        },
+    };
     let reply_tos = array_objects(details.get("1285"))
-        .iter()
-        .filter_map(|address| parse_encrypted_address(address, key))
-        .collect();
+        .into_iter()
+        .map(|address| parse_encrypted_address(address, key))
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(MailDetails {
         _id: None,
@@ -73,48 +90,47 @@ pub fn decrypt_mail_details(raw: &Value, key: &GenericAesKey) -> Result<MailDeta
     })
 }
 
-fn parse_body(body: &Map<String, Value>, key: &GenericAesKey) -> Body {
-    Body {
+fn parse_body(body: &Map<String, Value>, key: &GenericAesKey) -> Result<Body> {
+    Ok(Body {
         _id: None,
-        text: decrypt_string(body.get("1275"), key),
-        compressedText: decrypt_compressed(body.get("1276"), key),
-        _errors: Default::default(),
-    }
-}
-
-fn parse_headers(headers: &Map<String, Value>, key: &GenericAesKey) -> Option<Header> {
-    let compressed = decrypt_compressed(headers.get("1272"), key);
-    let plain = decrypt_string(headers.get("1271"), key);
-    if compressed.is_none() && plain.is_none() {
-        return None;
-    }
-    Some(Header {
-        _id: None,
-        headers: plain,
-        compressedHeaders: compressed,
+        text: decrypt_string(body.get("1275"), key)?,
+        compressedText: decrypt_compressed(body.get("1276"), key)?,
         _errors: Default::default(),
     })
 }
 
-fn parse_recipients(recipients: &Map<String, Value>, key: &GenericAesKey) -> Recipients {
-    Recipients {
-        _id: None,
-        toRecipients: parse_address_list(recipients.get("1279"), key),
-        ccRecipients: parse_address_list(recipients.get("1280"), key),
-        bccRecipients: parse_address_list(recipients.get("1281"), key),
+fn parse_headers(headers: &Map<String, Value>, key: &GenericAesKey) -> Result<Option<Header>> {
+    let compressed = decrypt_compressed(headers.get("1272"), key)?;
+    let plain = decrypt_string(headers.get("1271"), key)?;
+    if compressed.is_none() && plain.is_none() {
+        return Ok(None);
     }
+    Ok(Some(Header {
+        _id: None,
+        headers: plain,
+        compressedHeaders: compressed,
+        _errors: Default::default(),
+    }))
 }
 
-fn parse_address_list(value: Option<&Value>, key: &GenericAesKey) -> Vec<MailAddress> {
+fn parse_recipients(recipients: &Map<String, Value>, key: &GenericAesKey) -> Result<Recipients> {
+    Ok(Recipients {
+        _id: None,
+        toRecipients: parse_address_list(recipients.get("1279"), key)?,
+        ccRecipients: parse_address_list(recipients.get("1280"), key)?,
+        bccRecipients: parse_address_list(recipients.get("1281"), key)?,
+    })
+}
+
+fn parse_address_list(value: Option<&Value>, key: &GenericAesKey) -> Result<Vec<MailAddress>> {
     array_objects(value)
-        .iter()
-        .filter_map(|address| {
-            let name = decrypt_string(address.get("94"), key).unwrap_or_default();
-            let address = plain_string(address.get("95"))?;
-            Some(MailAddress {
+        .into_iter()
+        .map(|address| {
+            Ok(MailAddress {
                 _id: None,
-                name,
-                address,
+                name: decrypt_string(address.get("94"), key)?.unwrap_or_default(),
+                // A recipient without an address cannot be rendered.
+                address: plain_string(address.get("95"))?.ok_or_else(undecodable)?,
                 contact: None,
                 _errors: Default::default(),
             })
@@ -125,13 +141,11 @@ fn parse_address_list(value: Option<&Value>, key: &GenericAesKey) -> Vec<MailAdd
 fn parse_encrypted_address(
     address: &Map<String, Value>,
     key: &GenericAesKey,
-) -> Option<EncryptedMailAddress> {
-    let name = decrypt_string(address.get("614"), key).unwrap_or_default();
-    let address = decrypt_string(address.get("615"), key)?;
-    Some(EncryptedMailAddress {
+) -> Result<EncryptedMailAddress> {
+    Ok(EncryptedMailAddress {
         _id: None,
-        name,
-        address,
+        name: decrypt_string(address.get("614"), key)?.unwrap_or_default(),
+        address: decrypt_string(address.get("615"), key)?.ok_or_else(undecodable)?,
         _errors: Default::default(),
     })
 }
@@ -156,37 +170,57 @@ fn array_objects(value: Option<&Value>) -> Vec<&Map<String, Value>> {
     }
 }
 
-fn decrypt_bytes(value: Option<&Value>, key: &GenericAesKey) -> Option<Vec<u8>> {
-    let encoded = value?.as_str()?;
+/// Decrypt an encrypted value. `Ok(None)` only for an absent, `null`, or
+/// empty-string value (the server's encoding of a default); everything else
+/// either decrypts or is an error.
+fn decrypt_bytes(value: Option<&Value>, key: &GenericAesKey) -> Result<Option<Vec<u8>>> {
+    let encoded = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(encoded)) => encoded,
+        Some(_) => return Err(undecodable()),
+    };
     if encoded.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let ciphertext = BASE64_STANDARD.decode(encoded).ok()?;
-    key.decrypt_data(&ciphertext).ok()
+    let ciphertext = BASE64_STANDARD.decode(encoded).map_err(|_| undecodable())?;
+    key.decrypt_data(&ciphertext)
+        .map(Some)
+        .map_err(|_| undecodable())
 }
 
-fn decrypt_string(value: Option<&Value>, key: &GenericAesKey) -> Option<String> {
-    String::from_utf8(decrypt_bytes(value, key)?).ok()
+fn decrypt_string(value: Option<&Value>, key: &GenericAesKey) -> Result<Option<String>> {
+    decrypt_bytes(value, key)?
+        .map(|plain| String::from_utf8(plain).map_err(|_| undecodable()))
+        .transpose()
 }
 
-fn decrypt_compressed(value: Option<&Value>, key: &GenericAesKey) -> Option<String> {
-    let plain = decrypt_bytes(value, key)?;
-    let decompressed = EntityFacadeImpl::lz4_decompress_decrypted_bytes(plain.as_slice()).ok()?;
-    String::from_utf8(decompressed).ok()
+fn decrypt_compressed(value: Option<&Value>, key: &GenericAesKey) -> Result<Option<String>> {
+    decrypt_bytes(value, key)?
+        .map(|plain| {
+            let decompressed = EntityFacadeImpl::lz4_decompress_decrypted_bytes(plain.as_slice())
+                .map_err(|_| undecodable())?;
+            String::from_utf8(decompressed).map_err(|_| undecodable())
+        })
+        .transpose()
 }
 
-/// Read an unencrypted string value.
-fn plain_string(value: Option<&Value>) -> Option<String> {
-    value?.as_str().map(str::to_string)
+/// Read an unencrypted string value; `Ok(None)` when absent or `null`.
+fn plain_string(value: Option<&Value>) -> Result<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(undecodable()),
+    }
 }
 
 /// Read an unencrypted number or date value. Tuta JSON encodes both as
 /// decimal strings; a bare JSON number is accepted as well.
-fn plain_number(value: Option<&Value>) -> Option<i64> {
-    match value? {
-        Value::String(text) => text.parse().ok(),
-        Value::Number(number) => number.as_i64(),
-        _ => None,
+fn plain_number(value: Option<&Value>) -> Result<Option<i64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => text.parse().map(Some).map_err(|_| undecodable()),
+        Some(Value::Number(number)) => number.as_i64().map(Some).ok_or_else(undecodable),
+        Some(_) => Err(undecodable()),
     }
 }
 
@@ -278,5 +312,72 @@ mod tests {
     #[test]
     fn encrypted_field_helper_roundtrips() {
         assert_eq!(decrypt(&encrypt_string("hello")), "hello");
+    }
+
+    /// Ciphertext produced with a key other than the mail's session key.
+    fn other_key_ciphertext(value: &str) -> String {
+        let other = GenericAesKey::from_bytes(&[9u8; 32]).unwrap();
+        let iv = InitializationVector::from_arr([1u8; 16]);
+        BASE64_STANDARD.encode(other.encrypt_data(value.as_bytes(), iv).unwrap())
+    }
+
+    fn assert_fails_closed(raw: serde_json::Value) {
+        let Err(error) = decrypt_mail_details(&raw, &key()) else {
+            panic!("an undecodable value must fail the whole blob")
+        };
+        assert_eq!(
+            error.to_string(),
+            "message error: mail details decrypt failed"
+        );
+    }
+
+    #[test]
+    fn body_that_does_not_decrypt_is_an_error_not_an_empty_body() {
+        assert_fails_closed(serde_json::json!({
+            "1305": [{"1284": "1", "1288": [{"1275": other_key_ciphertext("secret body")}]}]
+        }));
+        assert_fails_closed(serde_json::json!({
+            "1305": [{"1284": "1", "1288": [{"1276": "not base64!"}]}]
+        }));
+        // Decrypts, but is not valid LZ4.
+        assert_fails_closed(serde_json::json!({
+            "1305": [{"1284": "1", "1288": [{"1276": encrypt(&[0xf0, 0xff, 0xff, 0xff])}]}]
+        }));
+    }
+
+    #[test]
+    fn undecodable_headers_recipients_and_reply_tos_are_errors() {
+        assert_fails_closed(serde_json::json!({
+            "1305": [{"1284": "1", "1287": [{"1271": other_key_ciphertext("Subject: x")}]}]
+        }));
+        assert_fails_closed(serde_json::json!({
+            "1305": [{"1284": "1", "1286": [{"1279": [{"94": other_key_ciphertext("Ann"), "95": "ann@example.com"}]}]}]
+        }));
+        assert_fails_closed(serde_json::json!({
+            "1305": [{"1284": "1", "1286": [{"1279": [{"94": "", "95": 7}]}]}]
+        }));
+        assert_fails_closed(serde_json::json!({
+            "1305": [{"1284": "1", "1285": [{"614": "", "615": other_key_ciphertext("bob@example.com")}]}]
+        }));
+        assert_fails_closed(serde_json::json!({"1305": [{"1284": "soon"}]}));
+    }
+
+    #[test]
+    fn absent_null_and_empty_values_decode_to_nothing() {
+        let raw = serde_json::json!({
+            "1305": [{
+                "1284": "5",
+                "1288": [{"1275": null, "1276": ""}],
+                "1287": [{"1271": null, "1272": null}],
+                "1286": [{"1279": [], "1280": [], "1281": []}],
+                "1285": []
+            }]
+        });
+        let details = decrypt_mail_details(&raw, &key()).unwrap();
+        assert!(details.body.text.is_none());
+        assert!(details.body.compressedText.is_none());
+        assert!(details.headers.is_none());
+        assert!(details.recipients.toRecipients.is_empty());
+        assert!(details.replyTos.is_empty());
     }
 }
