@@ -414,6 +414,72 @@ async fn sync_removes_mailboxes_missing_from_source() {
 }
 
 #[tokio::test]
+async fn resync_rebuilds_under_a_fresh_uidvalidity() {
+    let store = Arc::new(support::FakeStateStore::new());
+    let engine = SyncEngine::new(store.clone());
+    let inbox = folder("inbox-list", "Inbox", FolderKind::Inbox);
+
+    let mut source = support::FakeMailSource::new();
+    source.folders = vec![inbox.clone()];
+    source.set_headers(
+        &inbox.list_id,
+        vec![
+            header_at(&inbox.list_id, "e1", 1_700_000_001_000),
+            header_at(&inbox.list_id, "e2", 1_700_000_002_000),
+        ],
+    );
+    engine.sync(ACCOUNT_ID, &source, UIDVALIDITY).await.unwrap();
+    // e1 is gone by the time of the resync, so e2 restarts at UID 1.
+    source.set_headers(
+        &inbox.list_id,
+        vec![header_at(&inbox.list_id, "e2", 1_700_000_002_000)],
+    );
+
+    let report = engine
+        .resync(ACCOUNT_ID, &source, UIDVALIDITY)
+        .await
+        .unwrap();
+    assert_eq!(report, self::report(1, 1, 0));
+    assert_eq!(uid(&store, &inbox, "e2"), 1);
+    let mailboxes = store.mailboxes(ACCOUNT_ID).await.unwrap();
+    assert_eq!(mailboxes.len(), 1);
+    assert!(mailboxes[0].uidvalidity > UIDVALIDITY);
+}
+
+#[tokio::test]
+async fn failed_resync_leaves_the_index_untouched() {
+    let store = Arc::new(support::FakeStateStore::new());
+    let engine = SyncEngine::new(store.clone());
+    let inbox = folder("inbox-list", "Inbox", FolderKind::Inbox);
+
+    let mut source = support::FakeMailSource::new();
+    source.folders = vec![inbox.clone()];
+    source.set_headers(&inbox.list_id, vec![header(&inbox.list_id, "e1")]);
+    engine.sync(ACCOUNT_ID, &source, UIDVALIDITY).await.unwrap();
+    let before = store.mailboxes(ACCOUNT_ID).await.unwrap();
+
+    // No folder can be loaded: nothing may be reset.
+    source.fail_headers_in(&inbox.list_id);
+    assert!(matches!(
+        engine.resync(ACCOUNT_ID, &source, UIDVALIDITY + 1).await,
+        Err(Error::Network(_))
+    ));
+    // Neither may a failed folder listing reset anything.
+    source.fail_folders = true;
+    assert!(matches!(
+        engine.resync(ACCOUNT_ID, &source, UIDVALIDITY + 1).await,
+        Err(Error::Network(_))
+    ));
+
+    assert!(!store.calls().iter().any(|call| call == "reset_account"));
+    let after = store.mailboxes(ACCOUNT_ID).await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, before[0].id);
+    assert_eq!(after[0].uidvalidity, before[0].uidvalidity);
+    assert_eq!(uid(&store, &inbox, "e1"), 1);
+}
+
+#[tokio::test]
 async fn mailboxes_have_independent_uid_sequences() {
     let store = Arc::new(support::FakeStateStore::new());
     let engine = SyncEngine::new(store.clone());

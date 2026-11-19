@@ -123,9 +123,10 @@ pub(crate) async fn resync_with(
         .max();
     let uidvalidity = next_uidvalidity(previous, now)?;
 
-    state.reset_account(account_id).await?;
+    // The engine resets the account only once the replacement headers
+    // are loaded, so a failed resync leaves the index as it was.
     SyncEngine::new(state)
-        .sync(account_id, source, uidvalidity)
+        .resync(account_id, source, uidvalidity)
         .await
 }
 
