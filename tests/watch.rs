@@ -11,8 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tuta_bridge::adapters::tuta::event_wire::parse_frame;
 use tuta_bridge::adapters::tuta::generated_id::{timestamp_to_generated_id, BATCH_EXPIRY_MS};
-use tuta_bridge::app::watch::{BackoffPolicy, WatchUseCase};
+use tuta_bridge::app::watch::{BackoffPolicy, WatchUseCase, INVALID_FRAME_LIMIT};
 use tuta_bridge::config::Config;
 use tuta_bridge::domain::{
     AccountInfo, Address, EntityEvent, EntityOperation, Error, EventBatch, EventFrame, Folder,
@@ -1029,6 +1030,100 @@ async fn stop_ends_the_watch_during_the_index_sync() {
     assert_eq!(session.mail.calls(), vec!["folders".to_string()]);
     assert_eq!(session.events_calls(), 0);
     assert!(state.last_batches_for(account).is_empty());
+}
+
+/// The error the real frame parser returns for an `entityUpdate`
+/// message it cannot read.
+fn unreadable_frame() -> Result<EventFrame> {
+    let error = parse_frame("entityUpdate;not-json")
+        .err()
+        .expect("the payload must not parse");
+    Err(error)
+}
+
+#[tokio::test]
+async fn replayed_unreadable_frame_is_skipped_by_a_sync_instead_of_looping() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, marker) = synced_account(&state).await;
+    let mailbox = state.mailbox_id(account, "list-a");
+    state
+        .assign_uid(mailbox, &header("list-a", "e1"))
+        .await
+        .unwrap();
+
+    let mut mail = FakeMailSource::new();
+    mail.folders = vec![folder("list-a")];
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()]).with_mail(Arc::new(mail)),
+    );
+    session
+        .mail
+        .set_headers("list-a", vec![header("list-a", "e1")]);
+    // The server replays the same unreadable frame on every reconnect.
+    for _ in 0..INVALID_FRAME_LIMIT {
+        session.push_script(vec![unreadable_frame()]);
+    }
+    // Only a connection resumed past it gets anywhere.
+    session.push_script(vec![Err(Error::Login("stop".into()))]);
+
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+
+    // Every bounded reconnect resumed from the same, stuck marker...
+    let limit = INVALID_FRAME_LIMIT as usize;
+    assert_eq!(session.events_calls(), limit + 1);
+    for call in 0..limit {
+        assert_eq!(session.markers_for_call(call).get("group1"), Some(&marker));
+    }
+    // ...then one non-destructive sync moved the marker past the frame.
+    assert_eq!(
+        session
+            .mail
+            .calls()
+            .iter()
+            .filter(|call| *call == "headers_page")
+            .count(),
+        1
+    );
+    assert!(!state.calls().iter().any(|call| call == "reset_account"));
+    assert_eq!(
+        session.markers_for_call(limit).get("group1"),
+        Some(&resume_id())
+    );
+    assert_eq!(state.uid_for(mailbox, "list-a", "e1"), Some(1));
+    assert_eq!(state.mailboxes(account).await.unwrap()[0].uidvalidity, 100);
+}
+
+#[tokio::test]
+async fn unreadable_frames_only_count_when_consecutive() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let _ = synced_account(&state).await;
+
+    let session = event_session();
+    // An ordinary drop between unreadable frames starts the count over,
+    // so the limit is never reached.
+    for _ in 1..INVALID_FRAME_LIMIT {
+        session.push_script(vec![unreadable_frame()]);
+    }
+    session.push_script(vec![Err(Error::Network("drop".into()))]);
+    for _ in 1..INVALID_FRAME_LIMIT {
+        session.push_script(vec![unreadable_frame()]);
+    }
+    session.push_script(vec![Err(Error::Login("stop".into()))]);
+
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+    assert!(session.mail.calls().is_empty(), "no sync may run");
 }
 
 #[tokio::test]

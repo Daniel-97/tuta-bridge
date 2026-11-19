@@ -39,6 +39,7 @@ use crate::adapters::imap::server::{ensure_certificate, tls_acceptor};
 use crate::adapters::imap::session::run_session;
 use crate::adapters::mime::MimeRenderer;
 use crate::adapters::sqlite_state::STATE_BUSY_MESSAGE;
+use crate::adapters::tuta::event_wire::is_invalid_event;
 use crate::adapters::tuta::generated_id::{
     batch_is_expired, generated_id_timestamp, timestamp_to_generated_id,
 };
@@ -71,6 +72,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Production number of attempts at applying one event batch before the
 /// index is synced instead.
 pub const LOOKUP_FAILURE_THRESHOLD: usize = 10;
+
+/// Connections in a row that may end on the same unparseable event
+/// message before the index is synced and the markers are moved past it.
+pub const INVALID_FRAME_LIMIT: u32 = 3;
 
 impl BackoffPolicy {
     /// Production delays: 5 s, 20 s, then capped at 60 s.
@@ -180,10 +185,12 @@ impl WatchUseCase {
         let processor = EventProcessor::new(Arc::clone(&self.state));
         let mut stop = pin!(stop);
         let mut attempt: u32 = 0;
+        // Connections in a row that ended on an unparseable frame.
+        let mut invalid_frames: u32 = 0;
         loop {
             // The index sync runs first whenever events alone cannot be
             // trusted: at startup without usable markers, and after a
-            // batch that could not be applied. It never resets anything,
+            // batch that could not be applied or parsed. It never resets anything,
             // so every UID and UIDVALIDITY survives it. A network
             // failure leaves the markers alone and comes back here
             // after the backoff.
@@ -239,8 +246,18 @@ impl WatchUseCase {
                     let frame = match frame {
                         Ok(frame) => frame,
                         Err(e) if is_fatal(&e) => return Err(e),
-                        // A network error is retried on a fresh connection.
-                        Err(_) => break,
+                        // A network error is retried on a fresh
+                        // connection. A frame that does not parse ends
+                        // the stream the same way, but the server will
+                        // replay it unchanged, so those are counted.
+                        Err(e) => {
+                            if is_invalid_event(&e) {
+                                invalid_frames += 1;
+                            } else {
+                                invalid_frames = 0;
+                            }
+                            break;
+                        }
                     };
                     // Any successful frame proves the connection works again.
                     attempt = 0;
@@ -293,12 +310,23 @@ impl WatchUseCase {
                 }
             }
 
+            // Reconnecting cannot get past a frame the server keeps
+            // replaying: without a bound the group would stall forever.
+            // After a few identical failures the index is synced, which
+            // re-stamps the markers past the frame.
+            if invalid_frames >= INVALID_FRAME_LIMIT {
+                println!("event message could not be read; syncing the index");
+                invalid_frames = 0;
+                needs_sync = true;
+            }
             if needs_sync {
                 // The sync replaces the failed batch right away.
                 continue;
             }
             attempt += 1;
-            let delay = self.backoff.delay_ms(attempt);
+            // Repeated unreadable frames back off even though each
+            // connection delivered frames before them.
+            let delay = self.backoff.delay_ms(attempt.max(invalid_frames));
             println!("event stream lost; retrying in {delay} ms");
             let sleep = tokio::time::sleep(Duration::from_millis(delay));
             if unless_stopped(&mut stop, sleep).await.is_none() {
