@@ -918,6 +918,8 @@ pub struct FakeMailSource {
     pub headers_by_folder: Mutex<HashMap<String, Vec<MessageHeader>>>,
     pub failing_header_folders: Mutex<Vec<String>>,
     pub skipped_by_folder: Mutex<HashMap<String, usize>>,
+    /// Skipped mails the folder still lists, by folder list id.
+    pub unreadable_by_folder: Mutex<HashMap<String, Vec<(String, String)>>>,
     pub message_limits: Mutex<Vec<usize>>,
     pub message_folders: Mutex<Vec<Folder>>,
     pub header_limits: Mutex<Vec<usize>>,
@@ -938,6 +940,7 @@ impl FakeMailSource {
             headers_by_folder: Mutex::new(HashMap::new()),
             failing_header_folders: Mutex::new(Vec::new()),
             skipped_by_folder: Mutex::new(HashMap::new()),
+            unreadable_by_folder: Mutex::new(HashMap::new()),
             message_limits: Mutex::new(Vec::new()),
             message_folders: Mutex::new(Vec::new()),
             header_limits: Mutex::new(Vec::new()),
@@ -973,6 +976,14 @@ impl FakeMailSource {
     }
 
     /// Report `count` unreadable mails for `list_id`'s header page.
+    /// Mark mails as listed by the folder but impossible to load.
+    pub fn set_unreadable(&self, list_id: &str, mails: Vec<(String, String)>) {
+        self.unreadable_by_folder
+            .lock()
+            .unwrap()
+            .insert(list_id.to_owned(), mails);
+    }
+
     pub fn set_skipped(&self, list_id: &str, count: usize) {
         self.skipped_by_folder
             .lock()
@@ -1069,10 +1080,18 @@ impl MailSource for FakeMailSource {
             .get(&folder.list_id)
             .copied()
             .unwrap_or(0);
+        let unreadable = self
+            .unreadable_by_folder
+            .lock()
+            .unwrap()
+            .get(&folder.list_id)
+            .cloned()
+            .unwrap_or_default();
         Ok(MessagePage {
             headers,
             next_start: None,
-            skipped,
+            skipped: skipped + unreadable.len(),
+            unreadable,
         })
     }
 }

@@ -145,12 +145,19 @@ impl SyncEngine {
                 .then_with(|| a.element_id.cmp(&b.element_id))
         });
 
-        // A page with skipped mails or a follow-up page is incomplete: its
-        // absence is not evidence that a stored mail was deleted.
-        let complete = page.skipped == 0 && page.next_start.is_none();
+        // A page with a follow-up page, or with skipped mails the source
+        // could not even name, is an incomplete listing: absence from it is
+        // not evidence that a stored mail was deleted. Skipped mails that
+        // are named are still listed by the folder, so they are kept as
+        // stored and the rest of the folder is reconciled — one mail that
+        // never loads must not freeze its folder's deletions forever.
+        let complete = page.next_start.is_none() && page.skipped == page.unreadable.len();
         // The whole page is stored as one unit, so a folder costs one
         // transaction rather than one per message.
-        report.removed += self.store.store_page(mailbox, &headers, complete).await?;
+        report.removed += self
+            .store
+            .store_page(mailbox, &headers, &page.unreadable, complete)
+            .await?;
         report.messages += headers.len();
         report.skipped_messages += page.skipped;
         report.folders += 1;

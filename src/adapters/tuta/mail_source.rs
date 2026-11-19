@@ -398,30 +398,38 @@ impl MailSource for TutaMailSource {
             .map_err(|_| Error::Network("failed to load message entries".into()))?;
 
         let mut headers = Vec::with_capacity(entries.len());
-        let mut skipped = 0;
+        // The entry list loaded in full, so every mail that cannot be
+        // turned into a header is still known by id: the folder lists it.
+        // Naming it lets the caller keep its stored row and reconcile the
+        // rest of the folder.
+        let mut unreadable = Vec::new();
         for entry in entries {
-            // One unreadable mail must not fail the whole folder: count it and
-            // keep loading the remaining headers.
+            let id = (
+                entry.mail.list_id.as_str().to_string(),
+                entry.mail.element_id.as_str().to_string(),
+            );
+            // One unreadable mail must not fail the whole folder: record it
+            // and keep loading the remaining headers.
             let mail: Mail = match crypto_client.load(&entry.mail).await {
                 Ok(mail) => mail,
                 Err(_) => {
-                    skipped += 1;
+                    unreadable.push(id);
                     continue;
                 }
             };
             // A mail that loaded but is not intact (or cannot be
-            // referenced) is dropped like an unreadable one, and counted,
-            // so the caller never reconciles against a partial page.
+            // referenced) is dropped like an unreadable one.
             match header_from_mail(&mail) {
                 Some(header) => headers.push(header),
-                None => skipped += 1,
+                None => unreadable.push(id),
             }
         }
 
         Ok(MessagePage {
             headers,
             next_start: None,
-            skipped,
+            skipped: unreadable.len(),
+            unreadable,
         })
     }
 

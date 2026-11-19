@@ -510,3 +510,53 @@ async fn mailboxes_have_independent_uid_sequences() {
     assert_eq!(uid(&store, &inbox, "inbox-second"), 2);
     assert_eq!(uid(&store, &archive, "shared"), 1);
 }
+
+#[tokio::test]
+async fn an_unreadable_mail_does_not_freeze_its_folder() {
+    let store = Arc::new(support::FakeStateStore::new());
+    let engine = SyncEngine::new(store.clone());
+    let inbox = folder("inbox-list", "Inbox", FolderKind::Inbox);
+    let mut source = support::FakeMailSource::new();
+    source.folders = vec![inbox.clone()];
+    source.set_headers(
+        &inbox.list_id,
+        vec![
+            header_at(&inbox.list_id, "e1", 1_700_000_001_000),
+            header_at(&inbox.list_id, "e2", 1_700_000_002_000),
+            header_at(&inbox.list_id, "e3", 1_700_000_003_000),
+        ],
+    );
+    engine.sync(ACCOUNT_ID, &source, UIDVALIDITY).await.unwrap();
+
+    // e1 was deleted in Tuta; e2 is still listed by the folder but can no
+    // longer be loaded. The folder listing is complete, so e1 is removed
+    // while e2 keeps its row and UID.
+    source.set_headers(
+        &inbox.list_id,
+        vec![header_at(&inbox.list_id, "e3", 1_700_000_003_000)],
+    );
+    source.set_unreadable(
+        &inbox.list_id,
+        vec![(inbox.list_id.clone(), "e2".to_string())],
+    );
+    let second = engine.sync(ACCOUNT_ID, &source, UIDVALIDITY).await.unwrap();
+    assert_eq!(
+        second,
+        SyncReport {
+            folders: 1,
+            messages: 1,
+            removed: 1,
+            skipped_messages: 1,
+            skipped_folders: 0,
+        }
+    );
+    let mailbox = store.mailbox_id(ACCOUNT_ID, &inbox.list_id);
+    let stored: Vec<(u32, String)> = store
+        .messages(mailbox)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|message| (message.uid, message.header.element_id))
+        .collect();
+    assert_eq!(stored, vec![(2, "e2".to_string()), (3, "e3".to_string())]);
+}

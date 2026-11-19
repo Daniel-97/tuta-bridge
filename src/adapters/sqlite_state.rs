@@ -1078,6 +1078,7 @@ impl StateStore for SqliteStateStore {
         &self,
         mailbox: MailboxId,
         headers: &[MessageHeader],
+        keep: &[(String, String)],
         reconcile: bool,
     ) -> Result<usize> {
         // One transaction per page: a folder costs one commit instead of
@@ -1093,6 +1094,10 @@ impl StateStore for SqliteStateStore {
             let fetched: HashSet<(&str, &str)> = headers
                 .iter()
                 .map(|header| (header.list_id.as_str(), header.element_id.as_str()))
+                .chain(
+                    keep.iter()
+                        .map(|(list_id, element_id)| (list_id.as_str(), element_id.as_str())),
+                )
                 .collect();
             let stored: Vec<(i64, String, String)> = sqlx::query_as(LIST_MESSAGE_KEYS_SQL)
                 .bind(mailbox.0)
@@ -2187,12 +2192,18 @@ mod tests {
         let store = SqliteStateStore::open_in_memory().await.unwrap();
         let (account, mailbox) = account_and_mailbox(&store).await;
         let first = [header("mail", "e1"), header("mail", "e2")];
-        assert_eq!(store.store_page(mailbox, &first, true).await.unwrap(), 0);
+        assert_eq!(
+            store.store_page(mailbox, &first, &[], true).await.unwrap(),
+            0
+        );
 
         // e1 is gone from the next complete page and e3 is new: e2 keeps
         // its UID, e3 gets the next one, and e1's UID is not reused.
         let second = [header("mail", "e2"), header("mail", "e3")];
-        assert_eq!(store.store_page(mailbox, &second, true).await.unwrap(), 1);
+        assert_eq!(
+            store.store_page(mailbox, &second, &[], true).await.unwrap(),
+            1
+        );
         let stored: Vec<(u32, String)> = store
             .messages(mailbox)
             .await
@@ -2202,9 +2213,27 @@ mod tests {
             .collect();
         assert_eq!(stored, vec![(2, "e2".to_string()), (3, "e3".to_string())]);
 
+        // A mail the folder still lists but that could not be loaded is
+        // kept as stored, while a genuinely absent one would be removed.
+        let unreadable = [("mail".to_string(), "e2".to_string())];
+        assert_eq!(
+            store
+                .store_page(mailbox, &second[1..], &unreadable, true)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.messages(mailbox).await.unwrap().len(), 2);
+
         // An incomplete page removes nothing.
         let partial = [header("mail", "e3")];
-        assert_eq!(store.store_page(mailbox, &partial, false).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .store_page(mailbox, &partial, &[], false)
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(store.messages(mailbox).await.unwrap().len(), 2);
         assert_eq!(store.mailboxes(account).await.unwrap()[0].next_uid, 4);
     }
@@ -2242,7 +2271,7 @@ mod tests {
         let store = SqliteStateStore::open_in_memory().await.unwrap();
         let (account, mailbox) = account_and_mailbox(&store).await;
         store
-            .store_page(mailbox, &[header("mail", "e1")], true)
+            .store_page(mailbox, &[header("mail", "e1")], &[], true)
             .await
             .unwrap();
         // The second new message of the page fails to insert.
@@ -2256,7 +2285,7 @@ mod tests {
         .unwrap();
 
         let page = [header("mail", "e2"), header("mail", "e3")];
-        assert!(store.store_page(mailbox, &page, true).await.is_err());
+        assert!(store.store_page(mailbox, &page, &[], true).await.is_err());
 
         // Neither the first insert nor the removal of e1 was kept.
         let stored = store.messages(mailbox).await.unwrap();

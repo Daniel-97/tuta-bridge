@@ -1,9 +1,9 @@
 //! Mailbox-change broadcast events.
 //!
 //! The watch loop publishes one [`MailboxChanged`] per mailbox a batch
-//! touched — and one per current mailbox after a resync, which never goes
-//! through `apply_batch` — so idling sessions can learn that cached
-//! mailbox state, above all UIDVALIDITY-derived views, may be stale. The
+//! touched — and one per current mailbox after a recovery sync, which
+//! never goes through `apply_batch` — so idling sessions can learn that
+//! cached mailbox state may be stale. The
 //! events carry a [`MailboxId`] only: no subjects, addresses, or entity
 //! ids ever travel on this channel.
 

@@ -11,7 +11,9 @@ pub trait EventLookup: Send + Sync {
     /// Reload every stored placement of one mail.
     ///
     /// `Ok(None)` means the mail is unreadable (its intactness check failed)
-    /// and the caller must keep the existing rows. `Ok(Some(vec![]))` means
+    /// or no longer exists on the server; either way the caller must keep
+    /// the existing rows — a deleted mail is removed by its own delete
+    /// event. `Ok(Some(vec![]))` means
     /// the mail genuinely has no placements. `Err` means the mail could not
     /// be loaded completely; the caller must skip it rather than treat the
     /// placement list as empty.
@@ -22,14 +24,16 @@ pub trait EventLookup: Send + Sync {
     ) -> Result<Option<Vec<MailPlacement>>>;
 
     /// Reload the placement of one mail-set entry, or `Ok(None)` when the
-    /// entry's mail is unreadable or cannot be referenced.
+    /// entry or its mail no longer exists, is unreadable, or cannot be
+    /// referenced.
     async fn header_for_entry(
         &self,
         entry_list_id: &str,
         entry_element_id: &str,
     ) -> Result<Option<MailPlacement>>;
 
-    /// Reload one mail set as a folder, or `Ok(None)` when the set is not a
-    /// folder the bridge stores (for example the virtual "All" set).
+    /// Reload one mail set as a folder, or `Ok(None)` when the set no longer
+    /// exists or is not a folder the bridge stores (for example the
+    /// virtual "All" set).
     async fn folder(&self, set_list_id: &str, set_element_id: &str) -> Result<Option<Folder>>;
 }

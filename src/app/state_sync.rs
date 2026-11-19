@@ -216,6 +216,7 @@ mod tests {
                 headers: self.headers.clone(),
                 next_start: None,
                 skipped: 0,
+                unreadable: Vec::new(),
             })
         }
     }

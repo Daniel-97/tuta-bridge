@@ -26,14 +26,18 @@ pub trait StateStore: Send + Sync {
     ///
     /// Every header keeps its UID or is assigned the next one, in the
     /// order given. With `reconcile`, stored messages of the mailbox that
-    /// are absent from `headers` are removed; pass it only for a complete
-    /// page. Adapters with transactions run the whole page in one, so a
-    /// failure leaves the mailbox as it was; this default applies the
-    /// same steps one call at a time.
+    /// are absent from both `headers` and `keep` are removed; pass it
+    /// only for a complete listing. `keep` names, as `(list id, element
+    /// id)`, mails the folder still lists but whose header could not be
+    /// loaded: their rows stay exactly as stored. Adapters with
+    /// transactions run the whole page in one, so a failure leaves the
+    /// mailbox as it was; this default applies the same steps one call
+    /// at a time.
     async fn store_page(
         &self,
         mailbox: MailboxId,
         headers: &[MessageHeader],
+        keep: &[(String, String)],
         reconcile: bool,
     ) -> Result<usize> {
         for header in headers {
@@ -47,6 +51,8 @@ pub trait StateStore: Send + Sync {
             let fetched = headers.iter().any(|header| {
                 header.list_id == stored.header.list_id
                     && header.element_id == stored.header.element_id
+            }) || keep.iter().any(|(list_id, element_id)| {
+                *list_id == stored.header.list_id && *element_id == stored.header.element_id
             });
             if !fetched {
                 self.remove_message(mailbox, stored.uid).await?;
