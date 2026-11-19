@@ -812,6 +812,95 @@ async fn fetch_unknown_uid_returns_none() {
     assert_eq!(world.source.content_calls(), 0);
 }
 
+#[tokio::test]
+async fn same_named_and_slashed_folders_stay_reachable_and_distinct() {
+    let world = world().await;
+    let folder = |list_id: &str, name: &str| Folder {
+        list_id: list_id.into(),
+        name: name.into(),
+        kind: FolderKind::Custom,
+    };
+    let mut ids = Vec::new();
+    for (list_id, name) in [
+        ("work-a", "Work"),
+        ("work-b", "Work"),
+        ("slashed", "Clients/ACME"),
+        ("shadow", "INBOX"),
+    ] {
+        ids.push(
+            world
+                .store
+                .upsert_mailbox(world.account, &folder(list_id, name), 500)
+                .await
+                .unwrap(),
+        );
+    }
+
+    // Every mailbox is listed once, under a name of its own, and no
+    // name contains the hierarchy delimiter.
+    let views = world.backend.mailboxes().await.unwrap();
+    let mut names: Vec<&str> = views.iter().map(|view| view.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "Clients\u{2215}ACME",
+            "INBOX (2)",
+            "Inbox",
+            "Work",
+            "Work (2)"
+        ]
+    );
+
+    // Each listed name selects the mailbox it was listed for.
+    for view in &views {
+        let selected = world
+            .backend
+            .select(&view.name)
+            .await
+            .unwrap()
+            .expect("a listed name selects");
+        assert_eq!(selected.view.id, view.id);
+    }
+    // The two namesakes are different mailboxes, the older one first.
+    let select = |name: &'static str| {
+        let backend = &world.backend;
+        async move {
+            backend
+                .select(name)
+                .await
+                .unwrap()
+                .map(|found| found.view.id)
+        }
+    };
+    assert_eq!(select("Work").await, Some(ids[0]));
+    assert_eq!(select("Work (2)").await, Some(ids[1]));
+    // INBOX in any casing is the Inbox, never the custom namesake.
+    assert_eq!(select("INBOX").await, Some(world.inbox));
+    assert_eq!(select("inbox").await, Some(world.inbox));
+    assert_eq!(select("INBOX (2)").await, Some(ids[3]));
+    assert_eq!(select("Clients/ACME").await, None);
+
+    // By id the snapshot never depends on the name.
+    let snapshot = world
+        .backend
+        .snapshot(ids[1])
+        .await
+        .unwrap()
+        .expect("the mailbox exists");
+    assert_eq!(snapshot.view.name, "Work (2)");
+    assert!(world
+        .backend
+        .snapshot(MailboxId(9_999))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        world.backend.uidvalidity(MailboxId(9_999)).await.unwrap(),
+        None
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SEARCH
 // ---------------------------------------------------------------------------

@@ -178,6 +178,19 @@
   (highest number first), then `* n EXISTS` if any arrived, then
   `* n FETCH (FLAGS (...))` per read-state change. `EXAMINE` versus
   `SELECT` is recorded in the session state for the write milestone.
+- Mailbox names: on the wire every name is modified UTF-7 (RFC 3501
+  §5.1.3) in both directions; an argument that is not valid modified
+  UTF-7 is taken as written, so a client sending the raw name still
+  reaches its mailbox. The store is flat while `"/"` stays the
+  advertised delimiter, so a `/` inside a folder name is listed as
+  U+2215 DIVISION SLASH instead of inventing a hierarchy. Tuta lets
+  folder names repeat (and nests folders, which the index flattens):
+  of several mailboxes with one name the first keeps it — system
+  folders before custom ones, then lowest mailbox id — and the others
+  are listed as `Name (2)`, `Name (3)`, …; if the first is deleted the
+  next takes over the plain name. Only the Inbox-kind folder answers
+  to `INBOX` (any casing); a custom folder called `inbox` is a
+  namesake and gets a suffix.
 - IDLE literal edge: a tagged BAD during IDLE never answers a literal
   continuation, and RFC 3501 obliges the client not to send the octets
   its `{n}` token announced — the session reads none of them, and

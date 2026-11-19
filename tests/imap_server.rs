@@ -220,28 +220,37 @@ async fn greets_authenticates_and_lists() {
     wire.expect(LOGIN_OK).await;
 
     // LIST "" "*": the Inbox carries no special-use attribute, the
-    // Archive does, and the non-ASCII name travels as a literal.
+    // Archive does, and the non-ASCII name travels in modified UTF-7.
     wire.send("a2 LIST \"\" \"*\"").await;
     wire.expect("* LIST () \"/\" \"Inbox\"").await;
     wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
-    let name = wire.literal("* LIST () \"/\" ").await;
-    assert_eq!(name, "Caffè".as_bytes());
-    wire.expect("").await;
+    wire.expect("* LIST () \"/\" \"Caff&AOg-\"").await;
     wire.expect("a2 OK LIST completed").await;
 
     // LSUB mirrors LIST: the bridge has no separate subscription view.
     wire.send("a3 LSUB \"\" \"*\"").await;
     wire.expect("* LSUB () \"/\" \"Inbox\"").await;
     wire.expect("* LSUB (\\Archive) \"/\" \"Archive\"").await;
-    let name = wire.literal("* LSUB () \"/\" ").await;
-    assert_eq!(name, "Caffè".as_bytes());
-    wire.expect("").await;
+    wire.expect("* LSUB () \"/\" \"Caff&AOg-\"").await;
     wire.expect("a3 OK LSUB completed").await;
 
     // An exact pattern lists just that mailbox.
     wire.send("a4 LIST \"\" \"Archive\"").await;
     wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
     wire.expect("a4 OK LIST completed").await;
+
+    // The name the client was given selects the mailbox, and STATUS
+    // answers under the same wire name.
+    wire.send("a5 STATUS \"Caff&AOg-\" (MESSAGES)").await;
+    wire.expect("* STATUS \"Caff&AOg-\" (MESSAGES 0)").await;
+    wire.expect("a5 OK STATUS completed").await;
+    wire.send("a6 SELECT \"Caff&AOg-\"").await;
+    expect_select_block(&mut wire, "a6", 0, None, 11, 1, false).await;
+    // A client that sends the name raw instead still reaches it.
+    wire.send("a7 EXAMINE {6}").await;
+    wire.expect("+ ").await;
+    wire.send_raw("Caffè\r\n".as_bytes()).await;
+    expect_select_block(&mut wire, "a7", 0, None, 11, 1, true).await;
 
     drop(wire);
     session.await.unwrap().unwrap();

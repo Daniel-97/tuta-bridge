@@ -89,16 +89,71 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Resolve one requested mailbox name against a stored mailbox.
+/// What a `/` inside a folder name is listed as: DIVISION SLASH, which
+/// looks the same and is not the hierarchy delimiter.
+const SOLIDUS_STAND_IN: &str = "\u{2215}";
+
+/// `INBOX` in any casing: the one mailbox name RFC 3501 compares
+/// case-insensitively.
+fn is_inbox_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("INBOX")
+}
+
+/// The name each stored mailbox is listed and selected under, in the
+/// order given. The store is flat and Tuta lets folder names repeat, so
+/// the stored name is not always usable as it is:
 ///
-/// `INBOX` is case-insensitive and resolves the folder whose *kind* is
-/// Inbox (its display name may be localized); every other name matches
-/// exactly.
-fn name_matches(requested: &str, mailbox: &StoredMailbox) -> bool {
-    if requested.eq_ignore_ascii_case("INBOX") {
-        return mailbox.kind == FolderKind::Inbox;
+/// * the Inbox-kind folder keeps its name when that is `INBOX` in some
+///   casing and is listed as `INBOX` otherwise, so it is always the
+///   mailbox `INBOX` names;
+/// * a `/` in a name becomes [`SOLIDUS_STAND_IN`], so the delimiter
+///   never invents a hierarchy that does not exist;
+/// * names are unique: of several mailboxes with the same name the
+///   first keeps it and the others get ` (2)`, ` (3)`, … — system
+///   folders first, then lowest mailbox id, so the outcome does not
+///   depend on listing order. Any casing of `INBOX` counts as the
+///   Inbox's name.
+///
+/// The suffix is the smallest that is free, which keeps both
+/// mailboxes reachable; if the first of two namesakes is deleted the
+/// second takes over the plain name and its clients see a rename.
+fn imap_names(mailboxes: &[StoredMailbox]) -> Vec<String> {
+    let rank = |kind: &FolderKind| match kind {
+        FolderKind::Inbox => 0,
+        FolderKind::Custom => 2,
+        _ => 1,
+    };
+    let mut order: Vec<usize> = (0..mailboxes.len()).collect();
+    order.sort_by_key(|&index| (rank(&mailboxes[index].kind), mailboxes[index].id.0));
+
+    let same = |a: &str, b: &str| a == b || (is_inbox_name(a) && is_inbox_name(b));
+    let mut names = vec![String::new(); mailboxes.len()];
+    let mut taken: Vec<String> = Vec::new();
+    for index in order {
+        let mailbox = &mailboxes[index];
+        let base = if mailbox.kind != FolderKind::Inbox {
+            mailbox.name.replace('/', SOLIDUS_STAND_IN)
+        } else if is_inbox_name(&mailbox.name) {
+            mailbox.name.clone()
+        } else {
+            "INBOX".to_string()
+        };
+        let mut name = base.clone();
+        let mut copy = 2usize;
+        while taken.iter().any(|other| same(other, &name)) {
+            name = format!("{base} ({copy})");
+            copy += 1;
+        }
+        taken.push(name.clone());
+        names[index] = name;
     }
-    requested == mailbox.name
+    names
+}
+
+/// Whether `requested` names the mailbox listed as `listed`: exactly,
+/// or as `INBOX` in any casing.
+fn name_matches(requested: &str, listed: &str) -> bool {
+    requested == listed || (is_inbox_name(requested) && is_inbox_name(listed))
 }
 
 /// The summary every content load derives from a stored header — the
@@ -386,16 +441,28 @@ impl MailSource for OnceSource<'_> {
     }
 }
 
+/// One mailbox as LIST answers it, under its listed name.
+fn view_of(mailbox: &StoredMailbox, name: String) -> MailboxView {
+    MailboxView {
+        id: mailbox.id,
+        name,
+        special_use: render::special_use(&mailbox.kind),
+    }
+}
+
 impl TutaImapBackend {
+    /// Every stored mailbox with the name it is listed under.
+    async fn listed(&self) -> Result<Vec<(StoredMailbox, String)>> {
+        let mailboxes = self.store.mailboxes(self.account_id).await?;
+        let names = imap_names(&mailboxes);
+        Ok(mailboxes.into_iter().zip(names).collect())
+    }
+
     /// The current state of one stored mailbox. The message list is the
     /// store's cheap `(uid, unread)` read: no header is loaded.
-    async fn opened(&self, found: &StoredMailbox) -> Result<SelectedMailbox> {
+    async fn opened(&self, found: &StoredMailbox, listed: String) -> Result<SelectedMailbox> {
         Ok(SelectedMailbox {
-            view: MailboxView {
-                id: found.id,
-                name: found.name.clone(),
-                special_use: render::special_use(&found.kind),
-            },
+            view: view_of(found, listed),
             uidvalidity: found.uidvalidity,
             uidnext: found.next_uid,
             messages: self.store.message_uids(found.id).await?,
@@ -439,30 +506,33 @@ impl ImapBackend for TutaImapBackend {
 
     async fn mailboxes(&self) -> Result<Vec<MailboxView>> {
         Ok(self
-            .store
-            .mailboxes(self.account_id)
+            .listed()
             .await?
             .into_iter()
-            .map(|mailbox| MailboxView {
-                id: mailbox.id,
-                name: mailbox.name,
-                special_use: render::special_use(&mailbox.kind),
-            })
+            .map(|(mailbox, name)| view_of(&mailbox, name))
             .collect())
     }
 
     async fn select(&self, name: &str) -> Result<Option<SelectedMailbox>> {
-        let mailboxes = self.store.mailboxes(self.account_id).await?;
-        match mailboxes.iter().find(|mailbox| name_matches(name, mailbox)) {
-            Some(found) => Ok(Some(self.opened(found).await?)),
+        match self
+            .listed()
+            .await?
+            .into_iter()
+            .find(|(_, listed)| name_matches(name, listed))
+        {
+            Some((found, listed)) => Ok(Some(self.opened(&found, listed).await?)),
             None => Ok(None),
         }
     }
 
     async fn snapshot(&self, mailbox: MailboxId) -> Result<Option<SelectedMailbox>> {
-        let mailboxes = self.store.mailboxes(self.account_id).await?;
-        match mailboxes.iter().find(|stored| stored.id == mailbox) {
-            Some(found) => Ok(Some(self.opened(found).await?)),
+        match self
+            .listed()
+            .await?
+            .into_iter()
+            .find(|(stored, _)| stored.id == mailbox)
+        {
+            Some((found, listed)) => Ok(Some(self.opened(&found, listed).await?)),
             None => Ok(None),
         }
     }
@@ -656,6 +726,67 @@ mod tests {
         // Folding is ASCII-only: non-ASCII bytes compare exactly.
         assert!(!constant_time_eq_ignore_ascii_case(&[0xC4], &[0xE4]));
         assert!(constant_time_eq_ignore_ascii_case(&[0xC4], &[0xC4]));
+    }
+
+    fn stored(id: i64, name: &str, kind: FolderKind) -> StoredMailbox {
+        StoredMailbox {
+            id: MailboxId(id),
+            account_id: 1,
+            list_id: format!("list-{id}"),
+            name: name.into(),
+            kind,
+            uidvalidity: 1,
+            next_uid: 1,
+        }
+    }
+
+    #[test]
+    fn listed_names_are_unique_flat_and_keep_inbox_special() {
+        // Plain names pass through, in the order given.
+        let names = imap_names(&[
+            stored(1, "Inbox", FolderKind::Inbox),
+            stored(2, "Archive", FolderKind::Archive),
+            stored(3, "Work", FolderKind::Custom),
+        ]);
+        assert_eq!(names, ["Inbox", "Archive", "Work"]);
+
+        // A slash never reaches the wire as the hierarchy delimiter.
+        let names = imap_names(&[stored(3, "Clients/ACME", FolderKind::Custom)]);
+        assert_eq!(names, ["Clients\u{2215}ACME"]);
+
+        // Namesakes: the lowest id keeps the name whatever the listing
+        // order, a system folder beats a custom one, and a suffix that
+        // is itself taken is skipped.
+        let names = imap_names(&[
+            stored(9, "Work", FolderKind::Custom),
+            stored(4, "Work", FolderKind::Custom),
+            stored(5, "Work (2)", FolderKind::Custom),
+            stored(2, "Archive", FolderKind::Custom),
+            stored(7, "Archive", FolderKind::Archive),
+        ]);
+        assert_eq!(
+            names,
+            ["Work (3)", "Work", "Work (2)", "Archive (2)", "Archive"]
+        );
+
+        // Only the Inbox-kind folder answers to INBOX: a custom folder
+        // called "inbox" is a namesake, and a localized Inbox is listed
+        // under the name every client knows.
+        let names = imap_names(&[
+            stored(3, "inbox", FolderKind::Custom),
+            stored(8, "Inbox", FolderKind::Inbox),
+        ]);
+        assert_eq!(names, ["inbox (2)", "Inbox"]);
+        let names = imap_names(&[
+            stored(1, "Posteingang", FolderKind::Inbox),
+            stored(2, "INBOX", FolderKind::Custom),
+        ]);
+        assert_eq!(names, ["INBOX", "INBOX (2)"]);
+
+        assert!(name_matches("inbox", "Inbox"));
+        assert!(name_matches("Work (2)", "Work (2)"));
+        assert!(!name_matches("work", "Work"));
+        assert!(!name_matches("INBOX", "inbox (2)"));
     }
 
     #[test]

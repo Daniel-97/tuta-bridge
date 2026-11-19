@@ -8,6 +8,9 @@
 //! commands; dispatch on the command (plus the `UID` sub-command atom)
 //! belongs to the session.
 
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::Engine as _;
+
 use crate::domain::{Error, Result};
 
 /// One argument of a parsed client command.
@@ -381,6 +384,72 @@ pub fn encode_string(value: &str) -> ImapString {
     } else {
         ImapString::Literal(value.as_bytes().to_vec())
     }
+}
+
+/// Encode a mailbox name in modified UTF-7 (RFC 3501 §5.1.3), the
+/// only form a mailbox name may take on the wire: printable ASCII
+/// stands for itself, `&` is written `&-`, and every other run of
+/// characters is its UTF-16BE bytes in modified base64 between `&`
+/// and `-`.
+pub fn encode_mailbox_name(name: &str) -> String {
+    fn flush(run: &mut Vec<u16>, out: &mut String) {
+        if run.is_empty() {
+            return;
+        }
+        let bytes: Vec<u8> = run.iter().flat_map(|unit| unit.to_be_bytes()).collect();
+        out.push('&');
+        out.push_str(&STANDARD_NO_PAD.encode(bytes).replace('/', ","));
+        out.push('-');
+        run.clear();
+    }
+
+    let mut out = String::new();
+    let mut run: Vec<u16> = Vec::new();
+    for c in name.chars() {
+        if (' '..='~').contains(&c) {
+            flush(&mut run, &mut out);
+            out.push(c);
+            if c == '&' {
+                out.push('-');
+            }
+        } else {
+            let mut units = [0u16; 2];
+            run.extend_from_slice(c.encode_utf16(&mut units));
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// Decode a modified UTF-7 mailbox name, or `None` when it is not
+/// valid modified UTF-7. Characters outside a shifted `&...-` run pass
+/// through untouched, so a name with no `&` decodes to itself.
+pub fn decode_mailbox_name(wire: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = wire;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let shifted = &rest[start + 1..];
+        let end = shifted.find('-')?;
+        if end == 0 {
+            out.push('&');
+        } else {
+            let bytes = STANDARD_NO_PAD
+                .decode(shifted[..end].replace(',', "/"))
+                .ok()?;
+            if bytes.len() % 2 != 0 {
+                return None;
+            }
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            out.push_str(&String::from_utf16(&units).ok()?);
+        }
+        rest = &shifted[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// The section of a `BODY[...]` fetch item.
@@ -830,6 +899,43 @@ mod tests {
             encode_string("line\nbreak"),
             ImapString::Literal(_)
         ));
+    }
+
+    #[test]
+    fn mailbox_names_round_trip_through_modified_utf7() {
+        // The RFC 3501 §5.1.3 example.
+        let name = "~peter/mail/台北/日本語";
+        let wire = "~peter/mail/&U,BTFw-/&ZeVnLIqe-";
+        assert_eq!(encode_mailbox_name(name), wire);
+        assert_eq!(decode_mailbox_name(wire).as_deref(), Some(name));
+
+        for (name, wire) in [
+            ("Inbox", "Inbox"),
+            ("", ""),
+            ("Caffè", "Caff&AOg-"),
+            ("R&D", "R&-D"),
+            ("&", "&-"),
+            ("a\u{2215}b", "a&IhU-b"),
+            // Outside the BMP: a surrogate pair inside one run.
+            ("😀 mail", "&2D3eAA- mail"),
+            ("tab\there", "tab&AAk-here"),
+        ] {
+            assert_eq!(encode_mailbox_name(name), wire, "encoding {name:?}");
+            assert_eq!(
+                decode_mailbox_name(wire).as_deref(),
+                Some(name),
+                "decoding {wire:?}"
+            );
+            assert!(encode_mailbox_name(name).is_ascii());
+        }
+
+        // Not modified UTF-7: an unterminated shift, bad base64, an odd
+        // byte count, a lone surrogate.
+        for wire in ["R&D", "a&AOg", "&!!!-", "&AOg", "&AA-", "&2D0-"] {
+            assert_eq!(decode_mailbox_name(wire), None, "{wire:?} must not decode");
+        }
+        // Raw UTF-8 with no shift passes through.
+        assert_eq!(decode_mailbox_name("Caffè").as_deref(), Some("Caffè"));
     }
 
     #[test]

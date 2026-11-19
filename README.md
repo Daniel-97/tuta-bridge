@@ -207,6 +207,9 @@ would only produce errors. The `Far`/`Near` names require mbsync ≥ 1.3
   changes as `FETCH (FLAGS ...)`. Between those points a session keeps
   the message numbers it last announced, so a mail that arrived since
   is not visible to `FETCH` or `SEARCH` until the next one.
+- Folders are listed flat. A `/` in a folder name is shown as `∕`
+  (U+2215), and folders that share a name are listed as `Name`,
+  `Name (2)`, … so each stays reachable.
 - One account at a time.
 
 ## Dump

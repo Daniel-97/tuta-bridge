@@ -758,7 +758,7 @@ impl Session {
             .await?;
             return Ok(());
         };
-        let name = arg_string(name_arg);
+        let name = mailbox_name(name_arg);
         let Some(selected) = self.backend.select(&name).await? else {
             write_line(writer, &format!("{tag} NO no such mailbox")).await?;
             return Ok(());
@@ -814,7 +814,7 @@ impl Session {
         }
         // The reference is the root in this flat store; only the pattern
         // decides what lists.
-        let pattern = arg_string(&args[1]);
+        let pattern = mailbox_name(&args[1]);
         let views = self.backend.mailboxes().await?;
         let keyword = if lsub { "LSUB" } else { "LIST" };
         for view in &views {
@@ -826,7 +826,7 @@ impl Session {
                 &format!(
                     "* {keyword} ({}) \"/\" {}",
                     view.special_use,
-                    qs(&view.name)
+                    wire_mailbox(&view.name)
                 ),
             )
             .await?;
@@ -873,7 +873,7 @@ impl Session {
                 return Ok(());
             }
         }
-        let name = arg_string(name_arg);
+        let name = mailbox_name(name_arg);
         let Some(selected) = self.backend.select(&name).await? else {
             write_line(writer, &format!("{tag} NO no such mailbox")).await?;
             return Ok(());
@@ -894,7 +894,11 @@ impl Session {
             .collect();
         write_line(
             writer,
-            &format!("* STATUS {} ({})", qs(&selected.view.name), pairs.join(" ")),
+            &format!(
+                "* STATUS {} ({})",
+                wire_mailbox(&selected.view.name),
+                pairs.join(" ")
+            ),
         )
         .await?;
         write_line(writer, &format!("{tag} OK STATUS completed")).await?;
@@ -1251,6 +1255,20 @@ fn arg_string(arg: &ImapArg) -> String {
         ImapArg::Literal(bytes) => String::from_utf8_lossy(bytes).into_owned(),
         ImapArg::List(_) => String::new(),
     }
+}
+
+/// A mailbox name argument as the name it stands for. Mailbox names
+/// travel in modified UTF-7; an argument that is not valid modified
+/// UTF-7 is taken as written, so a client that sends the name raw
+/// still reaches its mailbox.
+fn mailbox_name(arg: &ImapArg) -> String {
+    let wire = arg_string(arg);
+    codec::decode_mailbox_name(&wire).unwrap_or(wire)
+}
+
+/// A mailbox name for the wire: modified UTF-7, quoted.
+fn wire_mailbox(name: &str) -> String {
+    qs(&codec::encode_mailbox_name(name))
 }
 
 /// One-level LIST matching: a pattern containing a wildcard (`*` or `%`)
