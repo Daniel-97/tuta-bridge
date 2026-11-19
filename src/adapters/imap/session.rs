@@ -812,13 +812,21 @@ impl Session {
             write_line(writer, &format!("{tag} BAD invalid {verb}")).await?;
             return Ok(());
         }
-        // The reference is the root in this flat store; only the pattern
-        // decides what lists.
-        let pattern = mailbox_name(&args[1]);
-        let views = self.backend.mailboxes().await?;
         let keyword = if lsub { "LSUB" } else { "LIST" };
+        let (reference, pattern) = (mailbox_name(&args[0]), mailbox_name(&args[1]));
+        if pattern.is_empty() {
+            // RFC 3501 §6.3.8: an empty pattern asks for the hierarchy
+            // delimiter and the root of the reference, nothing else.
+            write_line(writer, &format!("* {keyword} (\\Noselect) \"/\" \"\"")).await?;
+            write_line(writer, &format!("{tag} OK {keyword} completed")).await?;
+            return Ok(());
+        }
+        // The reference is a prefix of the names the pattern is
+        // matched against.
+        let pattern = format!("{reference}{pattern}");
+        let views = self.backend.mailboxes().await?;
         for view in &views {
-            if !pattern_matches(&pattern, &view.name) {
+            if !list_matches(&pattern, &view.name) {
                 continue;
             }
             write_line(
@@ -1271,12 +1279,47 @@ fn wire_mailbox(name: &str) -> String {
     qs(&codec::encode_mailbox_name(name))
 }
 
-/// One-level LIST matching: a pattern containing a wildcard (`*` or `%`)
-/// matches every mailbox — the store is flat, so the two forms agree —
-/// and anything else must equal the name exactly. The reference argument
-/// is the root and is not consulted.
-fn pattern_matches(pattern: &str, name: &str) -> bool {
-    pattern.contains('*') || pattern.contains('%') || pattern == name
+/// Whether a LIST pattern selects the mailbox listed as `name`. The
+/// mailbox whose name is `INBOX` in some casing is also matched as
+/// `INBOX` case-insensitively, the way SELECT resolves it.
+fn list_matches(pattern: &str, name: &str) -> bool {
+    wildcard_match(pattern, name, false)
+        || (name.eq_ignore_ascii_case("INBOX") && wildcard_match(pattern, "INBOX", true))
+}
+
+/// RFC 3501 §6.3.8 wildcard matching: `*` matches any run of
+/// characters, `%` any run without the hierarchy delimiter `/`, and
+/// everything else stands for itself (ASCII case-insensitively when
+/// `fold` is set). Linear in pattern length times name length.
+fn wildcard_match(pattern: &str, name: &str, fold: bool) -> bool {
+    let name: Vec<char> = name.chars().collect();
+    // reach[i]: the pattern consumed so far can match `name[..i]`.
+    let mut reach = vec![false; name.len() + 1];
+    reach[0] = true;
+    for wanted in pattern.chars() {
+        let mut next = vec![false; name.len() + 1];
+        match wanted {
+            '*' | '%' => {
+                let mut open = false;
+                for at in 0..=name.len() {
+                    if at > 0 && wanted == '%' && name[at - 1] == '/' {
+                        open = false;
+                    }
+                    open |= reach[at];
+                    next[at] = open;
+                }
+            }
+            _ => {
+                for at in 0..name.len() {
+                    let same =
+                        wanted == name[at] || (fold && wanted.eq_ignore_ascii_case(&name[at]));
+                    next[at + 1] = reach[at] && same;
+                }
+            }
+        }
+        reach = next;
+    }
+    reach[name.len()]
 }
 
 /// Encode one value for the wire: a quoted string when [`codec::
@@ -1651,12 +1694,40 @@ mod tests {
     }
 
     #[test]
-    fn list_matching_is_flat() {
-        assert!(pattern_matches("*", "Inbox"));
-        assert!(pattern_matches("%", "Inbox"));
-        assert!(pattern_matches("Inbo*", "Archive"));
-        assert!(pattern_matches("Inbox", "Inbox"));
-        assert!(!pattern_matches("Inbox", "Archive"));
+    fn list_patterns_match_with_real_wildcards() {
+        // Without a wildcard the name must be exact.
+        assert!(list_matches("Archive", "Archive"));
+        assert!(!list_matches("archive", "Archive"));
+        assert!(!list_matches("Arch", "Archive"));
+        // `*` and `%` match runs, anywhere in the pattern.
+        assert!(list_matches("*", "Archive"));
+        assert!(list_matches("%", "Archive"));
+        assert!(list_matches("*", ""));
+        assert!(list_matches("Arch*", "Archive"));
+        assert!(list_matches("*ive", "Archive"));
+        assert!(list_matches("A%e", "Archive"));
+        assert!(list_matches("A*c*e", "Archive"));
+        assert!(list_matches("Archive*", "Archive"));
+        assert!(!list_matches("Inbo*", "Archive"));
+        assert!(!list_matches("*x", "Archive"));
+        assert!(!list_matches("Archive/%", "Archive"));
+        // `%` stops at the hierarchy delimiter, `*` does not.
+        assert!(wildcard_match("a/%", "a/b", false));
+        assert!(!wildcard_match("%", "a/b", false));
+        assert!(!wildcard_match("a/%", "a/b/c", false));
+        assert!(wildcard_match("a/*", "a/b/c", false));
+        assert!(wildcard_match("%/%", "a/b", false));
+        // INBOX is case-insensitive, under whatever casing it is listed.
+        assert!(list_matches("INBOX", "Inbox"));
+        assert!(list_matches("inbox", "Inbox"));
+        assert!(list_matches("Inbox", "Inbox"));
+        assert!(list_matches("in%", "Inbox"));
+        assert!(list_matches("INB*", "INBOX"));
+        assert!(!list_matches("INBOX", "Inbox (2)"));
+        assert!(!list_matches("INBOX", "Archive"));
+        // Many wildcards stay cheap.
+        let pattern = "*a".repeat(200);
+        assert!(!list_matches(&pattern, &"a".repeat(150)));
     }
 
     #[test]

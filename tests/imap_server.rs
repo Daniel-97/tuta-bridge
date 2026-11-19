@@ -239,6 +239,32 @@ async fn greets_authenticates_and_lists() {
     wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
     wire.expect("a4 OK LIST completed").await;
 
+    // Real wildcards: a pattern selects what it matches, not
+    // everything, and the reference is a prefix of it.
+    wire.send("b1 LIST \"\" \"Arch%\"").await;
+    wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
+    wire.expect("b1 OK LIST completed").await;
+    wire.send("b2 LIST \"Arch\" \"*e\"").await;
+    wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
+    wire.expect("b2 OK LIST completed").await;
+    wire.send("b3 LIST \"\" \"Archive/%\"").await;
+    wire.expect("b3 OK LIST completed").await;
+    // INBOX is found in any casing, as SELECT finds it.
+    wire.send("b4 LIST \"\" \"INBOX\"").await;
+    wire.expect("* LIST () \"/\" \"Inbox\"").await;
+    wire.expect("b4 OK LIST completed").await;
+    wire.send("b5 LSUB \"\" inbox").await;
+    wire.expect("* LSUB () \"/\" \"Inbox\"").await;
+    wire.expect("b5 OK LSUB completed").await;
+    // The empty pattern is the delimiter probe.
+    wire.send("b6 LIST \"\" \"\"").await;
+    wire.expect("* LIST (\\Noselect) \"/\" \"\"").await;
+    wire.expect("b6 OK LIST completed").await;
+    // A pattern in modified UTF-7 matches the name it encodes.
+    wire.send("b7 LIST \"\" \"Caff&AOg-\"").await;
+    wire.expect("* LIST () \"/\" \"Caff&AOg-\"").await;
+    wire.expect("b7 OK LIST completed").await;
+
     // The name the client was given selects the mailbox, and STATUS
     // answers under the same wire name.
     wire.send("a5 STATUS \"Caff&AOg-\" (MESSAGES)").await;
