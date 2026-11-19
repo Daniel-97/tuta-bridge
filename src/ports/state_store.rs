@@ -82,6 +82,20 @@ pub trait StateStore: Send + Sync {
         -> Result<()>;
     async fn remove_message(&self, mailbox: MailboxId, uid: u32) -> Result<()>;
     async fn messages(&self, mailbox: MailboxId) -> Result<Vec<StoredMessage>>;
+    /// The `(uid, unread)` pair of every message in the mailbox, in
+    /// ascending UID order.
+    ///
+    /// This is the cheap read for keeping a message-number snapshot
+    /// current: adapters answer it without loading or decoding headers.
+    /// The default derives it from [`Self::messages`].
+    async fn message_uids(&self, mailbox: MailboxId) -> Result<Vec<(u32, bool)>> {
+        Ok(self
+            .messages(mailbox)
+            .await?
+            .into_iter()
+            .map(|message| (message.uid, message.header.unread))
+            .collect())
+    }
     /// Load one stored message by UID, or `None` when the mailbox has no
     /// such UID. Like every store read this is metadata only.
     async fn message_by_uid(&self, mailbox: MailboxId, uid: u32) -> Result<Option<StoredMessage>>;

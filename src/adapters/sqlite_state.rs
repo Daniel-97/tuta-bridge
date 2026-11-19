@@ -631,6 +631,11 @@ FROM messages WHERE mailbox_id = ? AND uid = ?";
 const SET_MIME_STRUCTURE_SQL: &str = "\
 UPDATE messages SET mime_structure = ? WHERE mailbox_id = ? AND uid = ?";
 
+/// Two integer columns walked in primary-key order: no header text is
+/// read and no JSON is decoded.
+const LIST_MESSAGE_UIDS_SQL: &str =
+    "SELECT uid, unread FROM messages WHERE mailbox_id = ? ORDER BY uid";
+
 const LIST_MESSAGE_KEYS_SQL: &str =
     "SELECT uid, tuta_list_id, tuta_element_id FROM messages WHERE mailbox_id = ?";
 
@@ -1190,6 +1195,17 @@ impl StateStore for SqliteStateStore {
             .map_err(storage_error)?;
 
         rows.iter().map(stored_message_from_row).collect()
+    }
+
+    async fn message_uids(&self, mailbox: MailboxId) -> Result<Vec<(u32, bool)>> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(LIST_MESSAGE_UIDS_SQL)
+            .bind(mailbox.0)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        rows.into_iter()
+            .map(|(uid, unread)| Ok((u32_from_i64(uid)?, unread != 0)))
+            .collect()
     }
 
     async fn message_by_uid(&self, mailbox: MailboxId, uid: u32) -> Result<Option<StoredMessage>> {
@@ -2093,6 +2109,34 @@ mod tests {
         assert_eq!(store.store_page(mailbox, &partial, false).await.unwrap(), 0);
         assert_eq!(store.messages(mailbox).await.unwrap().len(), 2);
         assert_eq!(store.mailboxes(account).await.unwrap()[0].next_uid, 4);
+    }
+
+    #[tokio::test]
+    async fn message_uids_lists_uid_and_unread_in_uid_order() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (account, mailbox) = account_and_mailbox(&store).await;
+        let other = store
+            .upsert_mailbox(account, &folder("other", "Other", FolderKind::Custom), 100)
+            .await
+            .unwrap();
+        let mut read = header("mail", "e2");
+        read.unread = false;
+        for stored in [header("mail", "e1"), read, header("mail", "e3")] {
+            store.assign_uid(mailbox, &stored).await.unwrap();
+        }
+        store
+            .assign_uid(other, &header("mail", "e9"))
+            .await
+            .unwrap();
+        // A removed message leaves a gap, not a renumbering.
+        store.remove_message(mailbox, 1).await.unwrap();
+
+        assert_eq!(
+            store.message_uids(mailbox).await.unwrap(),
+            vec![(2, false), (3, true)]
+        );
+        assert_eq!(store.message_uids(other).await.unwrap(), vec![(1, true)]);
+        assert!(store.message_uids(MailboxId(999)).await.unwrap().is_empty());
     }
 
     #[tokio::test]
