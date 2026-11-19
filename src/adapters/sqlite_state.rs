@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool};
+use sqlx::{Connection, Row, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::domain::{
     Address, BatchOutcome, Error, Folder, FolderKind, MailboxId, MessageHeader, Result,
@@ -13,9 +13,40 @@ use crate::domain::{
 };
 use crate::ports::StateStore;
 
-/// Schema statements executed in order on every open.
+/// Schema version this binary reads and writes, stored in SQLite's
+/// `user_version`.
 ///
-/// `IF NOT EXISTS` keeps reopening an existing database idempotent.
+/// Opening migrates an older database forward inside one transaction and
+/// refuses a newer one: a binary that does not know a later schema must
+/// not write to it.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// The database carries a schema version newer than [`SCHEMA_VERSION`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "state database has schema version {found}, but this tuta-bridge only supports \
+     versions up to {supported}; upgrade tuta-bridge"
+)]
+pub struct SchemaTooNew {
+    pub found: i64,
+    pub supported: i64,
+}
+
+/// Fail when `version` was written by a newer binary.
+fn check_schema_version(version: i64) -> std::result::Result<(), SchemaTooNew> {
+    if version > SCHEMA_VERSION {
+        return Err(SchemaTooNew {
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Version 1 schema statements.
+///
+/// `IF NOT EXISTS` lets the same statements create a fresh database and
+/// adopt one that predates version stamping.
 const SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY,
@@ -116,36 +147,21 @@ impl SqliteStateStore {
         &self.pool
     }
 
-    async fn apply_schema(&self) -> anyhow::Result<()> {
-        for statement in SCHEMA_STATEMENTS {
-            sqlx::query(statement).execute(&self.pool).await?;
-        }
-        self.add_mime_structure_column().await?;
-        sqlx::query("PRAGMA user_version = 2")
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// v2 migration: add the metadata-only `mime_structure` column.
+    /// Bring the schema to [`SCHEMA_VERSION`].
     ///
-    /// `CREATE TABLE IF NOT EXISTS` cannot extend an existing table, so a
-    /// database created at version 1 gains the column here; its rows
-    /// keep `NULL`, which reads back as "not enriched yet". The check
-    /// keeps the migration idempotent: a fresh database already carries
-    /// the column from the schema statements above.
-    async fn add_mime_structure_column(&self) -> anyhow::Result<()> {
-        let columns: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'mime_structure'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        if columns == 0 {
-            sqlx::query("ALTER TABLE messages ADD COLUMN mime_structure TEXT")
-                .execute(&self.pool)
-                .await?;
+    /// A database already at the current version is only read. An older
+    /// one is migrated forward; a newer one is refused with
+    /// [`SchemaTooNew`] and left untouched.
+    async fn apply_schema(&self) -> anyhow::Result<()> {
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?;
+        check_schema_version(version)?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
         }
-        Ok(())
+        let mut connection = self.pool.acquire().await?;
+        migrate(&mut connection).await
     }
 
     /// Assign a stable UID or refresh an existing header on `executor`.
@@ -288,6 +304,57 @@ impl SqliteStateStore {
             result.rows_affected(),
         ))
     }
+}
+
+/// Migrate the schema forward to [`SCHEMA_VERSION`] in one transaction.
+///
+/// `BEGIN IMMEDIATE` takes the write lock first and the version is read
+/// again under it, so two processes opening the same old database
+/// migrate it once. Every step and the new version commit together: a
+/// failed or interrupted migration leaves the database at its old
+/// version.
+async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
+    let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *transaction)
+        .await?;
+    check_schema_version(version)?;
+
+    if version < 1 {
+        for statement in SCHEMA_STATEMENTS {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+    }
+    if version < 2 {
+        add_mime_structure_column(&mut transaction).await?;
+    }
+
+    // PRAGMA arguments cannot be bound; the value is a constant.
+    sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// v2 migration: add the metadata-only `mime_structure` column.
+///
+/// A database created at version 1 gains the column here; its rows keep
+/// `NULL`, which reads back as "not enriched yet". The check keeps the
+/// step idempotent: a table created by the version 1 statements of this
+/// binary already carries the column.
+async fn add_mime_structure_column(connection: &mut SqliteConnection) -> anyhow::Result<()> {
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'mime_structure'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if columns == 0 {
+        sqlx::query("ALTER TABLE messages ADD COLUMN mime_structure TEXT")
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(())
 }
 
 const UPSERT_ACCOUNT_SQL: &str = "\
@@ -1853,7 +1920,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
         let stored = store
             .message_by_uid(MailboxId(1), 1)
             .await
@@ -1884,7 +1951,82 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_database_newer_than_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        {
+            let store = SqliteStateStore::open(&path).await.unwrap();
+            store.upsert_account("owner@example.invalid").await.unwrap();
+            sqlx::query(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+                .execute(store.pool())
+                .await
+                .unwrap();
+            store.pool().close().await;
+        }
+
+        // The newer database is refused with the typed error...
+        let error = match SqliteStateStore::open(&path).await {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(error) => error,
+        };
+        let too_new = error
+            .downcast_ref::<SchemaTooNew>()
+            .expect("the error names the schema versions");
+        assert_eq!(too_new.found, SCHEMA_VERSION + 1);
+        assert_eq!(too_new.supported, SCHEMA_VERSION);
+        assert!(error.to_string().contains("upgrade tuta-bridge"));
+
+        // ...and left untouched: the version is not stamped back down.
+        let options = SqliteConnectOptions::new().filename(&path);
+        let pool = pool_options().connect_with(options).await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1);
+        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(accounts, 1);
+    }
+
+    #[tokio::test]
+    async fn adopts_an_unversioned_database_without_losing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        // A database that predates version stamping: tables exist, but
+        // `user_version` is still 0.
+        {
+            let store = SqliteStateStore::open(&path).await.unwrap();
+            let (_account, mailbox) = account_and_mailbox(&store).await;
+            store
+                .assign_uid(mailbox, &header("entries", "e1"))
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA user_version = 0")
+                .execute(store.pool())
+                .await
+                .unwrap();
+            store.pool().close().await;
+        }
+
+        let store = SqliteStateStore::open(&path).await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let mailboxes = store.mailboxes(account).await.unwrap();
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].uidvalidity, 100);
+        assert_eq!(mailboxes[0].next_uid, 2);
+        assert_eq!(store.messages(mailboxes[0].id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2064,7 +2206,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[tokio::test]
@@ -2096,7 +2238,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[cfg(unix)]

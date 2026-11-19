@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::adapters::sqlite_state::SqliteStateStore;
+use crate::adapters::sqlite_state::{SchemaTooNew, SqliteStateStore};
 use crate::app::sync::{SyncEngine, SyncReport};
 use crate::config::{state_path, Config};
 use crate::domain::{AccountId, Error, Result};
@@ -72,8 +72,19 @@ pub async fn open_state_store() -> Result<Arc<dyn StateStore>> {
     let path = state_path().map_err(|e| Error::Config(e.to_string()))?;
     let store = SqliteStateStore::open(&path)
         .await
-        .map_err(|_| Error::Storage("failed to open state database".into()))?;
+        .map_err(open_error)?;
     Ok(Arc::new(store))
+}
+
+/// Map a failed open to a fixed message.
+///
+/// A database written by a newer binary keeps its own explanation, which
+/// carries schema version numbers only; every other failure stays opaque.
+fn open_error(error: anyhow::Error) -> Error {
+    match error.downcast_ref::<SchemaTooNew>() {
+        Some(too_new) => Error::Storage(too_new.to_string()),
+        None => Error::Storage("failed to open state database".into()),
+    }
 }
 
 pub(crate) async fn sync_with(
