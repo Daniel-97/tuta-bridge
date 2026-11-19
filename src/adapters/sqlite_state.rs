@@ -20,7 +20,7 @@ use crate::ports::StateStore;
 /// Opening migrates an older database forward inside one transaction and
 /// refuses a newer one: a binary that does not know a later schema must
 /// not write to it.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The database carries a schema version newer than [`SCHEMA_VERSION`].
 #[derive(Debug, thiserror::Error)]
@@ -549,6 +549,11 @@ async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
             .execute(&mut *transaction)
             .await?;
     }
+    if version < 6 {
+        sqlx::query(RESET_ENRICHMENT_SQL)
+            .execute(&mut *transaction)
+            .await?;
+    }
 
     // The caller switched foreign keys off for the table rebuild; nothing
     // may commit with a dangling reference.
@@ -595,6 +600,20 @@ const MAILBOX_AUTOINCREMENT_STATEMENTS: &[&str] = &[
     "DROP TABLE mailboxes",
     "ALTER TABLE mailboxes_rebuilt RENAME TO mailboxes",
 ];
+
+/// v6 migration: forget every stored enrichment.
+///
+/// Earlier binaries decoded mail details without their To/Cc/Bcc
+/// recipients, so enriched rows hold an incomplete envelope and a size
+/// and BODYSTRUCTURE measured on a message rendered without them — and
+/// being marked complete, they would never be loaded again. Clearing the
+/// completeness mark together with the two derived columns is exactly
+/// what the enricher and the IMAP backend test before loading content,
+/// so each message is enriched again on its next body-class fetch. UIDs,
+/// flags, and every header field stay as they are; a size a client
+/// already cached can therefore change once.
+const RESET_ENRICHMENT_SQL: &str =
+    "UPDATE messages SET envelope_complete = 0, rfc822_size = NULL, mime_structure = NULL";
 
 /// v5 migration: index messages by Tuta element id.
 ///
@@ -2534,12 +2553,15 @@ mod tests {
             "INSERT INTO mailboxes (id, account_id, list_id, name, kind, uidvalidity, next_uid)
              VALUES (1, 1, 'entries-a', 'Inbox', 'inbox', 100, 8),
                     (2, 1, 'entries-b', 'Work', 'custom', 100, 4)",
+            // e1 was enriched by the version 2 binary; e2 never was.
             "INSERT INTO messages (mailbox_id, uid, tuta_list_id, tuta_element_id,
-                 received_at_ms, subject, from_address, unread, references_json, mime_structure)
-             VALUES (1, 7, 'mail-list', 'e1', 1700000000000, 'first',
-                     'sender@example.invalid', 1, '[]', 'structure'),
-                    (2, 3, 'mail-list', 'e2', 1700000000001, 'second',
-                     'sender@example.invalid', 0, '[]', NULL)",
+                 received_at_ms, sent_at_ms, subject, from_address, unread, message_id,
+                 references_json, rfc822_size, envelope_complete, mime_structure)
+             VALUES (1, 7, 'mail-list', 'e1', 1700000000000, 1699999999000, 'first',
+                     'sender@example.invalid', 1, '<m1@example.invalid>', '[]', 1234, 1,
+                     'structure'),
+                    (2, 3, 'mail-list', 'e2', 1700000000001, 0, 'second',
+                     'sender@example.invalid', 0, NULL, '[]', NULL, 0, NULL)",
             "INSERT INTO sync_state (account_id, group_id, last_batch_id)
              VALUES (1, 'group1', 'batch-1')",
             "PRAGMA user_version = 2",
@@ -2582,7 +2604,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.header.element_id, "e1");
-        assert_eq!(first.mime_structure.as_deref(), Some("structure"));
+        // The enriched row lost exactly its enrichment state, so it is
+        // enriched again on its next fetch; its header fields and flag
+        // are as stored.
+        assert!(!first.header.envelope_complete);
+        assert_eq!(first.rfc822_size, None);
+        assert_eq!(first.mime_structure, None);
+        assert_eq!(first.header.subject, "first");
+        assert!(first.header.unread);
+        assert_eq!(first.header.sent_at_ms, 1_699_999_999_000);
+        assert_eq!(
+            first.header.message_id.as_deref(),
+            Some("<m1@example.invalid>")
+        );
         let second = store
             .message_by_uid(MailboxId(2), 3)
             .await
