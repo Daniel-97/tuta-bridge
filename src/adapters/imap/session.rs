@@ -619,6 +619,55 @@ fn bad_tag(line: &str) -> String {
 /// client bytes.
 const INVALID_LOG_TAG: &str = "<invalid>";
 
+/// Every command the session dispatches on, as the log may name it.
+const KNOWN_COMMANDS: &[&str] = &[
+    "CAPABILITY",
+    "NOOP",
+    "ID",
+    "LOGOUT",
+    "LOGIN",
+    "SELECT",
+    "EXAMINE",
+    "LIST",
+    "LSUB",
+    "STATUS",
+    "FETCH",
+    "UID FETCH",
+    "SEARCH",
+    "UID SEARCH",
+    "CHECK",
+    "CLOSE",
+    "IDLE",
+    "STORE",
+    "APPEND",
+    "EXPUNGE",
+    "COPY",
+    "MOVE",
+    "CREATE",
+    "DELETE",
+    "RENAME",
+    "SUBSCRIBE",
+    "UNSUBSCRIBE",
+    "UID STORE",
+    "UID COPY",
+];
+
+/// The placeholder logged for a command the session does not know.
+const UNKNOWN_LOG_COMMAND: &str = "<unknown>";
+
+/// The command as it may appear in a log line: its fixed name when the
+/// session knows it, a fixed placeholder otherwise. The command token
+/// is client input like any other — a client that pipelines a literal
+/// the server refused has its next line, credentials included, parsed
+/// as a command — so it is never logged as received.
+fn log_command(verb: &str) -> &'static str {
+    KNOWN_COMMANDS
+        .iter()
+        .copied()
+        .find(|known| *known == verb)
+        .unwrap_or(UNKNOWN_LOG_COMMAND)
+}
+
 /// The tag as it may appear in a log line: itself when it passes
 /// [`tag_is_safe`], a fixed placeholder otherwise. The wire never
 /// changes — this is the log field only.
@@ -671,10 +720,12 @@ impl Session {
     {
         let Request { tag, command, args } = request;
         let command = command.to_ascii_uppercase();
+        let verb = normalize(&command, &args);
         // The logged tag passes the same printable-ASCII gate a BAD
-        // response applies; a tag that fails it logs a fixed
+        // response applies, and the command is logged only when it is
+        // one the session knows; anything else logs a fixed
         // placeholder, so raw client bytes never reach a log line.
-        tracing::debug!(tag = %log_tag(&tag), command = %command, "imap command");
+        tracing::debug!(tag = %log_tag(&tag), command = log_command(&verb), "imap command");
 
         // Snapshot validity: a Selected session never acts on a stale
         // view. SELECT/EXAMINE replace it, CLOSE drops it, LOGOUT ends
@@ -687,7 +738,6 @@ impl Session {
             return Ok(Flow::Close);
         }
 
-        let verb = normalize(&command, &args);
         // IDLE is served here rather than in dispatch_command because
         // its DONE loop reads from the connection.
         if verb == "IDLE" {
@@ -1983,6 +2033,22 @@ mod tests {
         assert_eq!(log_tag("\u{7f}weird\u{1b}"), INVALID_LOG_TAG);
         assert_eq!(log_tag("{5}"), INVALID_LOG_TAG);
         assert_eq!(log_tag("a[b]"), INVALID_LOG_TAG);
+    }
+
+    #[test]
+    fn logged_commands_are_fixed_names_never_client_bytes() {
+        assert_eq!(log_command("LOGIN"), "LOGIN");
+        assert_eq!(log_command("UID FETCH"), "UID FETCH");
+        // A credential line parsed as a command, control characters, a
+        // UID sub-command the session does not serve: all placeholders.
+        assert_eq!(log_command("HUNTER2"), UNKNOWN_LOG_COMMAND);
+        assert_eq!(log_command("NOOP\u{1b}[31m"), UNKNOWN_LOG_COMMAND);
+        assert_eq!(log_command("UID HUNTER2"), UNKNOWN_LOG_COMMAND);
+        assert_eq!(log_command(""), UNKNOWN_LOG_COMMAND);
+        // Every dispatched verb is known to the log, the UID forms
+        // through `normalize` like the dispatcher sees them.
+        let uid = normalize("UID", &[ImapArg::Atom("fetch".into())]);
+        assert_eq!(log_command(&uid), "UID FETCH");
     }
 
     #[test]
