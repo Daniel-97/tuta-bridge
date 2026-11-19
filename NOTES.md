@@ -218,6 +218,13 @@
   for too long; closing connection`. Writes go through a stall guard:
   60 s without progress fails the write and ends the session, and a
   failed connection is never answered again.
+- Login throttling: a failed `LOGIN` logs `imap login failed` at warn
+  level with the per-connection attempt count and no client text,
+  waits `login_failure_delay` (3 s) holding a mutex shared by every
+  session of the listener — so failures are answered one at a time
+  whatever the number of connections, about one guess per 3 s in
+  total — then answers `NO`; the third failure adds `* BYE too many
+  failed logins` and closes. A correct login never touches the mutex.
 - IDLE literal edge: a tagged BAD during IDLE never answers a literal
   continuation, and RFC 3501 obliges the client not to send the octets
   its `{n}` token announced — the session reads none of them, and

@@ -132,6 +132,10 @@ tuta-bridge serve
   one `IDLE`) once logged in. A client that stops reading is dropped
   after 60 seconds. A client cut off this way gets `* BYE` and simply
   reconnects.
+- A wrong password is answered after 3 seconds, logged as a warning
+  (without the user name), and the connection is closed after the
+  third failure. Failed attempts wait in a single queue, so opening
+  more connections does not allow more guesses.
 - Ctrl-C stops `serve`. A Ctrl-C pressed during the initial baseline
   sync takes effect only after that sync finishes; once the event
   stream is running the stop is immediate.

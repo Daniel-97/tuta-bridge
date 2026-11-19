@@ -131,6 +131,15 @@ pub struct SessionLimits {
     pub pre_auth_literal_bytes: usize,
     /// The same bound once logged in.
     pub command_literal_bytes: usize,
+    /// How long a failed LOGIN waits before it is answered.
+    pub login_failure_delay: Duration,
+    /// Failed LOGINs after which the connection is closed.
+    pub max_login_attempts: u32,
+    /// Held while a failed LOGIN waits out its delay. Sessions cloned
+    /// from the same limits share it, so the delays of one listener's
+    /// connections run one after the other: opening more connections
+    /// does not buy more password guesses per second.
+    pub login_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for SessionLimits {
@@ -141,6 +150,9 @@ impl Default for SessionLimits {
             write_timeout: Duration::from_secs(60),
             pre_auth_literal_bytes: MAX_PRE_AUTH_LITERAL_BYTES,
             command_literal_bytes: MAX_LITERAL_BYTES,
+            login_failure_delay: Duration::from_secs(3),
+            max_login_attempts: 3,
+            login_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -257,6 +269,8 @@ struct Session {
     backend: Arc<dyn ImapBackend>,
     watch: broadcast::Receiver<MailboxChanged>,
     limits: SessionLimits,
+    /// Failed LOGINs on this connection so far.
+    failed_logins: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +298,7 @@ where
         backend,
         watch,
         limits,
+        failed_logins: 0,
     };
 
     write_line(&mut writer, &greeting()).await?;
@@ -733,7 +748,7 @@ impl Session {
             }
             "LOGIN" => {
                 if matches!(self.state, State::NotAuthenticated) {
-                    self.handle_login(writer, tag, args).await?;
+                    return self.handle_login(writer, tag, args).await;
                 } else {
                     write_line(
                         writer,
@@ -873,10 +888,10 @@ impl Session {
         writer: &mut W,
         tag: &str,
         args: &[ImapArg],
-    ) -> Result<()> {
+    ) -> Result<Flow> {
         if args.len() != 2 {
             write_line(writer, &format!("{tag} BAD invalid LOGIN")).await?;
-            return Ok(());
+            return Ok(Flow::Continue);
         }
         let user = arg_string(&args[0]);
         let password = SecretString::new(arg_string(&args[1]).into_boxed_str());
@@ -887,10 +902,25 @@ impl Session {
                 &format!("{tag} OK [CAPABILITY {CAPABILITIES}] LOGIN completed"),
             )
             .await?;
-        } else {
-            write_line(writer, &format!("{tag} NO authentication failed")).await?;
+            return Ok(Flow::Continue);
         }
-        Ok(())
+
+        // A failed login: logged with its count and nothing the client
+        // sent, answered only after a delay that all connections of the
+        // listener wait out one at a time, and tolerated a few times
+        // per connection.
+        self.failed_logins += 1;
+        tracing::warn!(attempt = self.failed_logins, "imap login failed");
+        {
+            let _gate = self.limits.login_gate.lock().await;
+            sleep(self.limits.login_failure_delay).await;
+        }
+        write_line(writer, &format!("{tag} NO authentication failed")).await?;
+        if self.failed_logins >= self.limits.max_login_attempts {
+            write_line(writer, "* BYE too many failed logins").await?;
+            return Ok(Flow::Close);
+        }
+        Ok(Flow::Continue)
     }
 
     // -- SELECT / EXAMINE -------------------------------------------------

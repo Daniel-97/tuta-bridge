@@ -226,7 +226,55 @@ async fn select_inbox(wire: &mut DuplexWire) {
 // Session contract
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn failed_logins_are_delayed_serialized_and_bounded() {
+    let limits = SessionLimits::default();
+    let (delay, attempts) = (limits.login_failure_delay, limits.max_login_attempts);
+    assert!(delay >= Duration::from_secs(1) && attempts > 1);
+
+    // Two connections of one listener share its limits.
+    let (mut first, first_session, _) = spawn_session_with(backend(), 16, limits.clone()).await;
+    let (mut second, second_session, _) = spawn_session_with(backend(), 16, limits).await;
+    first.expect(GREETING).await;
+    second.expect(GREETING).await;
+
+    // A wrong password is answered only after the delay, and two
+    // connections guessing at once wait one after the other: a second
+    // connection does not double the guessing rate.
+    let started = Instant::now();
+    first.send("a1 LOGIN user@example.invalid wrong").await;
+    second.send("b1 LOGIN user@example.invalid wrong").await;
+    first.expect("a1 NO authentication failed").await;
+    second.expect("b1 NO authentication failed").await;
+    assert_eq!(started.elapsed(), delay * 2);
+
+    // A correct login is never delayed, even behind a failing one.
+    let started = Instant::now();
+    second.send("b2 LOGIN user@example.invalid wrong").await;
+    first.send("a2 LOGIN user@example.invalid hunter2").await;
+    first
+        .expect("a2 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed")
+        .await;
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    second.expect("b2 NO authentication failed").await;
+
+    // The connection that keeps failing is closed.
+    for attempt in 3..=attempts {
+        second
+            .send(&format!("b{attempt} LOGIN user@example.invalid wrong"))
+            .await;
+        second
+            .expect(&format!("b{attempt} NO authentication failed"))
+            .await;
+    }
+    second.expect("* BYE too many failed logins").await;
+    second.expect_eof().await;
+    second_session.await.unwrap().unwrap();
+    drop(first);
+    first_session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn greets_authenticates_and_lists() {
     let (mut wire, session, _) = spawn_session(backend(), 16).await;
 
