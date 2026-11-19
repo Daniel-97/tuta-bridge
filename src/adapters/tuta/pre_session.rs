@@ -142,36 +142,35 @@ impl TutaPreSession {
             .await?;
         let mut session_resp = parse_session_response(&session_data)?;
 
-        // Step 7: Handle challenges. Only TOTP (type 1) is supported; any other
-        // challenge type is rejected immediately.
+        // Step 7: Handle challenges. The server sends one challenge per
+        // registered second-factor type and any one of them completes the
+        // login, so — like the reference client, which looks for the TOTP
+        // challenge among them — answer the TOTP challenge when there is
+        // one and ignore the others. Only a login that offers no TOTP at
+        // all is unsupported.
         let session_id = super::json::session_id_from_access_token(&session_resp.access_token)?;
         let mut need_poll = false;
 
-        for challenge in &session_resp.challenges {
-            match challenge {
-                ChallengeType::Totp => {
-                    let code = (totp)()?;
-                    let totp_body = second_factor_body(&session_id, &code);
-                    let totp_url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
-                    let mut totp_headers = self.common_headers(true);
-                    totp_headers.insert("v".to_string(), "158".to_string());
-                    self.request_json(
-                        HttpMethod::POST,
-                        &totp_url,
-                        Some(totp_body),
-                        totp_headers,
-                        AuthFailure::SecondFactor,
-                        "second factor request",
-                    )
-                    .await?;
-                    need_poll = true;
-                }
-                ChallengeType::Other(_) => {
-                    return Err(Error::Unsupported(
-                        "second factor type not supported".into(),
-                    ));
-                }
-            }
+        if session_resp.challenges.contains(&ChallengeType::Totp) {
+            let code = (totp)()?;
+            let totp_body = second_factor_body(&session_id, &code);
+            let totp_url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
+            let mut totp_headers = self.common_headers(true);
+            totp_headers.insert("v".to_string(), "158".to_string());
+            self.request_json(
+                HttpMethod::POST,
+                &totp_url,
+                Some(totp_body),
+                totp_headers,
+                AuthFailure::SecondFactor,
+                "second factor request",
+            )
+            .await?;
+            need_poll = true;
+        } else if !session_resp.challenges.is_empty() {
+            return Err(Error::Unsupported(
+                "second factor type not supported".into(),
+            ));
         }
 
         // Step 8: Poll for approval
