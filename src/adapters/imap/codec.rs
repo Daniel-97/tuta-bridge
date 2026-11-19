@@ -402,7 +402,13 @@ pub enum BodySection {
 /// One item of a FETCH request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchItem {
-    Body { peek: bool, section: BodySection },
+    /// `BODY[section]` or `BODY.PEEK[section]`, optionally limited to
+    /// the `<offset.count>` octets of a partial fetch.
+    Body {
+        peek: bool,
+        section: BodySection,
+        partial: Option<(u32, u32)>,
+    },
     BodyStructure,
     Envelope,
     Flags,
@@ -449,15 +455,16 @@ pub fn parse_fetch_items(args: &[ImapArg]) -> Result<Vec<FetchItem>> {
 
 /// Expand one fetch token; macros expand to several items.
 fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
-    let (name, section) = match token.find('[') {
+    let (name, section, partial) = match token.find('[') {
         Some(open) => {
             let close = token.rfind(']').ok_or_else(invalid_fetch_items)?;
-            if close != token.len() - 1 || open + 1 > close {
+            if open + 1 > close {
                 return Err(invalid_fetch_items());
             }
-            (&token[..open], Some(&token[open + 1..close]))
+            let partial = parse_partial(&token[close + 1..])?;
+            (&token[..open], Some(&token[open + 1..close]), partial)
         }
-        None => (token, None),
+        None => (token, None, None),
     };
 
     match section {
@@ -473,6 +480,7 @@ fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
             Ok(vec![FetchItem::Body {
                 peek,
                 section: parse_body_section(section)?,
+                partial,
             }])
         }
         None => {
@@ -511,6 +519,31 @@ fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
             }
         }
     }
+}
+
+/// Parse what follows the `]` of a body item: nothing, or the
+/// `<offset.count>` of a partial fetch (RFC 3501 §6.4.5; the count is
+/// a non-zero number).
+fn parse_partial(raw: &str) -> Result<Option<(u32, u32)>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let (offset, count) = raw
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .and_then(|inner| inner.split_once('.'))
+        .ok_or_else(invalid_fetch_items)?;
+    let number = |digits: &str| -> Result<u32> {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid_fetch_items());
+        }
+        digits.parse().map_err(|_| invalid_fetch_items())
+    };
+    let (offset, count) = (number(offset)?, number(count)?);
+    if count == 0 {
+        return Err(invalid_fetch_items());
+    }
+    Ok(Some((offset, count)))
 }
 
 /// Parse the text between `BODY[` and `]`.
@@ -825,23 +858,28 @@ mod tests {
             vec![
                 FetchItem::Body {
                     peek: false,
-                    section: BodySection::Empty
+                    section: BodySection::Empty,
+                    partial: None,
                 },
                 FetchItem::Body {
                     peek: false,
-                    section: BodySection::Header
+                    section: BodySection::Header,
+                    partial: None,
                 },
                 FetchItem::Body {
                     peek: false,
-                    section: BodySection::Text
+                    section: BodySection::Text,
+                    partial: None,
                 },
                 FetchItem::Body {
                     peek: true,
-                    section: BodySection::Empty
+                    section: BodySection::Empty,
+                    partial: None,
                 },
                 FetchItem::Body {
                     peek: false,
-                    section: BodySection::Part("1.2".into())
+                    section: BodySection::Part("1.2".into()),
+                    partial: None,
                 },
                 FetchItem::BodyStructure,
             ]
@@ -853,6 +891,7 @@ mod tests {
         let wanted = vec![FetchItem::Body {
             peek: false,
             section: BodySection::HeaderFields(vec!["DATE".into(), "FROM".into()]),
+            partial: None,
         }];
         // The unparenthesized form is one item, not three tokens.
         assert_eq!(
@@ -871,6 +910,45 @@ mod tests {
         assert!(fetch_items("BODY[HEADER.FIELDS ()]").is_err());
         assert!(fetch_items("BODY[HEADER.FIELDS DATE]").is_err());
         assert!(fetch_items("BODY[HEADER.FIELDS.NOT (DATE)]").is_err());
+    }
+
+    #[test]
+    fn parses_partial_fetches() {
+        assert_eq!(
+            fetch_items("(BODY.PEEK[]<0.65536> BODY[TEXT]<10.5>)").unwrap(),
+            vec![
+                FetchItem::Body {
+                    peek: true,
+                    section: BodySection::Empty,
+                    partial: Some((0, 65536)),
+                },
+                FetchItem::Body {
+                    peek: false,
+                    section: BodySection::Text,
+                    partial: Some((10, 5)),
+                },
+            ]
+        );
+        assert!(matches!(
+            fetch_items("BODY[HEADER.FIELDS (DATE)]<0.1>").unwrap()[0],
+            FetchItem::Body {
+                partial: Some((0, 1)),
+                ..
+            }
+        ));
+        for raw in [
+            "BODY[]<0>",
+            "BODY[]<0.0>",
+            "BODY[]<.5>",
+            "BODY[]<0.5",
+            "BODY[]0.5>",
+            "BODY[]<a.5>",
+            "BODY[]<0.5>x",
+            "BODY[]<0.99999999999>",
+            "RFC822<0.5>",
+        ] {
+            assert!(fetch_items(raw).is_err(), "{raw} must not parse");
+        }
     }
 
     #[test]

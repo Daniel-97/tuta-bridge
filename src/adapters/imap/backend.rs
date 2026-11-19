@@ -657,7 +657,7 @@ impl ImapBackend for TutaImapBackend {
                     }
                     response.rfc822_size = stored.rfc822_size;
                 }
-                FetchItem::Body { peek, section } => {
+                FetchItem::Body { peek, section, .. } => {
                     // A stale row heals before the by-design re-render;
                     // partial rows keep the body-only path.
                     if stale_complete(&stored) {

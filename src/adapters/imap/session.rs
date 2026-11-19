@@ -1296,6 +1296,22 @@ fn body_section_name(section: &BodySection) -> String {
     }
 }
 
+/// The octets a partial fetch `<offset.count>` selects from a section.
+/// An offset at or beyond the end selects nothing, and a count that
+/// runs past the end is cut there (RFC 3501 §6.4.5).
+fn partial_octets(mut body: Vec<u8>, partial: Option<(u32, u32)>) -> Vec<u8> {
+    let Some((offset, count)) = partial else {
+        return body;
+    };
+    let start = usize::try_from(offset).map_or(body.len(), |offset| offset.min(body.len()));
+    let end = usize::try_from(count).map_or(body.len(), |count| {
+        start.saturating_add(count).min(body.len())
+    });
+    body.truncate(end);
+    body.drain(..start);
+    body
+}
+
 /// One rendered fragment of a FETCH response: wire text, or body bytes
 /// that stream as a server-sent literal.
 enum Piece {
@@ -1327,10 +1343,17 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
         )
     });
 
+    let mut body_partial = None;
     for (index, item) in items.iter().enumerate() {
         let body_name = match item {
-            FetchItem::Body { section, .. } if body_at == Some(index) => {
-                Some(format!("BODY[{}]", body_section_name(section)))
+            FetchItem::Body {
+                section, partial, ..
+            } if body_at == Some(index) => {
+                // RFC 3501 §7.4.2: a partial answer names its origin
+                // octet, `BODY[]<0>`, and never the requested count.
+                let origin = partial.map_or_else(String::new, |(offset, _)| format!("<{offset}>"));
+                body_partial = *partial;
+                Some(format!("BODY[{}]{origin}", body_section_name(section)))
             }
             FetchItem::Rfc822 if body_at == Some(index) => Some("RFC822".to_string()),
             FetchItem::Rfc822Header if body_at == Some(index) => Some("RFC822.HEADER".to_string()),
@@ -1377,6 +1400,7 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
         let Some(body) = response.body.take() else {
             continue;
         };
+        let body = partial_octets(body, body_partial);
         pieces.push(Piece::Text(std::mem::take(&mut text)));
         pieces.push(Piece::Text(format!("{name} {{{}}}\r\n", body.len())));
         pieces.push(Piece::Body(body));
@@ -1479,6 +1503,32 @@ mod tests {
               INTERNALDATE \"14-Nov-2023 22:13:20 +0000\")\r\n"
         );
         assert!(response.body.is_some());
+    }
+
+    #[test]
+    fn partial_fetches_render_their_origin_and_slice() {
+        // The item name carries `<origin>`, the literal the requested
+        // octets only: "hello\r\nworld" is 12 octets.
+        let render = |raw: &str| {
+            let mut response = sample_response();
+            let items = parse_fetch_items(raw).unwrap();
+            wire_of(render_fetch(3, &mut response, &items))
+        };
+        assert_eq!(
+            render("BODY.PEEK[]<0.5>"),
+            "* 3 FETCH (BODY[]<0> {5}\r\nhello)\r\n"
+        );
+        assert_eq!(
+            render("BODY[]<7.100>"),
+            "* 3 FETCH (BODY[]<7> {5}\r\nworld)\r\n"
+        );
+        // At or past the end the answer is an empty string, still named.
+        assert_eq!(render("BODY[]<12.4>"), "* 3 FETCH (BODY[]<12> {0}\r\n)\r\n");
+        assert_eq!(render("BODY[]<99.4>"), "* 3 FETCH (BODY[]<99> {0}\r\n)\r\n");
+        assert_eq!(
+            render("(UID BODY[TEXT]<1.3>)"),
+            "* 3 FETCH (UID 5 BODY[TEXT]<1> {3}\r\nell)\r\n"
+        );
     }
 
     #[test]
