@@ -45,6 +45,7 @@
 - Attachments are `TutanotaFile` instances, each referencing blobs that are decrypted separately.
 - BlobService GET uses the plural form (`193` with one `BlobId` per blob) and returns a framed multi-blob response: 4-byte count, then per blob 9-byte id, 6-byte padding, 4-byte size, ciphertext. `v=13`, `accessToken` and `cv` are query parameters.
 - `TutanotaFile.size` is the encrypted blob size, not the decrypted length.
+- Inside a `MailDetailsBlob` only the values the type model flags `encrypted` are ciphertext: `Body.text`/`compressedText`, `Header.headers`/`compressedHeaders`, `MailAddress.name`, and both `EncryptedMailAddress` fields. `MailAddress.address` (id 95) and `MailDetails.sentDate` (id 1284) are plaintext. The decoder follows that flag; treating them as ciphertext dropped every To/Cc/Bcc recipient and read every `sentDate` as 0.
 
 ## M3 state and sync
 
@@ -194,10 +195,13 @@
   `Junk`, `Archive`) are derived from the folder kind because Tuta
   stores the `name` of system MailSets empty on the server; custom
   MailSets carry real names and an unnamed custom set is skipped.
-- Sent dates are taken from the parsed `Date:` header, not Tuta's
-  `MailDetails.sentDate`, which is 0 for external mail — an M2-era root
-  cause that left every enriched row with `sent_at_ms = 0`, so ENVELOPE
-  dates rendered NIL and Thunderbird showed 01/01/1970. Mail without a
+- Sent dates are taken from the parsed `Date:` header first, then Tuta's
+  `MailDetails.sentDate`. The M2-era decoder read `sentDate` as 0 for
+  every mail (it tried to decrypt the plaintext field; this was first
+  misread as "0 for external mail"), which left every enriched row with
+  `sent_at_ms = 0`, so ENVELOPE dates rendered NIL and Thunderbird showed
+  01/01/1970. Whether the server really stores 0 for external mail is
+  unverified, so the header keeps precedence. Mail without a
   parseable `Date:` falls back to `sentDate`, then to the received time
   (mirroring the web client's display), so undated mail never renders
   as epoch. Rows already in a database heal on their next

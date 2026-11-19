@@ -4,6 +4,21 @@
 //! and served by the blob server as encrypted server-model JSON. The SDK does
 //! not expose a loader for them, so this module decrypts the fields needed by
 //! the MIME renderer with the mail's session key.
+//!
+//! Which values are ciphertext follows the `encrypted` flag of the pinned
+//! type model (`tutanota.json`), not the name of the type:
+//!
+//! | type                 | id   | field             | wire form          |
+//! |----------------------|------|-------------------|--------------------|
+//! | MailDetails          | 1284 | sentDate          | plain number string |
+//! | Body                 | 1275 | text              | encrypted          |
+//! | Body                 | 1276 | compressedText    | encrypted, LZ4     |
+//! | Header               | 1271 | headers           | encrypted          |
+//! | Header               | 1272 | compressedHeaders | encrypted, LZ4     |
+//! | MailAddress          | 94   | name              | encrypted          |
+//! | MailAddress          | 95   | address           | plain string       |
+//! | EncryptedMailAddress | 614  | name              | encrypted          |
+//! | EncryptedMailAddress | 615  | address           | encrypted          |
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crypto_primitives::key::GenericAesKey;
@@ -24,7 +39,7 @@ pub fn decrypt_mail_details(raw: &Value, key: &GenericAesKey) -> Result<MailDeta
     let details =
         nested(blob, "1305").ok_or_else(|| Error::Message("mail details parse failed".into()))?;
 
-    let sent_at = decrypt_number(details.get("1284"), key).unwrap_or(0);
+    let sent_at = plain_number(details.get("1284")).unwrap_or(0);
     let body = nested(details, "1288")
         .map(|body| parse_body(body, key))
         .unwrap_or(Body {
@@ -95,7 +110,7 @@ fn parse_address_list(value: Option<&Value>, key: &GenericAesKey) -> Vec<MailAdd
         .iter()
         .filter_map(|address| {
             let name = decrypt_string(address.get("94"), key).unwrap_or_default();
-            let address = decrypt_string(address.get("95"), key)?;
+            let address = plain_string(address.get("95"))?;
             Some(MailAddress {
                 _id: None,
                 name,
@@ -160,8 +175,19 @@ fn decrypt_compressed(value: Option<&Value>, key: &GenericAesKey) -> Option<Stri
     String::from_utf8(decompressed).ok()
 }
 
-fn decrypt_number(value: Option<&Value>, key: &GenericAesKey) -> Option<i64> {
-    decrypt_string(value, key)?.parse().ok()
+/// Read an unencrypted string value.
+fn plain_string(value: Option<&Value>) -> Option<String> {
+    value?.as_str().map(str::to_string)
+}
+
+/// Read an unencrypted number or date value. Tuta JSON encodes both as
+/// decimal strings; a bare JSON number is accepted as well.
+fn plain_number(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::String(text) => text.parse().ok(),
+        Value::Number(number) => number.as_i64(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -199,15 +225,15 @@ mod tests {
     fn decrypts_body_headers_recipients_and_threading() {
         let raw = serde_json::json!({
             "1305": [{
-                "1284": encrypt_string("1700000000000"),
+                "1284": "1700000000000",
                 "1288": [{
                     "1275": encrypt_string("plain body"),
                     "1276": encrypt_compressed("<p>html body</p>")
                 }],
                 "1286": [{
-                    "1279": [{"94": encrypt_string("Ann"), "95": encrypt_string("ann@example.com")}],
-                    "1280": [],
-                    "1281": []
+                    "1279": [{"93": "aaaa", "94": encrypt_string("Ann"), "95": "ann@example.com", "96": []}],
+                    "1280": [{"93": "bbbb", "94": "", "95": "cc@example.com", "96": []}],
+                    "1281": [{"93": "cccc", "94": encrypt_string("Dan"), "95": "bcc@example.com", "96": []}]
                 }],
                 "1285": [{"614": encrypt_string("Bob"), "615": encrypt_string("bob@example.com")}],
                 "1287": [{"1271": encrypt_string("Message-ID: <x@y>\r\n")}]
@@ -225,6 +251,13 @@ mod tests {
             details.recipients.toRecipients[0].address,
             "ann@example.com"
         );
+        assert_eq!(details.recipients.toRecipients[0].name, "Ann");
+        assert_eq!(details.recipients.ccRecipients[0].address, "cc@example.com");
+        assert_eq!(details.recipients.ccRecipients[0].name, "");
+        assert_eq!(
+            details.recipients.bccRecipients[0].address,
+            "bcc@example.com"
+        );
         assert_eq!(details.replyTos[0].address, "bob@example.com");
         assert_eq!(
             details.headers.unwrap().headers.as_deref(),
@@ -235,7 +268,7 @@ mod tests {
     #[test]
     fn decrypts_encrypted_body_without_text() {
         let raw = serde_json::json!({
-            "1305": [{"1284": encrypt_string("1"), "1288": [{"1276": encrypt_compressed("<div>x</div>")}]}]
+            "1305": [{"1284": "1", "1288": [{"1276": encrypt_compressed("<div>x</div>")}]}]
         });
         let details = decrypt_mail_details(&raw, &key()).unwrap();
         assert_eq!(details.body.compressedText.as_deref(), Some("<div>x</div>"));
