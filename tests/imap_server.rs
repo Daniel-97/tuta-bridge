@@ -533,6 +533,90 @@ async fn fetch_streams_bodies_and_skips_expunged_uids() {
     session.await.unwrap().unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_chunked_download_loads_its_message_once() {
+    let body: Vec<u8> = (0..1000u32)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    let fetched = |body: &[u8]| FakeFetched {
+        body: body.to_vec(),
+        ..bare_fetch()
+    };
+    let scripted = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_fetch(1, fetched(&body))
+            .with_fetch(3, fetched(b"other message")),
+    );
+    let loads = || {
+        scripted
+            .body_fetches
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let (mut wire, session, _) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // Three chunks of one message: one load, every chunk exact, and
+    // the metadata items still answered each time.
+    for (tag, offset) in [("a4", 0usize), ("a5", 400), ("a6", 800)] {
+        wire.send(&format!(
+            "{tag} UID FETCH 1 (UID BODY.PEEK[]<{offset}.400>)"
+        ))
+        .await;
+        let bytes = wire
+            .literal(&format!("* 1 FETCH (UID 1 BODY[]<{offset}> "))
+            .await;
+        assert_eq!(bytes, body[offset..(offset + 400).min(body.len())]);
+        wire.expect(")").await;
+        wire.expect(&format!("{tag} OK UID FETCH completed")).await;
+    }
+    assert_eq!(loads(), 1);
+
+    // Another message replaces the kept one; a whole-body fetch never
+    // uses it.
+    wire.send("a7 UID FETCH 3 (BODY.PEEK[]<0.5>)").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[]<0> ").await, b"other");
+    wire.expect(" UID 3)").await;
+    wire.expect("a7 OK UID FETCH completed").await;
+    assert_eq!(loads(), 2);
+    wire.send("a8 UID FETCH 3 (BODY.PEEK[])").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[] ").await, b"other message");
+    wire.expect(" UID 3)").await;
+    wire.expect("a8 OK UID FETCH completed").await;
+    assert_eq!(loads(), 3);
+
+    // The kept bytes age out …
+    wire.send("a9 UID FETCH 3 (BODY.PEEK[]<5.3>)").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[]<5> ").await, b" me");
+    wire.expect(" UID 3)").await;
+    wire.expect("a9 OK UID FETCH completed").await;
+    assert_eq!(loads(), 3);
+    tokio::time::sleep(Duration::from_secs(6 * 60)).await;
+    wire.send("b1 UID FETCH 3 (BODY.PEEK[]<5.3>)").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[]<5> ").await, b" me");
+    wire.expect(" UID 3)").await;
+    wire.expect("b1 OK UID FETCH completed").await;
+    assert_eq!(loads(), 4);
+
+    // … and go when another mailbox view is selected.
+    wire.send("b2 SELECT Inbox").await;
+    expect_select_block(&mut wire, "b2", 2, Some(1), 7, 4, false).await;
+    wire.send("b3 UID FETCH 3 (BODY.PEEK[]<5.3>)").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[]<5> ").await, b" me");
+    wire.expect(" UID 3)").await;
+    wire.expect("b3 OK UID FETCH completed").await;
+    assert_eq!(loads(), 5);
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn fetch_skips_poisoned_uids_and_refuses_part_sections() {
     // uid 1 fails on every fetch, uid 3 answers: one poisoned row

@@ -1375,6 +1375,8 @@ pub struct FakeImapBackend {
     pub search_uids: Mutex<Vec<u32>>,
     /// While set, reading a mailbox by id fails like a store error.
     pub store_failing: Mutex<bool>,
+    /// How many FETCH calls asked for at least one body.
+    pub body_fetches: AtomicUsize,
 }
 
 impl FakeImapBackend {
@@ -1389,6 +1391,7 @@ impl FakeImapBackend {
             search_scripts: Mutex::new(Vec::new()),
             search_uids: Mutex::new(Vec::new()),
             store_failing: Mutex::new(false),
+            body_fetches: AtomicUsize::new(0),
         }
     }
 
@@ -1589,6 +1592,9 @@ impl ImapBackend for FakeImapBackend {
         let Some(fetched) = fetches.get(&uid) else {
             return Ok(None);
         };
+        if items.iter().any(|item| item.is_body()) {
+            self.body_fetches.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Some(FetchResponse {
             uid,
             flags: fetched.flags.clone(),

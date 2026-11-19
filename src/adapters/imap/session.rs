@@ -220,6 +220,30 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for StallGuard<W> {
     }
 }
 
+/// The most rendered bytes a session keeps between the chunks of a
+/// partial fetch — the same figure that bounds a client literal.
+const MAX_PARTIAL_CACHE_BYTES: usize = MAX_LITERAL_BYTES;
+
+/// How long those bytes are kept after they were rendered.
+const PARTIAL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The sections of the one message a session is being asked for in
+/// pieces.
+///
+/// A client that downloads a large message with `BODY[]<offset.count>`
+/// sends one FETCH per chunk, and every one of them would download,
+/// decrypt, and render the whole message again. The session therefore
+/// keeps the sections of the last message fetched that way — in memory
+/// only, one message at most, bounded in size and age, and gone with
+/// the session or its selected mailbox. Whole-body fetches never read
+/// or fill it, and nothing is ever written to disk.
+struct PartialCache {
+    mailbox: MailboxId,
+    uid: u32,
+    rendered_at: Instant,
+    sections: Vec<(BodySection, Vec<u8>)>,
+}
+
 /// The untagged BYE a session that hit an internal error ends with.
 const INTERNAL_BYE: &str = "* BYE internal error; reconnect";
 
@@ -274,6 +298,7 @@ struct Session {
     limits: SessionLimits,
     /// Failed LOGINs on this connection so far.
     failed_logins: u32,
+    partial_cache: Option<PartialCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +327,7 @@ where
         watch,
         limits,
         failed_logins: 0,
+        partial_cache: None,
     };
 
     write_line(&mut writer, &greeting()).await?;
@@ -917,6 +943,7 @@ impl Session {
             "CLOSE" => {
                 if self.state.selected() {
                     self.state = State::Authenticated;
+                    self.partial_cache = None;
                     write_line(writer, &format!("{tag} OK CLOSE completed")).await?;
                 } else {
                     write_line(
@@ -1043,8 +1070,9 @@ impl Session {
 
         tracing::debug!(exists, unseen, read_only = examine, "mailbox selected");
         // Notifications queued before this view was taken are already
-        // part of it.
+        // part of it, and bytes kept for the previous mailbox go.
         self.drain_notifications();
+        self.partial_cache = None;
         self.state = State::Selected {
             mailbox: selected.view.id,
             read_only: examine,
@@ -1240,7 +1268,7 @@ impl Session {
             // on the next sync or event. An Unsupported refusal is a
             // verdict about the request itself, not about one row: it
             // fails every uid identically and stays fatal.
-            let mut response = match self.backend.fetch(mailbox, *uid, &items).await {
+            let mut response = match self.fetch_one(mailbox, *uid, &items).await {
                 Ok(Some(response)) => response,
                 Ok(None) => continue,
                 Err(error @ Error::Unsupported(_)) => return Err(error),
@@ -1262,6 +1290,100 @@ impl Session {
         let verb = if uid_command { "UID FETCH" } else { "FETCH" };
         write_line(writer, &format!("{tag} OK {verb} completed")).await?;
         Ok(())
+    }
+
+    /// Fetch one message with its bodies cut to what was asked for.
+    ///
+    /// A request made only of partial body items is a chunked
+    /// download: its sections are kept in the session's
+    /// [`PartialCache`], and the following chunks of the same message
+    /// are cut from there, asking the backend for the metadata items
+    /// only. Everything else goes to the backend whole.
+    async fn fetch_one(
+        &mut self,
+        mailbox: MailboxId,
+        uid: u32,
+        items: &[FetchItem],
+    ) -> Result<Option<FetchResponse>> {
+        // The (section, partial) of every body item when all of them
+        // are partial; `None` for any other request.
+        let chunks: Option<Vec<(&BodySection, (u32, u32))>> = items
+            .iter()
+            .filter(|item| item.is_body())
+            .map(|item| match item {
+                FetchItem::Body {
+                    section,
+                    partial: Some(partial),
+                    ..
+                } => Some((section, *partial)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .filter(|chunks| !chunks.is_empty());
+
+        if self
+            .partial_cache
+            .as_ref()
+            .is_some_and(|cache| cache.rendered_at.elapsed() > PARTIAL_CACHE_TTL)
+        {
+            self.partial_cache = None;
+        }
+
+        // A later chunk of the message already rendered.
+        if let (Some(chunks), Some(cache)) = (&chunks, &self.partial_cache) {
+            let cut: Option<Vec<Vec<u8>>> = (cache.mailbox == mailbox && cache.uid == uid)
+                .then(|| {
+                    chunks
+                        .iter()
+                        .map(|(section, partial)| {
+                            cache
+                                .sections
+                                .iter()
+                                .find(|(cached, _)| cached == *section)
+                                .map(|(_, bytes)| {
+                                    bytes[partial_range(bytes.len(), Some(*partial))].to_vec()
+                                })
+                        })
+                        .collect()
+                })
+                .flatten();
+            if let Some(bodies) = cut {
+                let metadata: Vec<FetchItem> = items
+                    .iter()
+                    .filter(|item| !item.is_body())
+                    .cloned()
+                    .collect();
+                let Some(mut response) = self.backend.fetch(mailbox, uid, &metadata).await? else {
+                    self.partial_cache = None;
+                    return Ok(None);
+                };
+                response.bodies = bodies;
+                return Ok(Some(response));
+            }
+        }
+
+        let Some(mut response) = self.backend.fetch(mailbox, uid, items).await? else {
+            return Ok(None);
+        };
+        if let Some(chunks) = &chunks {
+            // The first chunk: keep the sections for the next ones,
+            // unless they are more than the session may hold.
+            let total: usize = response.bodies.iter().map(Vec::len).sum();
+            self.partial_cache = (total <= MAX_PARTIAL_CACHE_BYTES
+                && response.bodies.len() == chunks.len())
+            .then(|| PartialCache {
+                mailbox,
+                uid,
+                rendered_at: Instant::now(),
+                sections: chunks
+                    .iter()
+                    .zip(&response.bodies)
+                    .map(|((section, _), bytes)| ((*section).clone(), bytes.clone()))
+                    .collect(),
+            });
+        }
+        response.bodies = cut_partials(items, std::mem::take(&mut response.bodies));
+        Ok(Some(response))
     }
 
     // -- SEARCH ----------------------------------------------------------
@@ -1671,20 +1793,34 @@ fn reconcile(view: &mut Vec<(u32, bool)>, current: &[(u32, bool)]) -> Vec<String
     announcements
 }
 
-/// The octets a partial fetch `<offset.count>` selects from a section.
-/// An offset at or beyond the end selects nothing, and a count that
-/// runs past the end is cut there (RFC 3501 §6.4.5).
-fn partial_octets(mut body: Vec<u8>, partial: Option<(u32, u32)>) -> Vec<u8> {
+/// The octets a partial fetch `<offset.count>` selects from a section
+/// of `len` octets. An offset at or beyond the end selects nothing,
+/// and a count that runs past the end is cut there (RFC 3501 §6.4.5).
+fn partial_range(len: usize, partial: Option<(u32, u32)>) -> std::ops::Range<usize> {
     let Some((offset, count)) = partial else {
-        return body;
+        return 0..len;
     };
-    let start = usize::try_from(offset).map_or(body.len(), |offset| offset.min(body.len()));
-    let end = usize::try_from(count).map_or(body.len(), |count| {
-        start.saturating_add(count).min(body.len())
-    });
-    body.truncate(end);
-    body.drain(..start);
-    body
+    let start = usize::try_from(offset).map_or(len, |offset| offset.min(len));
+    let end = usize::try_from(count).map_or(len, |count| start.saturating_add(count).min(len));
+    start..end
+}
+
+/// Cut every body to the partial range its item asks for. `bodies`
+/// holds one whole section per body item of `items`, in order.
+fn cut_partials(items: &[FetchItem], bodies: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    items
+        .iter()
+        .filter(|item| item.is_body())
+        .zip(bodies)
+        .map(|(item, mut body)| {
+            if let FetchItem::Body { partial, .. } = item {
+                let range = partial_range(body.len(), *partial);
+                body.truncate(range.end);
+                body.drain(..range.start);
+            }
+            body
+        })
+        .collect()
 }
 
 /// One rendered fragment of a FETCH response: wire text, or body bytes
@@ -1700,8 +1836,9 @@ enum Piece {
 /// `FetchItem::Uid` for a UID command when the client did not list it.
 /// ENVELOPE and BODYSTRUCTURE use the backend's strings verbatim (they
 /// already carry their own literal framing). Every body item takes the
-/// next of the response's bodies and renders it as `{n}\r\n` framing
-/// followed by the raw bytes: the client never round-trips a
+/// next of the response's bodies — already cut to the item's partial
+/// range — and renders it as `{n}\r\n` framing followed by the raw
+/// bytes: the client never round-trips a
 /// continuation, and the bytes move out of the response instead of
 /// being copied. Items the backend left unfilled are skipped, which the
 /// real backend never produces.
@@ -1711,21 +1848,18 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
     let mut bodies = std::mem::take(&mut response.bodies).into_iter();
 
     for item in items {
-        let (name, partial) = match item {
+        let name = match item {
             FetchItem::Body {
                 section, partial, ..
             } => {
                 // RFC 3501 §7.4.2: a partial answer names its origin
                 // octet, `BODY[]<0>`, and never the requested count.
                 let origin = partial.map_or_else(String::new, |(offset, _)| format!("<{offset}>"));
-                (
-                    format!("BODY[{}]{origin}", body_section_name(section)),
-                    *partial,
-                )
+                format!("BODY[{}]{origin}", body_section_name(section))
             }
-            FetchItem::Rfc822 => ("RFC822".to_string(), None),
-            FetchItem::Rfc822Header => ("RFC822.HEADER".to_string(), None),
-            FetchItem::Rfc822Text => ("RFC822.TEXT".to_string(), None),
+            FetchItem::Rfc822 => "RFC822".to_string(),
+            FetchItem::Rfc822Header => "RFC822.HEADER".to_string(),
+            FetchItem::Rfc822Text => "RFC822.TEXT".to_string(),
             FetchItem::Flags => {
                 text.push_str(&format!("FLAGS ({}) ", response.flags));
                 continue;
@@ -1774,7 +1908,6 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
         let Some(body) = bodies.next() else {
             continue;
         };
-        let body = partial_octets(body, partial);
         pieces.push(Piece::Text(std::mem::take(&mut text)));
         pieces.push(Piece::Text(format!("{name} {{{}}}\r\n", body.len())));
         pieces.push(Piece::Body(body));
@@ -1902,6 +2035,7 @@ mod tests {
         let mut response = sample_response();
         response.bodies = vec![b"H: 1\r\n\r\n".to_vec(), b"text".to_vec()];
         let items = parse_fetch_items("(BODY.PEEK[HEADER] FLAGS BODY.PEEK[TEXT]<0.2>)").unwrap();
+        response.bodies = cut_partials(&items, std::mem::take(&mut response.bodies));
         let wire = wire_of(render_fetch(3, &mut response, &items));
         assert_eq!(
             wire,
@@ -1917,6 +2051,7 @@ mod tests {
         let render = |raw: &str| {
             let mut response = sample_response();
             let items = parse_fetch_items(raw).unwrap();
+            response.bodies = cut_partials(&items, std::mem::take(&mut response.bodies));
             wire_of(render_fetch(3, &mut response, &items))
         };
         assert_eq!(

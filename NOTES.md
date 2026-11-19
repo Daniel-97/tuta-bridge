@@ -246,7 +246,12 @@
   - `mime_structure` (the precomputed BODYSTRUCTURE string) and
     `rfc822_size` are persisted at first enrichment, so structure and
     size requests never re-download content; `BODY[]` always re-renders
-    — there is no body cache by design.
+    — no body is ever stored. The one exception lives in memory: a
+    session downloading a message in `BODY[]<offset.count>` chunks
+    keeps that message's rendered sections between chunks (one message,
+    at most 16 MiB, at most 5 minutes, dropped on `SELECT`/`CLOSE` and
+    with the session), because each chunk would otherwise download and
+    render the whole mail again. Whole-body fetches never use it.
   - `ENVELOPE` is served index-only, from the stored header; it never
     triggers a network load. cc/bcc/message-id stay blank in a
     listing until the first body open enriches the row.

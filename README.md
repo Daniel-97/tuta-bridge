@@ -209,6 +209,10 @@ would only produce errors. The `Far`/`Near` names require mbsync ≥ 1.3
   bridge stores none of those flags, so their `UN…` forms match every
   mail. Unsupported keys answer `NO`. `SEARCH CHARSET` accepts `UTF-8`
   and `US-ASCII` only.
+- Mail bodies are never written to disk. While a client downloads one
+  mail in chunks (`BODY[]<offset.count>`), its session keeps that
+  mail's bytes in memory — one mail, 16 MiB at most, for five minutes
+  at most — so each chunk does not download the whole mail again.
 - Numeric `BODY[n]` part sections are unsupported; only whole-message
   `BODY[]`, `HEADER`, `TEXT`, and `HEADER.FIELDS` sections are served.
 - Mailbox changes are announced at `NOOP`, `CHECK`, and during `IDLE`
