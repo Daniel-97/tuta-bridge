@@ -9,6 +9,7 @@
 //! metadata-only, and the report carries counters and local mailbox ids:
 //! subjects, addresses, and entity ids never appear in it.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -83,19 +84,20 @@ impl EventProcessor {
     /// Apply one event batch and persist it atomically.
     ///
     /// Mail sets are upserted as folders as soon as their event is seen,
-    /// so one batch can create a folder and file mail into it. Mail events
-    /// are coalesced per element id — a `Mail` create/update replaces the
-    /// element's action with the lookup's authoritative placements, a
-    /// `Mail` delete sets `Delete`, and a `MailSetEntry` create/update adds
-    /// a single placement. A batch can therefore still emit both a removal
-    /// and an upsert for one mail — a `Mail` delete followed by a late
-    /// entry create — and the delete wins because `apply_batch` applies
-    /// removals after upserts and entry ids never collide with mail ids,
-    /// so the two actions never overwrite each other. Unreadable or
-    /// failed lookups are skipped and keep the stored rows; failed ones
-    /// are counted in [`EventReport::lookup_failures`]. Afterwards
-    /// every action becomes state changes and `apply_batch` runs exactly
-    /// once, even when nothing changed, so the batch id always advances.
+    /// so one batch can create a folder and file mail into it. `Mail`
+    /// events are coalesced per mail — a create/update replaces the
+    /// mail's action with the lookup's authoritative placements, a
+    /// delete sets `Delete`. `MailSetEntry` creates/updates are kept per
+    /// entry and each adds one placement; they never join a mail's
+    /// action, because an entry event carries the entry's id, not the
+    /// mail's. A batch can therefore emit both a removal and an upsert
+    /// for one mail — a `Mail` delete next to an entry create — and the
+    /// delete wins because `apply_batch` applies removals after upserts.
+    /// Unreadable or failed lookups are skipped and keep the stored
+    /// rows; failed ones are counted in
+    /// [`EventReport::lookup_failures`]. Afterwards every action becomes
+    /// state changes and `apply_batch` runs exactly once, even when
+    /// nothing changed, so the batch id always advances.
     pub async fn apply(
         &self,
         account_id: i64,
@@ -104,7 +106,10 @@ impl EventProcessor {
         batch: &EventBatch,
     ) -> Result<EventReport> {
         let mut changes: Vec<StateChange> = Vec::new();
+        // Mail actions keyed by the mail's element id.
         let mut actions: HashMap<String, MailAction> = HashMap::new();
+        // Entry placements keyed by the entry's own `(list, element)` id.
+        let mut entries: HashMap<(&str, &str), MailPlacement> = HashMap::new();
         let mut applied = 0;
         let mut skipped = 0;
         let mut lookup_failures = 0;
@@ -138,11 +143,12 @@ impl EventProcessor {
                     }
                 },
                 MAIL_SET_ENTRY_TYPE_ID => match entry_placement(lookup, event).await {
-                    // An entry event adds one placement; a mail deleted
-                    // in the same batch stays deleted, and a placement
-                    // the element already has changes nothing.
+                    // One placement per entry: a create followed by
+                    // an update of the same entry adds nothing new.
                     LookupOutcome::Found(placement) => {
-                        if add_placement(&mut actions, &event.element_id, placement) {
+                        let key = (event.list_id.as_str(), event.element_id.as_str());
+                        if let Entry::Vacant(slot) = entries.entry(key) {
+                            slot.insert(placement);
                             applied += 1;
                         } else {
                             skipped += 1;
@@ -162,6 +168,14 @@ impl EventProcessor {
             actions
                 .into_iter()
                 .flat_map(|(element_id, action)| action_changes(element_id, action)),
+        );
+        changes.extend(
+            entries
+                .into_values()
+                .map(|placement| StateChange::UpsertHeader {
+                    mailbox_list_id: placement.mailbox_list_id,
+                    header: placement.header,
+                }),
         );
 
         let outcome = self
@@ -248,50 +262,14 @@ async fn entry_placement(
     }
 }
 
-/// Record one entry placement for `element_id`.
-///
-/// The placement joins the element's existing placements, deduplicated by
-/// `mailbox_list_id`; a missing entry starts one. Returns `false` when no
-/// placement was added — the element's mail was deleted in the same batch
-/// or the mailbox already has a placement — in which case the event
-/// counts as skipped.
-fn add_placement(
-    actions: &mut HashMap<String, MailAction>,
-    element_id: &str,
-    placement: MailPlacement,
-) -> bool {
-    if let Some(MailAction::Delete) = actions.get(element_id) {
-        // A mail deleted in the same batch stays deleted.
-        return false;
-    }
-    if let Some(MailAction::Placements(placements)) = actions.get_mut(element_id) {
-        // The first placement per mailbox wins, like the lookup's own
-        // dedupe; a repeat adds nothing and counts as skipped.
-        if placements
-            .iter()
-            .any(|stored| stored.mailbox_list_id == placement.mailbox_list_id)
-        {
-            return false;
-        }
-        placements.push(placement);
-        return true;
-    }
-    // No action yet: this entry starts one.
-    actions.insert(
-        element_id.to_string(),
-        MailAction::Placements(vec![placement]),
-    );
-    true
-}
-
 /// Turn one coalesced action into its state changes.
 ///
 /// A deleted mail, or one the lookup reports without any placement, loses
 /// every stored row. A placed mail is upserted once per placement and
 /// every placement outside the reported mailboxes is removed. One action
-/// never mixes the two outcomes; a removal and an upsert for the same
-/// mail from different actions (a delete plus a late entry create) is
-/// settled by `apply_batch`, which runs removals after upserts.
+/// never mixes the two outcomes; a removal here and an entry's upsert of
+/// the same mail (a delete next to an entry create) are settled by
+/// `apply_batch`, which runs removals after upserts.
 fn action_changes(element_id: String, action: MailAction) -> Vec<StateChange> {
     match action {
         MailAction::Delete => vec![StateChange::RemoveHeaderEverywhere { element_id }],
