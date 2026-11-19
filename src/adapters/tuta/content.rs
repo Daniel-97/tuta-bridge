@@ -241,7 +241,7 @@ pub fn mail_is_intact(mail: &Mail) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tutasdk::entities::generated::sys::Blob;
     use tutasdk::entities::generated::tutanota::{Header, Recipients};
@@ -339,7 +339,7 @@ mod tests {
         }
     }
 
-    fn intact_mail() -> Mail {
+    pub(crate) fn intact_mail() -> Mail {
         Mail {
             _id: Some(IdTupleGenerated::new(
                 GeneratedId("list".into()),

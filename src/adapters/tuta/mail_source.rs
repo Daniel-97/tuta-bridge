@@ -114,6 +114,28 @@ pub fn header_from_parts(
     })
 }
 
+/// Build the list-level [`MessageHeader`] of a loaded [`Mail`].
+///
+/// Returns `None` for a mail that must not be indexed: one whose intactness
+/// check fails (a subject or sender that did not decrypt comes back as an
+/// empty default, not as an error), or one without an id. Callers count
+/// every `None` as a skipped mail so the page is treated as incomplete.
+pub fn header_from_mail(mail: &Mail) -> Option<MessageHeader> {
+    if !mail_is_intact(mail) {
+        return None;
+    }
+    let id = mail._id.as_ref()?;
+    header_from_parts(
+        id.list_id.as_str(),
+        id.element_id.as_str(),
+        mail.receivedDate.as_millis() as i64,
+        &mail.subject,
+        &mail.sender,
+        mail.firstRecipient.as_ref(),
+        mail.unread,
+    )
+}
+
 /// Resolve a requested folder name (alias or custom name) case-insensitively.
 pub fn resolve_folder<'a>(folders: &'a [Folder], requested: &str) -> Result<&'a Folder> {
     let requested = requested.trim();
@@ -329,19 +351,12 @@ impl MailSource for TutaMailSource {
                     continue;
                 }
             };
-            let Some(id) = mail._id.as_ref() else {
-                continue;
-            };
-            if let Some(header) = header_from_parts(
-                id.list_id.as_str(),
-                id.element_id.as_str(),
-                mail.receivedDate.as_millis() as i64,
-                &mail.subject,
-                &mail.sender,
-                mail.firstRecipient.as_ref(),
-                mail.unread,
-            ) {
-                headers.push(header);
+            // A mail that loaded but is not intact (or cannot be
+            // referenced) is dropped like an unreadable one, and counted,
+            // so the caller never reconciles against a partial page.
+            match header_from_mail(&mail) {
+                Some(header) => headers.push(header),
+                None => skipped += 1,
             }
         }
 
@@ -442,5 +457,41 @@ impl MailSource for TutaMailSource {
             body_text,
             attachments,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::tuta::content::tests::intact_mail;
+
+    #[test]
+    fn intact_mail_maps_to_a_header_with_its_own_ids() {
+        let mut mail = intact_mail();
+        mail.subject = "hello".into();
+        let header = header_from_mail(&mail).expect("an intact mail maps");
+        assert_eq!(header.list_id, "list");
+        assert_eq!(header.element_id, "element");
+        assert_eq!(header.subject, "hello");
+    }
+
+    #[test]
+    fn mail_with_decryption_errors_is_not_indexed() {
+        let mut mail = intact_mail();
+        mail._errors =
+            serde_json::from_str(r#"{"subject":{"String":"decryption failed"}}"#).unwrap();
+        assert!(header_from_mail(&mail).is_none());
+
+        let mut mail = intact_mail();
+        mail.sender._errors =
+            serde_json::from_str(r#"{"name":{"String":"decryption failed"}}"#).unwrap();
+        assert!(header_from_mail(&mail).is_none());
+    }
+
+    #[test]
+    fn mail_without_an_id_is_not_indexed() {
+        let mut mail = intact_mail();
+        mail._id = None;
+        assert!(header_from_mail(&mail).is_none());
     }
 }
