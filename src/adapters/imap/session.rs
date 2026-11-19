@@ -1482,6 +1482,16 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
                 }
                 continue;
             }
+            // A bare BODY is answered as BODY, without the extension
+            // data BODYSTRUCTURE carries (RFC 3501 §7.4.2).
+            FetchItem::BodyBasic => {
+                if let Some(bodystructure) = response.bodystructure.as_ref() {
+                    text.push_str("BODY ");
+                    text.push_str(&render::body_basic(bodystructure));
+                    text.push(' ');
+                }
+                continue;
+            }
             FetchItem::Rfc822Size => {
                 if let Some(size) = response.rfc822_size {
                     text.push_str(&format!("RFC822.SIZE {size} "));
@@ -1592,6 +1602,24 @@ mod tests {
               BODYSTRUCTURE (\"STRUCTURE\") \
               RFC822.SIZE 1234 \
               INTERNALDATE \"14-Nov-2023 22:13:20 +0000\")\r\n"
+        );
+    }
+
+    #[test]
+    fn bare_body_is_named_body_and_drops_extension_data() {
+        let mut response = sample_response();
+        response.bodystructure = Some(
+            "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 5 1) \
+              \"MIXED\" (\"BOUNDARY\" \"b\"))"
+                .into(),
+        );
+        let items = parse_fetch_items("(BODY BODYSTRUCTURE)").unwrap();
+        let wire = wire_of(render_fetch(1, &mut response, &items));
+        assert_eq!(
+            wire,
+            "* 1 FETCH (BODY ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 5 1) \"MIXED\") \
+              BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 5 1) \
+              \"MIXED\" (\"BOUNDARY\" \"b\")))\r\n"
         );
     }
 

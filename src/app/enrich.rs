@@ -76,11 +76,14 @@ impl EnvelopeEnricher {
         };
         let content = source.content(&summary).await?;
 
-        // Exactly one render, for the byte length only. The bytes are
-        // dropped on the next line; nothing but the length is persisted.
+        // Exactly one render, for the byte length and the structure,
+        // whose part sizes and encodings are measured from the bytes.
+        // The bytes are dropped right after; nothing but the length and
+        // the structure string is persisted.
         let rendered = self.renderer.render(&content)?;
         let size = u64::try_from(rendered.len())
             .map_err(|_| Error::Storage("message size out of range".into()))?;
+        let structure = render::bodystructure(&content, &rendered);
         drop(rendered);
 
         let header = MessageHeader {
@@ -106,7 +109,6 @@ impl EnvelopeEnricher {
         self.store
             .update_metadata(mailbox, stored.uid, &header, Some(size))
             .await?;
-        let structure = render::bodystructure(&content);
         self.store
             .set_mime_structure(mailbox, stored.uid, &structure)
             .await?;

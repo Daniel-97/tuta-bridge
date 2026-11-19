@@ -160,7 +160,7 @@ async fn enriches_partial_envelopes_once_persisting_only_metadata() {
     // The size is the rendered byte length.
     assert_eq!(enriched.rfc822_size, Some(10));
     // The structure mirrors the pure renderer for the same content.
-    let expected_structure = bodystructure(source.content.as_ref().unwrap());
+    let expected_structure = bodystructure(source.content.as_ref().unwrap(), b"0123456789");
     assert!(
         enriched
             .mime_structure

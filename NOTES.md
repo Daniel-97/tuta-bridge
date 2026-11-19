@@ -191,6 +191,17 @@
   next takes over the plain name. Only the Inbox-kind folder answers
   to `INBOX` (any casing); a custom folder called `inbox` is a
   namesake and gets a suffix.
+- BODYSTRUCTURE: the tree mirrors `build_message`, but each leaf's
+  transfer encoding, octet count, and line count are measured from the
+  rendered bytes (parsed back with `mail-parser`), because the renderer
+  picks 7bit, quoted-printable, or base64 per part from its content.
+  `text/*` attachments carry the line count a `body-type-text` needs.
+  `message/rfc822` and `multipart/*` attachments are reported as
+  `APPLICATION/OCTET-STREAM`: the real forms would need the attached
+  message's own envelope and structure, and the bridge treats
+  attachments as opaque bytes (the part header in the rendered message
+  keeps the original type). A bare `BODY` item is answered as `BODY`
+  with the extension data stripped from the stored string.
 - IDLE literal edge: a tagged BAD during IDLE never answers a literal
   continuation, and RFC 3501 obliges the client not to send the octets
   its `{n}` token announced — the session reads none of them, and

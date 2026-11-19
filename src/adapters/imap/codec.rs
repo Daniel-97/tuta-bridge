@@ -478,7 +478,10 @@ pub enum FetchItem {
         section: BodySection,
         partial: Option<(u32, u32)>,
     },
+    /// `BODYSTRUCTURE`: the MIME structure with extension data.
     BodyStructure,
+    /// A bare `BODY`: the same structure without extension data.
+    BodyBasic,
     Envelope,
     Flags,
     InternalDate,
@@ -514,7 +517,7 @@ fn invalid_fetch_items() -> Error {
 /// Macros expand per RFC 3501 — `FAST` → FLAGS INTERNALDATE RFC822.SIZE,
 /// `ALL` → plus ENVELOPE, `FULL` → plus BODY, where a bare `BODY` requests
 /// the non-extensible structure (RFC 3501 §6.4.5) and maps to
-/// [`FetchItem::BodyStructure`]. Item names are case-insensitive.
+/// [`FetchItem::BodyBasic`]. Item names are case-insensitive.
 /// `HEADER.FIELDS.NOT` sections are a v1 limitation and are rejected with
 /// the fixed error `invalid fetch items`.
 pub fn parse_fetch_items(args: &[ImapArg]) -> Result<Vec<FetchItem>> {
@@ -585,7 +588,7 @@ fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
                     FetchItem::InternalDate,
                     FetchItem::Rfc822Size,
                     FetchItem::Envelope,
-                    FetchItem::BodyStructure,
+                    FetchItem::BodyBasic,
                 ]),
                 "FLAGS" => Ok(vec![FetchItem::Flags]),
                 "UID" => Ok(vec![FetchItem::Uid]),
@@ -596,8 +599,9 @@ fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
                 "RFC822.SIZE" => Ok(vec![FetchItem::Rfc822Size]),
                 "RFC822.TEXT" => Ok(vec![FetchItem::Rfc822Text]),
                 "BODYSTRUCTURE" => Ok(vec![FetchItem::BodyStructure]),
-                // A bare BODY requests the structure (RFC 3501 §6.4.5).
-                "BODY" => Ok(vec![FetchItem::BodyStructure]),
+                // A bare BODY requests the structure without its
+                // extension data (RFC 3501 §6.4.5).
+                "BODY" => Ok(vec![FetchItem::BodyBasic]),
                 _ => Err(invalid_fetch_items()),
             }
         }
@@ -964,7 +968,7 @@ mod tests {
                 FetchItem::InternalDate,
                 FetchItem::Rfc822Size,
                 FetchItem::Envelope,
-                FetchItem::BodyStructure,
+                FetchItem::BodyBasic,
             ]
         );
     }
@@ -1001,7 +1005,7 @@ mod tests {
                     section: BodySection::Part("1.2".into()),
                     partial: None,
                 },
-                FetchItem::BodyStructure,
+                FetchItem::BodyBasic,
             ]
         );
     }
@@ -1076,6 +1080,10 @@ mod tests {
         assert_eq!(
             fetch_items("(flags uid)").unwrap(),
             vec![FetchItem::Flags, FetchItem::Uid]
+        );
+        assert_eq!(
+            fetch_items("(bodystructure body)").unwrap(),
+            vec![FetchItem::BodyStructure, FetchItem::BodyBasic]
         );
     }
 

@@ -572,7 +572,9 @@ impl ImapBackend for TutaImapBackend {
         }
 
         let wants_body = items.iter().any(FetchItem::is_body);
-        let wants_structure = items.contains(&FetchItem::BodyStructure);
+        let wants_structure = items
+            .iter()
+            .any(|item| matches!(item, FetchItem::BodyStructure | FetchItem::BodyBasic));
         let wants_size = items.contains(&FetchItem::Rfc822Size);
 
         // One content load serves the whole request: the enricher and

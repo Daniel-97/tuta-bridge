@@ -409,7 +409,7 @@ async fn fetch_serves_envelopes_from_the_index_and_enriches_structure_once() {
 
     let content = world.source.content.clone().unwrap();
     let expected_bytes = MimeRenderer.render(&content).unwrap();
-    let expected_structure = bodystructure(&content);
+    let expected_structure = bodystructure(&content, &expected_bytes);
 
     // ENVELOPE serves from the stored (partial) header: no source call,
     // unknown fields stay NIL until enrichment.
@@ -1114,7 +1114,7 @@ async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
     let uid_body = seed_stale_row(&world.store, world.inbox, "e3").await;
     let content = world.source.content.clone().unwrap();
     let expected_bytes = MimeRenderer.render(&content).unwrap();
-    let expected_structure = bodystructure(&content);
+    let expected_structure = bodystructure(&content, &expected_bytes);
 
     // BODYSTRUCTURE heals through the enricher even though the
     // structure was stored: one content load, the sent date lands, and
