@@ -207,11 +207,11 @@ pub async fn request_archive_read_token(
         .await
         .map_err(|_| Error::Network("mail details token failed".into()))?;
     if response.status < 200 || response.status >= 300 {
-        let detail = String::from_utf8_lossy(response.body.as_deref().unwrap_or_default());
-        let detail: String = detail.chars().take(500).collect();
+        // Status only: the server's response body never enters an error
+        // string, which callers print and log.
         return Err(Error::Network(format!(
-            "mail details token failed: status {}; {}",
-            response.status, detail
+            "mail details token failed: status {}",
+            response.status
         )));
     }
     parse_archive_access(response.body.as_deref().unwrap_or_default())
@@ -256,11 +256,9 @@ pub async fn request_instance_read_token(
         .await
         .map_err(|_| Error::Message("attachment token request failed".into()))?;
     if response.status < 200 || response.status >= 300 {
-        let detail = String::from_utf8_lossy(response.body.as_deref().unwrap_or_default());
-        let detail: String = detail.chars().take(500).collect();
         return Err(Error::Message(format!(
-            "attachment token failed: status {}; {}",
-            response.status, detail
+            "attachment token failed: status {}",
+            response.status
         )));
     }
     parse_archive_access(response.body.as_deref().unwrap_or_default())

@@ -2,7 +2,8 @@ use base64::Engine as _;
 use crypto_primitives::aes::InitializationVector;
 use crypto_primitives::key::GenericAesKey;
 use tuta_bridge::adapters::tuta::blob::{
-    blob_get_body, blob_url, decrypt_chunks, fetch_blob, parse_multiple_blobs, validate_blob_server,
+    blob_get_body, blob_url, decrypt_chunks, fetch_blob, parse_multiple_blobs,
+    request_archive_read_token, request_instance_read_token, validate_blob_server,
 };
 use tutasdk::net::native_rest_client::NativeRestClient;
 use tutasdk::util::BASE64_EXT;
@@ -85,4 +86,36 @@ async fn fetches_binary_blob_with_access_token() {
     assert!(url.contains("accessToken=user-token"));
     let data = fetch_blob(&rest, &url, "user-token").await.unwrap();
     assert_eq!(data, b"cipher");
+}
+
+#[tokio::test]
+async fn token_errors_carry_the_status_but_never_the_response_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/storage/blobaccesstokenservice"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("SERVER-BODY a@b.c"))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let rest = NativeRestClient::try_new().unwrap();
+    let Err(archive) = request_archive_read_token(&rest, &server.uri(), "user-token", "arch").await
+    else {
+        panic!("expected an error")
+    };
+    assert_eq!(
+        archive.to_string(),
+        "network error: mail details token failed: status 400"
+    );
+
+    let Err(instance) =
+        request_instance_read_token(&rest, &server.uri(), "user-token", "arch", "list", "elem")
+            .await
+    else {
+        panic!("expected an error")
+    };
+    assert_eq!(
+        instance.to_string(),
+        "message error: attachment token failed: status 400"
+    );
 }
