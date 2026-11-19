@@ -11,8 +11,8 @@ use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, Logged
 
 use super::blob::{fetch_blob_element, load_attachment, request_archive_read_token};
 use super::content::{
-    address_from_encrypted, address_from_mail_address, draft_details_are_intact, mail_is_intact,
-    parse_headers, select_body, sent_at_from, threading_headers,
+    address_from_encrypted, address_from_mail_address, draft_details_are_intact, from_address,
+    mail_is_intact, parse_headers, select_body, sent_at_from, threading_headers,
 };
 use super::wire::decrypt_mail_details;
 use crate::domain::{
@@ -385,14 +385,7 @@ impl MailSource for TutaMailSource {
             .unwrap_or_default();
         let (message_id, in_reply_to, references) = threading_headers(&headers);
 
-        let mut from = address_from_mail_address(&mail.sender);
-        if let Some(envelope) = mail
-            .differentEnvelopeSender
-            .as_deref()
-            .filter(|a| !a.is_empty())
-        {
-            from.address = envelope.to_string();
-        }
+        let from = from_address(&mail);
 
         let mut attachments = Vec::new();
         for attachment_id in &mail.attachments {
