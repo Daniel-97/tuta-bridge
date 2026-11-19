@@ -199,8 +199,11 @@ would only produce errors. The `Far`/`Near` names require mbsync ≥ 1.3
   Unsupported keys answer `NO`.
 - Numeric `BODY[n]` part sections are unsupported; only whole-message
   `BODY[]`, `HEADER`, `TEXT`, and `HEADER.FIELDS` sections are served.
-- IDLE updates are `EXISTS`-only: counts change live, expunges are not
-  itemized, and clients re-fetch.
+- Mailbox changes are announced at `NOOP`, `CHECK`, and during `IDLE`
+  only: removed mails as `EXPUNGE`, new ones as `EXISTS`, read-state
+  changes as `FETCH (FLAGS ...)`. Between those points a session keeps
+  the message numbers it last announced, so a mail that arrived since
+  is not visible to `FETCH` or `SEARCH` until the next one.
 - One account at a time.
 
 ## Dump

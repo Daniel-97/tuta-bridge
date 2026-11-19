@@ -11,17 +11,27 @@
 //! Two disciplines shape the flow:
 //!
 //! * **Snapshot validity** (the Proton Bridge lesson): a `Selected`
-//!   session compares its UIDVALIDITY with the store's before every
-//!   command that could act on it and, on mismatch, sends one fixed
-//!   untagged BYE and closes — the client must reconnect. NOOP drains
-//!   the mailbox-change broadcast, so polling clients see `* <n>`
-//!   EXISTS updates without IDLE, and a lagged receiver treats
-//!   "everything may have changed" literally. IDLE (RFC 2177) pushes
-//!   the same drain live: it answers `+ idling`, flushes whatever
-//!   queued at the boundary so no update is lost, and waits on the
-//!   command reader and the watcher at once — `DONE` ends it with the
-//!   tagged OK, LOGOUT behaves as always, and any other command
-//!   answers BAD and returns to normal dispatch.
+//!   session holds its own view of the mailbox — the mailbox id, its
+//!   UIDVALIDITY, and the `(uid, unread)` list whose positions are the
+//!   message sequence numbers the client knows. Before every command
+//!   that could act on it the session compares the UIDVALIDITY with the
+//!   store's and, on a mismatch or a vanished mailbox, sends one fixed
+//!   untagged BYE and closes — the client must reconnect. FETCH and
+//!   SEARCH resolve numbers against the session's view, never the live
+//!   store, so a number always names the message the client means.
+//!
+//! * **Announced changes**: the view moves only where RFC 3501 lets a
+//!   server announce it — NOOP, CHECK, and IDLE, never during FETCH,
+//!   STORE, or SEARCH (§7.4.1). There the session compares its view
+//!   with the store and sends `* <n> EXPUNGE` for every message that
+//!   left (highest number first), `* <n> EXISTS` when any arrived, and
+//!   `* <n> FETCH (FLAGS (...))` for every read-state change. IDLE
+//!   (RFC 2177) pushes the same comparison live: it answers `+ idling`,
+//!   compares at once so nothing is lost at the boundary, and waits on
+//!   the command reader and the mailbox-change broadcast together —
+//!   `DONE` ends it with the tagged OK, LOGOUT behaves as always, and
+//!   any other command answers BAD and returns to normal dispatch. A
+//!   lagged receiver treats "everything may have changed" literally.
 //!
 //! * **Log hygiene**: the session logs with `tracing::debug!` only, with
 //!   tag, command, and count fields — the tag only after the same
@@ -40,8 +50,10 @@ use tokio::io::{
 use tokio::sync::broadcast;
 
 use super::codec::{self, BodySection, FetchItem, ImapArg, Request};
+use super::render;
+use crate::domain::MailboxId;
 use crate::domain::{Error, Result};
-use crate::ports::imap_backend::{FetchResponse, ImapBackend, MailboxView};
+use crate::ports::imap_backend::{FetchResponse, ImapBackend};
 use crate::ports::mailbox_events::MailboxChanged;
 
 /// The capability set the greeting, the CAPABILITY responses, and the
@@ -84,10 +96,19 @@ enum State {
     NotAuthenticated,
     Authenticated,
     Selected {
-        view: MailboxView,
-        exists: usize,
-        unseen: usize,
+        /// The mailbox, addressed by id from here on: its name is
+        /// never resolved again.
+        mailbox: MailboxId,
+        /// Opened with EXAMINE rather than SELECT. Every write is
+        /// refused today whichever it was; the flag is recorded so a
+        /// write-capable server can refuse them on an EXAMINEd mailbox.
+        #[allow(dead_code)]
+        read_only: bool,
         uidvalidity: u32,
+        /// The session's view: `(uid, unread)` in ascending UID order.
+        /// Position + 1 is the message sequence number the client
+        /// knows; it changes only at the announced sync points.
+        messages: Vec<(u32, bool)>,
     },
 }
 
@@ -531,11 +552,8 @@ impl Session {
                 write_line(writer, &format!("{tag} OK CAPABILITY completed")).await?;
             }
             "NOOP" => {
-                if self.state.selected() {
-                    let flow = self.flush_notifications(writer).await?;
-                    if matches!(flow, Flow::Close) {
-                        return Ok(flow);
-                    }
+                if matches!(self.announce_changes(writer).await?, Flow::Close) {
+                    return Ok(Flow::Close);
                 }
                 write_line(writer, &format!("{tag} OK NOOP completed")).await?;
             }
@@ -636,6 +654,9 @@ impl Session {
             }
             "CHECK" => {
                 if self.state.selected() {
+                    if matches!(self.announce_changes(writer).await?, Flow::Close) {
+                        return Ok(Flow::Close);
+                    }
                     write_line(writer, &format!("{tag} OK CHECK completed")).await?;
                 } else {
                     write_line(
@@ -743,10 +764,11 @@ impl Session {
         };
 
         write_line(writer, "* FLAGS (\\Seen)").await?;
-        write_line(writer, &format!("* {} EXISTS", selected.exists)).await?;
+        let (exists, unseen) = (selected.messages.len(), selected.unseen());
+        write_line(writer, &format!("* {exists} EXISTS")).await?;
         write_line(writer, "* 0 RECENT").await?;
-        if selected.unseen > 0 {
-            write_line(writer, &format!("* OK [UNSEEN {}]", selected.unseen)).await?;
+        if unseen > 0 {
+            write_line(writer, &format!("* OK [UNSEEN {unseen}]")).await?;
         }
         write_line(writer, "* OK [PERMANENTFLAGS ()] Read-only mailbox").await?;
         write_line(
@@ -756,16 +778,15 @@ impl Session {
         .await?;
         write_line(writer, &format!("* OK [UIDNEXT {}]", selected.uidnext)).await?;
 
-        tracing::debug!(
-            exists = selected.exists,
-            unseen = selected.unseen,
-            "mailbox selected"
-        );
+        tracing::debug!(exists, unseen, read_only = examine, "mailbox selected");
+        // Notifications queued before this view was taken are already
+        // part of it.
+        self.drain_notifications();
         self.state = State::Selected {
-            view: selected.view,
-            exists: selected.exists,
-            unseen: selected.unseen,
+            mailbox: selected.view.id,
+            read_only: examine,
             uidvalidity: selected.uidvalidity,
+            messages: selected.messages,
         };
         let (code, verb) = if examine {
             ("READ-ONLY", "EXAMINE")
@@ -860,11 +881,11 @@ impl Session {
             .iter()
             .filter_map(|item| {
                 let value = match item.as_str() {
-                    "MESSAGES" => selected.exists.to_string(),
+                    "MESSAGES" => selected.messages.len().to_string(),
                     "RECENT" => "0".to_string(),
                     "UIDNEXT" => selected.uidnext.to_string(),
                     "UIDVALIDITY" => selected.uidvalidity.to_string(),
-                    "UNSEEN" => selected.unseen.to_string(),
+                    "UNSEEN" => selected.unseen().to_string(),
                     _ => return None,
                 };
                 Some(format!("{item} {value}"))
@@ -912,20 +933,17 @@ impl Session {
             items.push(FetchItem::Uid);
         }
 
-        let mailbox = match &self.state {
-            State::Selected { view, .. } => view.id,
-            _ => {
-                write_line(
-                    writer,
-                    &format!("{tag} BAD command not valid in this state"),
-                )
-                .await?;
-                return Ok(());
-            }
+        // The session's view is the message order the client knows:
+        // position + 1 is the message sequence number, and the last
+        // uid is the `*` of a UID set.
+        let Some((mailbox, uids)) = self.selected_view() else {
+            write_line(
+                writer,
+                &format!("{tag} BAD command not valid in this state"),
+            )
+            .await?;
+            return Ok(());
         };
-        // The uid list is the mailbox's message order: position + 1 is
-        // the message sequence number, and the last uid is the `*`.
-        let uids = self.backend.search(mailbox, &[String::from("ALL")]).await?;
         let max_uid = uids.last().copied().unwrap_or(0);
 
         for (index, uid) in uids.iter().enumerate() {
@@ -938,8 +956,9 @@ impl Session {
             if !selected {
                 continue;
             }
-            // An expunged uid answers nothing (the Proton Bridge
-            // lesson for mid-session expunges) and so does a uid whose
+            // A uid the store no longer has answers nothing — its
+            // EXPUNGE waits for the next sync point, since none may be
+            // sent during a FETCH — and so does a uid whose
             // details cannot be loaded: one poisoned row must not
             // abort the whole `UID FETCH 1:*` — no FETCH line for it,
             // the rest of the loop continues, and the row disappears
@@ -984,33 +1003,30 @@ impl Session {
             write_line(writer, &format!("{tag} BAD invalid SEARCH")).await?;
             return Ok(());
         }
-        let mailbox = match &self.state {
-            State::Selected { view, .. } => view.id,
-            _ => {
-                write_line(
-                    writer,
-                    &format!("{tag} BAD command not valid in this state"),
-                )
-                .await?;
-                return Ok(());
-            }
+        let Some((mailbox, uids)) = self.selected_view() else {
+            write_line(
+                writer,
+                &format!("{tag} BAD command not valid in this state"),
+            )
+            .await?;
+            return Ok(());
         };
-        // The backend answers uids; a plain SEARCH reports the positions
-        // those uids occupy.
-        let uids = self.backend.search(mailbox, &[String::from("ALL")]).await?;
+        // The backend answers uids. Only messages of the session's
+        // view are reported — one the client has not been told about
+        // has no number yet — and a plain SEARCH reports the positions
+        // the uids occupy in that view.
         let matched = self.backend.search(mailbox, &criteria).await?;
-        let numbers: Vec<String> = if uid_command {
-            matched.iter().map(|uid| uid.to_string()).collect()
-        } else {
-            matched
-                .iter()
-                .filter_map(|uid| {
-                    uids.iter()
-                        .position(|known| known == uid)
-                        .map(|position| (position + 1).to_string())
-                })
-                .collect()
-        };
+        let numbers: Vec<String> = matched
+            .iter()
+            .filter_map(|uid| uids.binary_search(uid).ok().map(|position| (position, uid)))
+            .map(|(position, uid)| {
+                if uid_command {
+                    uid.to_string()
+                } else {
+                    (position + 1).to_string()
+                }
+            })
+            .collect();
         let joined = numbers.join(" ");
         if joined.is_empty() {
             write_line(writer, "* SEARCH").await?;
@@ -1024,101 +1040,87 @@ impl Session {
 
     // -- Snapshot maintenance ----------------------------------------------
 
+    /// The selected mailbox and the uids of the session's view, in
+    /// message-number order; `None` outside the `Selected` state.
+    fn selected_view(&self) -> Option<(MailboxId, Vec<u32>)> {
+        match &self.state {
+            State::Selected {
+                mailbox, messages, ..
+            } => Some((*mailbox, messages.iter().map(|(uid, _)| *uid).collect())),
+            _ => None,
+        }
+    }
+
     /// Whether the selected snapshot still matches the store: the same
-    /// mailbox at the same UIDVALIDITY. A resynced or deleted mailbox is
-    /// stale.
+    /// mailbox id at the same UIDVALIDITY. A resynced, renamed, or
+    /// deleted mailbox is stale.
     async fn snapshot_is_current(&self) -> Result<bool> {
-        let (name, session_uidvalidity) = match &self.state {
+        let (mailbox, session_uidvalidity) = match &self.state {
             State::Selected {
-                view, uidvalidity, ..
-            } => (view.name.clone(), *uidvalidity),
-            _ => return Ok(true),
-        };
-        match self.backend.select(&name).await? {
-            Some(current) => Ok(current.uidvalidity == session_uidvalidity),
-            None => Ok(false),
-        }
-    }
-
-    /// Drain pending mailbox notifications. When one concerns the
-    /// selected mailbox — or the receiver lagged, which means everything
-    /// may have changed — the snapshot is re-checked with
-    /// [`Session::refresh_selected_snapshot`].
-    async fn flush_notifications<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<Flow> {
-        let mailbox = match &self.state {
-            State::Selected { view, .. } => view.id,
-            _ => return Ok(Flow::Continue),
-        };
-
-        let mut relevant = false;
-        loop {
-            match self.watch.try_recv() {
-                Ok(MailboxChanged(changed)) => relevant |= changed == mailbox,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => relevant = true,
-                Err(broadcast::error::TryRecvError::Empty)
-                | Err(broadcast::error::TryRecvError::Closed) => break,
-            }
-        }
-        if !relevant {
-            return Ok(Flow::Continue);
-        }
-        self.refresh_selected_snapshot(writer).await
-    }
-
-    /// Re-check the selected snapshot against the store in one
-    /// round-trip: a vanished mailbox or a moved UIDVALIDITY sends the
-    /// resync BYE and ends the session; a changed count is reported as
-    /// `* <n> EXISTS`; the session's counts refresh either way.
-    async fn refresh_selected_snapshot<W: AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-    ) -> Result<Flow> {
-        let (name, previous_exists, session_uidvalidity) = match &self.state {
-            State::Selected {
-                view,
-                exists,
+                mailbox,
                 uidvalidity,
                 ..
-            } => (view.name.clone(), *exists, *uidvalidity),
+            } => (*mailbox, *uidvalidity),
+            _ => return Ok(true),
+        };
+        Ok(self.backend.uidvalidity(mailbox).await? == Some(session_uidvalidity))
+    }
+
+    /// Empty the mailbox-change queue. The session compares its whole
+    /// view at every sync point, so the notifications themselves carry
+    /// nothing it still needs; draining only keeps the receiver from
+    /// lagging.
+    fn drain_notifications(&mut self) {
+        while !matches!(
+            self.watch.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed)
+        ) {}
+    }
+
+    /// One sync point: compare the session's view with the store and
+    /// announce every difference. A vanished mailbox or a moved
+    /// UIDVALIDITY sends the resync BYE and ends the session; otherwise
+    /// the client is told what left, whether anything arrived, and
+    /// which read states changed, and the view becomes the store's.
+    /// Outside the `Selected` state there is nothing to announce.
+    async fn announce_changes<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<Flow> {
+        let (mailbox, session_uidvalidity) = match &self.state {
+            State::Selected {
+                mailbox,
+                uidvalidity,
+                ..
+            } => (*mailbox, *uidvalidity),
             _ => return Ok(Flow::Continue),
         };
+        self.drain_notifications();
 
-        let Some(current) = self.backend.select(&name).await? else {
-            write_line(writer, RESYNC_BYE).await?;
-            return Ok(Flow::Close);
+        let current = match self.backend.snapshot(mailbox).await? {
+            Some(current) if current.uidvalidity == session_uidvalidity => current,
+            _ => {
+                write_line(writer, RESYNC_BYE).await?;
+                return Ok(Flow::Close);
+            }
         };
-        if current.uidvalidity != session_uidvalidity {
-            write_line(writer, RESYNC_BYE).await?;
-            return Ok(Flow::Close);
+        if let State::Selected { messages, .. } = &mut self.state {
+            let announcements = reconcile(messages, &current.messages);
+            tracing::debug!(
+                exists = messages.len(),
+                announced = announcements.len(),
+                "mailbox compared"
+            );
+            for line in announcements {
+                write_line(writer, &line).await?;
+            }
         }
-        if current.exists != previous_exists {
-            write_line(writer, &format!("* {} EXISTS", current.exists)).await?;
-        }
-        if let State::Selected {
-            exists,
-            unseen,
-            uidvalidity,
-            ..
-        } = &mut self.state
-        {
-            *exists = current.exists;
-            *unseen = current.unseen;
-            *uidvalidity = current.uidvalidity;
-        }
-        tracing::debug!(
-            exists = current.exists,
-            unseen = current.unseen,
-            "mailbox refreshed"
-        );
         Ok(Flow::Continue)
     }
 
     // -- IDLE -------------------------------------------------------------
 
     /// Serve IDLE (RFC 2177) in the `Selected` state: answer `+ idling`,
-    /// flush the notifications that queued while the session was not
-    /// idling — never lose an update at the IDLE boundary — then wait on
-    /// the command reader and the watcher at once. `DONE` ends IDLE with
+    /// announce what changed while the session was not idling — never
+    /// lose an update at the IDLE boundary — then wait on the command
+    /// reader and the watcher at once. `DONE` ends IDLE with
     /// the tagged OK; LOGOUT behaves as it always does; any other
     /// command answers BAD and returns to normal dispatch. A change for
     /// the selected mailbox re-checks the snapshot; changes for other
@@ -1130,16 +1132,16 @@ impl Session {
         W: AsyncWrite + Unpin,
     {
         let mailbox = match &self.state {
-            State::Selected { view, .. } => view.id,
+            State::Selected { mailbox, .. } => *mailbox,
             _ => return Ok(Flow::Continue),
         };
 
         write_line(writer, "+ idling").await?;
         writer.flush().await.map_err(io_failed)?;
 
-        // The boundary flush: a change that queued while the session
-        // was not idling is reported before the first wait.
-        let flow = self.flush_notifications(writer).await?;
+        // The boundary comparison: a change that happened while the
+        // session was not idling is reported before the first wait.
+        let flow = self.announce_changes(writer).await?;
         writer.flush().await.map_err(io_failed)?;
         if matches!(flow, Flow::Close) {
             return Ok(Flow::Close);
@@ -1217,7 +1219,7 @@ impl Session {
     /// connection, so the response — or the BYE that ends it — must not
     /// sit in the writer's buffer.
     async fn idle_recheck<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<Flow> {
-        let flow = self.refresh_selected_snapshot(writer).await?;
+        let flow = self.announce_changes(writer).await?;
         writer.flush().await.map_err(io_failed)?;
         Ok(flow)
     }
@@ -1294,6 +1296,58 @@ fn body_section_name(section: &BodySection) -> String {
         }
         BodySection::Part(raw) => raw.clone(),
     }
+}
+
+/// Bring the session's view to the store's `current` state and return
+/// the untagged responses that tell the client, in the order they
+/// must be sent.
+///
+/// * Every message that left is one `* <n> EXPUNGE`, highest number
+///   first, so no announcement renumbers a message still to be named.
+/// * Messages are only ever added at the end: a uid above the view's
+///   highest is new, and any number of them is one `* <n> EXISTS` — sent
+///   after the expunges, so a change that leaves the count unchanged
+///   (one out, one in) is still two visible events.
+/// * A changed read state of a message the client already knew is one
+///   `* <n> FETCH (FLAGS (...))`.
+fn reconcile(view: &mut Vec<(u32, bool)>, current: &[(u32, bool)]) -> Vec<String> {
+    let mut announcements = Vec::new();
+    let position = |uid: u32| current.binary_search_by_key(&uid, |(known, _)| *known);
+
+    for index in (0..view.len()).rev() {
+        if position(view[index].0).is_err() {
+            view.remove(index);
+            announcements.push(format!("* {} EXPUNGE", index + 1));
+        }
+    }
+
+    for (index, (uid, unread)) in view.iter_mut().enumerate() {
+        if let Ok(at) = position(*uid) {
+            if current[at].1 != *unread {
+                *unread = current[at].1;
+                announcements.push(format!(
+                    "* {} FETCH (FLAGS ({}))",
+                    index + 1,
+                    render::flags(*unread)
+                ));
+            }
+        }
+    }
+
+    let highest = view.last().map_or(0, |(uid, _)| *uid);
+    let known = view.len();
+    view.extend(current.iter().filter(|(uid, _)| *uid > highest));
+    if view.len() != known {
+        // New messages are announced before the flag updates of old
+        // ones would matter to them; EXISTS follows the expunges.
+        let exists = format!("* {} EXISTS", view.len());
+        let after_expunges = announcements
+            .iter()
+            .position(|line| !line.ends_with("EXPUNGE"))
+            .unwrap_or(announcements.len());
+        announcements.insert(after_expunges, exists);
+    }
+    announcements
 }
 
 /// The octets a partial fetch `<offset.count>` selects from a section.
@@ -1531,6 +1585,63 @@ mod tests {
             render("(UID BODY[TEXT]<1.3>)"),
             "* 3 FETCH (UID 5 BODY[TEXT]<1> {3}\r\nell)\r\n"
         );
+    }
+
+    #[test]
+    fn reconcile_announces_expunges_then_exists_then_flags() {
+        let seen = false;
+        let unread = true;
+
+        // Nothing changed: nothing is said.
+        let mut view = vec![(1, seen), (3, unread)];
+        assert!(reconcile(&mut view, &[(1, seen), (3, unread)]).is_empty());
+
+        // Arrivals are one EXISTS with the new count.
+        let mut view = vec![(1, seen), (3, unread)];
+        assert_eq!(
+            reconcile(
+                &mut view,
+                &[(1, seen), (3, unread), (4, unread), (5, unread)]
+            ),
+            vec!["* 4 EXISTS"]
+        );
+        assert_eq!(view.len(), 4);
+
+        // Departures are one EXPUNGE each, highest number first, so
+        // every number is still valid when it is sent.
+        let mut view = vec![(1, seen), (3, seen), (5, seen), (7, seen)];
+        assert_eq!(
+            reconcile(&mut view, &[(3, seen), (5, seen)]),
+            vec!["* 4 EXPUNGE", "* 1 EXPUNGE"]
+        );
+        assert_eq!(view, vec![(3, seen), (5, seen)]);
+
+        // One out, one in: the count is unchanged and both events are
+        // still reported, the EXPUNGE first.
+        let mut view = vec![(1, seen), (3, seen)];
+        assert_eq!(
+            reconcile(&mut view, &[(3, seen), (4, unread)]),
+            vec!["* 1 EXPUNGE", "* 2 EXISTS"]
+        );
+        assert_eq!(view, vec![(3, seen), (4, unread)]);
+
+        // Read-state changes name the message by its number after the
+        // expunges; a new message's flags are not announced.
+        let mut view = vec![(1, seen), (3, unread), (5, seen)];
+        assert_eq!(
+            reconcile(&mut view, &[(3, seen), (5, unread), (6, unread)]),
+            vec![
+                "* 1 EXPUNGE",
+                "* 3 EXISTS",
+                "* 1 FETCH (FLAGS (\\Seen))",
+                "* 2 FETCH (FLAGS ())",
+            ]
+        );
+
+        // The mailbox emptied, then filled again.
+        let mut view = vec![(1, seen)];
+        assert_eq!(reconcile(&mut view, &[]), vec!["* 1 EXPUNGE"]);
+        assert_eq!(reconcile(&mut view, &[(9, unread)]), vec!["* 1 EXISTS"]);
     }
 
     #[test]

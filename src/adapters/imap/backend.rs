@@ -553,6 +553,23 @@ impl MailSource for OnceSource<'_> {
     }
 }
 
+impl TutaImapBackend {
+    /// The current state of one stored mailbox. The message list is the
+    /// store's cheap `(uid, unread)` read: no header is loaded.
+    async fn opened(&self, found: &StoredMailbox) -> Result<SelectedMailbox> {
+        Ok(SelectedMailbox {
+            view: MailboxView {
+                id: found.id,
+                name: found.name.clone(),
+                special_use: render::special_use(&found.kind),
+            },
+            uidvalidity: found.uidvalidity,
+            uidnext: found.next_uid,
+            messages: self.store.message_uids(found.id).await?,
+        })
+    }
+}
+
 /// A row marked complete whose sent date never landed — the shape the
 /// M2-era external-mail population left in existing databases, where
 /// Tuta's `MailDetails.sentDate` is 0 and the real send time lived only
@@ -603,25 +620,28 @@ impl ImapBackend for TutaImapBackend {
 
     async fn select(&self, name: &str) -> Result<Option<SelectedMailbox>> {
         let mailboxes = self.store.mailboxes(self.account_id).await?;
-        let Some(found) = mailboxes.iter().find(|mailbox| name_matches(name, mailbox)) else {
-            return Ok(None);
-        };
-        let view = MailboxView {
-            id: found.id,
-            name: found.name.clone(),
-            special_use: render::special_use(&found.kind),
-        };
-        let messages = self.store.messages(found.id).await?;
-        Ok(Some(SelectedMailbox {
-            view,
-            uidvalidity: found.uidvalidity,
-            uidnext: found.next_uid,
-            exists: messages.len(),
-            unseen: messages
-                .iter()
-                .filter(|message| message.header.unread)
-                .count(),
-        }))
+        match mailboxes.iter().find(|mailbox| name_matches(name, mailbox)) {
+            Some(found) => Ok(Some(self.opened(found).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn snapshot(&self, mailbox: MailboxId) -> Result<Option<SelectedMailbox>> {
+        let mailboxes = self.store.mailboxes(self.account_id).await?;
+        match mailboxes.iter().find(|stored| stored.id == mailbox) {
+            Some(found) => Ok(Some(self.opened(found).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn uidvalidity(&self, mailbox: MailboxId) -> Result<Option<u32>> {
+        Ok(self
+            .store
+            .mailboxes(self.account_id)
+            .await?
+            .iter()
+            .find(|stored| stored.id == mailbox)
+            .map(|stored| stored.uidvalidity))
     }
 
     async fn fetch(

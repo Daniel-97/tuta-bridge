@@ -339,8 +339,8 @@ async fn mailboxes_list_special_use() {
         .unwrap()
         .expect("lowercase inbox resolves");
     assert_eq!(selected.view.id, world.inbox);
-    assert_eq!(selected.exists, 2);
-    assert_eq!(selected.unseen, 1);
+    assert_eq!(selected.messages.len(), 2);
+    assert_eq!(selected.unseen(), 1);
     assert_eq!(selected.uidnext, 3);
     assert_eq!(selected.uidvalidity, 100);
 

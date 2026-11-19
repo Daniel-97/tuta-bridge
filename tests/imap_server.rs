@@ -597,6 +597,139 @@ async fn idle_emits_exists_on_changes_and_done_ends_it() {
     session.await.unwrap().unwrap();
 }
 
+/// A fetch answer that renders nothing but what the session itself
+/// knows; enough for `(UID)` and `(UID FLAGS)` requests.
+fn bare_fetch() -> FakeFetched {
+    FakeFetched {
+        flags: "\\Seen".into(),
+        internal_date: "\"14-Nov-2023 22:13:20 +0000\"".into(),
+        envelope: None,
+        bodystructure: None,
+        rfc822_size: None,
+        body: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn message_numbers_hold_until_an_expunge_is_announced() {
+    let scripted = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 6, 0, vec![1, 3, 5]),
+            )
+            .with_fetch(3, bare_fetch())
+            .with_fetch(5, bare_fetch())
+            .with_fetch(6, bare_fetch())
+            .with_search(vec![1, 3, 5, 6]),
+    );
+    let (mut wire, session, _sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    wire.send("a3 SELECT Inbox").await;
+    expect_select_block(&mut wire, "a3", 3, None, 7, 6, false).await;
+
+    // The store loses uid 1 and gains uid 6 under the session. Until
+    // the session says so, every number keeps naming the message the
+    // client knows by it: 2 is still uid 3, 1 answers nothing, and the
+    // unannounced arrival has no number at all.
+    scripted.remove_message("Inbox", 1);
+    scripted.add_message("Inbox", 6);
+    wire.send("a4 FETCH 1:* (UID)").await;
+    wire.expect("* 2 FETCH (UID 3)").await;
+    wire.expect("* 3 FETCH (UID 5)").await;
+    wire.expect("a4 OK FETCH completed").await;
+    wire.send("a5 SEARCH SEEN").await;
+    wire.expect("* SEARCH 1 2 3").await;
+    wire.expect("a5 OK SEARCH completed").await;
+    wire.send("a6 UID SEARCH SEEN").await;
+    wire.expect("* SEARCH 1 3 5").await;
+    wire.expect("a6 OK UID SEARCH completed").await;
+    wire.send("a7 UID FETCH 6 (UID)").await;
+    wire.expect("a7 OK UID FETCH completed").await;
+
+    // NOOP is where the change may be announced: the expunge first,
+    // then the arrival — the count is the same as before, and both
+    // events are still reported.
+    wire.send("a8 NOOP").await;
+    wire.expect("* 1 EXPUNGE").await;
+    wire.expect("* 3 EXISTS").await;
+    wire.expect("a8 OK NOOP completed").await;
+    wire.send("a9 FETCH 1:* (UID)").await;
+    wire.expect("* 1 FETCH (UID 3)").await;
+    wire.expect("* 2 FETCH (UID 5)").await;
+    wire.expect("* 3 FETCH (UID 6)").await;
+    wire.expect("a9 OK FETCH completed").await;
+
+    // CHECK is a sync point too, and a read-state change is a FETCH.
+    scripted.set_unread("Inbox", 5, true);
+    wire.send("b1 CHECK").await;
+    wire.expect("* 2 FETCH (FLAGS ())").await;
+    wire.expect("b1 OK CHECK completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn idle_announces_expunges_and_flag_changes_live() {
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+
+    // One mail out and one in between two notifications.
+    scripted.remove_message("Inbox", 1);
+    scripted.add_message("Inbox", 4);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* 1 EXPUNGE").await;
+    wire.expect("* 2 EXISTS").await;
+
+    // The remaining unread mail is read elsewhere.
+    scripted.set_unread("Inbox", 3, false);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* 1 FETCH (FLAGS (\\Seen))").await;
+
+    wire.send("DONE").await;
+    wire.expect("i1 OK IDLE completed").await;
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_deleted_mailbox_ends_the_selected_session_with_bye() {
+    // The folder is deleted in Tuta: the watcher removes the mailbox
+    // and announces its id one last time. An idling session ends with
+    // the fixed BYE instead of an error.
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    scripted.remove_mailbox("Inbox");
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* BYE mailbox state was resynced; reconnect")
+        .await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+
+    // Outside IDLE the next command finds the mailbox gone.
+    let scripted = backend();
+    let (mut wire, session, _sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    scripted.remove_mailbox("Inbox");
+    wire.send("a4 FETCH 1 (UID)").await;
+    wire.expect("* BYE mailbox state was resynced; reconnect")
+        .await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn uidvalidity_change_resets_the_session_with_bye() {
     let scripted = backend();

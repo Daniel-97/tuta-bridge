@@ -158,15 +158,26 @@
     FETCH continues; a message whose details cannot be loaded is
     skipped in the FETCH response exactly like an expunged one, and
     its row disappears on the next sync or event.
-- IDLE reset rules: a `Selected` session re-validates its snapshot
-  before every command except `SELECT`/`EXAMINE` (which replace it)
-  and `CLOSE`/`LOGOUT` (which drop or end it), and on every drained
-  notification: a UIDVALIDITY drift or a vanished mailbox sends the
-  fixed `* BYE mailbox state was resynced; reconnect` and closes the
-  session. `NOOP` drains queued notifications so polling clients see
-  untagged `EXISTS`; a `RecvError::Lagged` broadcast receiver means
-  "everything may have changed" and forces the same re-check, both in
-  and out of IDLE.
+- Session snapshot: a `Selected` session owns its view of the mailbox
+  — the mailbox id, the UIDVALIDITY, and the `(uid, unread)` list whose
+  positions are the message numbers the client knows. It addresses the
+  mailbox by id from `SELECT` on and never resolves the name again.
+  `FETCH` and `SEARCH` answer from that view: a uid the store no longer
+  has answers nothing, and one the client was not told about has no
+  number yet.
+- Reset rules: the session re-validates the UIDVALIDITY (one mailbox
+  row, no message read) before every command except `SELECT`/`EXAMINE`
+  (which replace the view) and `CLOSE`/`LOGOUT` (which drop or end it).
+  A drift — resync, or a renamed folder — or a mailbox whose id no
+  longer exists sends the fixed `* BYE mailbox state was resynced;
+  reconnect` and closes the session.
+- Sync points: the view changes only at `NOOP`, `CHECK`, `IDLE` entry,
+  and each `MailboxChanged` (or lagged receiver) during `IDLE` — never
+  during `FETCH`/`STORE`/`SEARCH` (RFC 3501 §7.4.1). The session reads
+  `StateStore::message_uids` and sends `* n EXPUNGE` per removed mail
+  (highest number first), then `* n EXISTS` if any arrived, then
+  `* n FETCH (FLAGS (...))` per read-state change. `EXAMINE` versus
+  `SELECT` is recorded in the session state for the write milestone.
 - IDLE literal edge: a tagged BAD during IDLE never answers a literal
   continuation, and RFC 3501 obliges the client not to send the octets
   its `{n}` token announced — the session reads none of them, and

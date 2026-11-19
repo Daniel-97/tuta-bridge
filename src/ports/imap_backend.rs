@@ -15,13 +15,22 @@ pub struct MailboxView {
     pub special_use: &'static str,
 }
 
-/// The snapshot `SELECT` reports for one mailbox.
+/// The state of one mailbox at one moment: what `SELECT` reports, and
+/// what a selected session compares its own view against.
 pub struct SelectedMailbox {
     pub view: MailboxView,
     pub uidvalidity: u32,
     pub uidnext: u32,
-    pub exists: usize,
-    pub unseen: usize,
+    /// `(uid, unread)` of every message, in ascending UID order: a
+    /// message's position, plus one, is its message sequence number.
+    pub messages: Vec<(u32, bool)>,
+}
+
+impl SelectedMailbox {
+    /// How many messages are unread.
+    pub fn unseen(&self) -> usize {
+        self.messages.iter().filter(|(_, unread)| *unread).count()
+    }
 }
 
 /// One FETCH response, built from the requested item list.
@@ -59,6 +68,21 @@ pub trait ImapBackend: Send + Sync {
     async fn mailboxes(&self) -> Result<Vec<MailboxView>>;
     /// Resolve one mailbox by name: exact, plus `INBOX` case-insensitively.
     async fn select(&self, name: &str) -> Result<Option<SelectedMailbox>>;
+    /// The current state of the mailbox with this id, or `None` once it
+    /// no longer exists. A selected session addresses its mailbox this
+    /// way — never by name again, so a renamed or same-named mailbox can
+    /// not be mistaken for it.
+    async fn snapshot(&self, mailbox: MailboxId) -> Result<Option<SelectedMailbox>>;
+    /// The current UIDVALIDITY of the mailbox with this id, or `None`
+    /// once it no longer exists: the check a selected session runs
+    /// before every command, so implementations should answer it
+    /// without reading messages.
+    async fn uidvalidity(&self, mailbox: MailboxId) -> Result<Option<u32>> {
+        Ok(self
+            .snapshot(mailbox)
+            .await?
+            .map(|snapshot| snapshot.uidvalidity))
+    }
     /// Fetch one stored message by UID, or `None` when the mailbox has no
     /// such row.
     async fn fetch(

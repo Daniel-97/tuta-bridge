@@ -1314,24 +1314,26 @@ impl MessageRenderer for FakeRenderer {
 // FakeImapBackend
 // ---------------------------------------------------------------------------
 
-/// One scripted `SELECT` snapshot. The uid list doubles as the message
-/// count (`exists` is its length), so a new stored message is one pushed
-/// uid — exactly how the real store reports a growing mailbox.
+/// One scripted mailbox state. The uid list doubles as the message
+/// count, so a new stored message is one pushed uid — exactly how the
+/// real store reports a growing mailbox. `new` marks the last `unseen`
+/// uids unread.
 #[derive(Clone)]
 pub struct FakeSelected {
     pub uidvalidity: u32,
     pub uidnext: u32,
-    pub unseen: usize,
     pub uids: Vec<u32>,
+    pub unread: Vec<u32>,
 }
 
 impl FakeSelected {
     pub fn new(uidvalidity: u32, uidnext: u32, unseen: usize, uids: Vec<u32>) -> Self {
+        let unread = uids[uids.len().saturating_sub(unseen)..].to_vec();
         Self {
             uidvalidity,
             uidnext,
-            unseen,
             uids,
+            unread,
         }
     }
 }
@@ -1442,15 +1444,60 @@ impl FakeImapBackend {
             .uidvalidity = uidvalidity;
     }
 
-    /// Simulate one new stored message: append a uid.
+    /// Simulate one new stored message: append a uid (read).
     pub fn add_message(&self, name: &str, uid: u32) {
-        self.snapshots
-            .lock()
-            .unwrap()
-            .get_mut(name)
-            .unwrap_or_else(|| panic!("mailbox {name} is not scripted"))
-            .uids
-            .push(uid);
+        self.script(name, |snapshot| snapshot.uids.push(uid));
+    }
+
+    /// Simulate a message leaving the mailbox.
+    pub fn remove_message(&self, name: &str, uid: u32) {
+        self.script(name, |snapshot| {
+            snapshot.uids.retain(|known| *known != uid);
+            snapshot.unread.retain(|known| *known != uid);
+        });
+    }
+
+    /// Simulate a read-state change on one stored message.
+    pub fn set_unread(&self, name: &str, uid: u32, unread: bool) {
+        self.script(name, |snapshot| {
+            snapshot.unread.retain(|known| *known != uid);
+            if unread {
+                snapshot.unread.push(uid);
+            }
+        });
+    }
+
+    /// Simulate the folder being deleted: its id stops resolving.
+    pub fn remove_mailbox(&self, name: &str) {
+        self.snapshots.lock().unwrap().remove(name);
+    }
+
+    fn script(&self, name: &str, change: impl FnOnce(&mut FakeSelected)) {
+        change(
+            self.snapshots
+                .lock()
+                .unwrap()
+                .get_mut(name)
+                .unwrap_or_else(|| panic!("mailbox {name} is not scripted")),
+        );
+    }
+
+    fn opened(&self, view: &MailboxView) -> Option<SelectedMailbox> {
+        let snapshot = self.snapshots.lock().unwrap().get(&view.name).cloned()?;
+        Some(SelectedMailbox {
+            view: MailboxView {
+                id: view.id,
+                name: view.name.clone(),
+                special_use: view.special_use,
+            },
+            uidvalidity: snapshot.uidvalidity,
+            uidnext: snapshot.uidnext,
+            messages: snapshot
+                .uids
+                .iter()
+                .map(|uid| (*uid, snapshot.unread.contains(uid)))
+                .collect(),
+        })
     }
 }
 
@@ -1486,24 +1533,15 @@ impl ImapBackend for FakeImapBackend {
                     })
                     .flatten()
             });
-        let Some(view) = found else {
-            return Ok(None);
-        };
-        let snapshot = self.snapshots.lock().unwrap().get(&view.name).cloned();
-        let Some(snapshot) = snapshot else {
-            return Ok(None);
-        };
-        Ok(Some(SelectedMailbox {
-            view: MailboxView {
-                id: view.id,
-                name: view.name.clone(),
-                special_use: view.special_use,
-            },
-            uidvalidity: snapshot.uidvalidity,
-            uidnext: snapshot.uidnext,
-            exists: snapshot.uids.len(),
-            unseen: snapshot.unseen,
-        }))
+        Ok(found.and_then(|view| self.opened(view)))
+    }
+
+    async fn snapshot(&self, mailbox: MailboxId) -> Result<Option<SelectedMailbox>> {
+        Ok(self
+            .views
+            .iter()
+            .find(|view| view.id == mailbox)
+            .and_then(|view| self.opened(view)))
     }
 
     async fn fetch(
