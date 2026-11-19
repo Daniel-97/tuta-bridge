@@ -211,11 +211,26 @@ impl EventProcessor {
     }
 }
 
+/// Whether `batch` reports a deleted mail set.
+///
+/// A delete event names the set, but the index knows folders by their
+/// entries list, which a deleted set can no longer be asked for. The
+/// processor therefore skips the event and the watch loop uses this to
+/// reconcile the stored folders against the server's list instead.
+pub fn deletes_folder(batch: &EventBatch) -> bool {
+    batch.events.iter().any(|event| {
+        event.application == TUTANOTA_APP
+            && event.type_id == MAIL_SET_TYPE_ID
+            && event.operation == EntityOperation::Delete
+    })
+}
+
 /// Resolve a mail-set event into a folder upsert.
 ///
 /// A set the bridge does not store (for example the virtual "All" set)
-/// answers `Ok(None)` and is skipped, as is every failed load. Folder
-/// deletion is left to `sync`, which reconciles the full folder list.
+/// answers `Ok(None)` and is skipped, as is every failed load. A deleted
+/// set is skipped too: its folder is removed by reconciling the full
+/// folder list (see [`deletes_folder`]).
 async fn mail_set_change(
     lookup: &dyn EventLookup,
     uidvalidity: u32,

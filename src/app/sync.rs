@@ -113,6 +113,21 @@ impl SyncEngine {
         Ok(report)
     }
 
+    /// Remove the stored mailboxes of folders deleted on the server and
+    /// return their ids.
+    ///
+    /// Only the folder list is loaded, no headers: this is the cheap part
+    /// of [`Self::sync`] for when a folder is known to be gone. A failed
+    /// listing fails the call and removes nothing.
+    pub async fn reconcile_folders(
+        &self,
+        account_id: i64,
+        source: &dyn MailSource,
+    ) -> Result<Vec<MailboxId>> {
+        let folders = load_folders(source).await?;
+        self.remove_missing_mailboxes(account_id, &folders).await
+    }
+
     /// Store one loaded folder page and add its counts to `report`.
     async fn store_folder(
         &self,

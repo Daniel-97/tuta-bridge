@@ -44,9 +44,9 @@ use crate::adapters::tuta::generated_id::{
     batch_is_expired, generated_id_timestamp, timestamp_to_generated_id,
 };
 use crate::app::enrich::EnvelopeEnricher;
-use crate::app::event_sync::{EventProcessor, EventReport};
+use crate::app::event_sync::{deletes_folder, EventProcessor, EventReport};
 use crate::app::state_sync::{current_uidvalidity, sync_with};
-use crate::app::sync::SyncReport;
+use crate::app::sync::{SyncEngine, SyncReport};
 use crate::config::{resolve_imap_port, validate_imap_port, Config};
 use crate::domain::{AccountId, Error, EventBatch, EventFrame, Result};
 use crate::ports::clock::Clock;
@@ -187,6 +187,8 @@ impl WatchUseCase {
         let mut attempt: u32 = 0;
         // Connections in a row that ended on an unparseable frame.
         let mut invalid_frames: u32 = 0;
+        // A folder was deleted on the server and not yet removed here.
+        let mut folders_stale = false;
         loop {
             // The index sync runs first whenever events alone cannot be
             // trusted: at startup without usable markers, and after a
@@ -203,6 +205,8 @@ impl WatchUseCase {
                     Ok(markers) => {
                         batches = markers;
                         needs_sync = false;
+                        // The sync reconciled the folder list as well.
+                        folders_stale = false;
                     }
                     Err(e) if is_fatal(&e) => return Err(e),
                     Err(_) => {
@@ -216,6 +220,16 @@ impl WatchUseCase {
                         continue;
                     }
                 }
+            }
+
+            // A folder reconciliation that failed earlier is tried again
+            // before every connect.
+            if folders_stale {
+                let reconcile = self.reconcile_folders(session.as_ref(), account_id);
+                let Some(reconciled) = unless_stopped(&mut stop, reconcile).await else {
+                    return Ok(());
+                };
+                folders_stale = !reconciled?;
             }
 
             // A failed or hung connect is retried like a dropped
@@ -293,6 +307,22 @@ impl WatchUseCase {
                                 for mailbox in &report.touched_mailboxes {
                                     let _ = notifier.send(MailboxChanged(*mailbox));
                                 }
+                            }
+                            // A deleted folder cannot be resolved from
+                            // its event, and no `sync` can run beside
+                            // this process, so the stored folders are
+                            // compared with the server's list here. A
+                            // network failure keeps the flag for the
+                            // next applied batch or connect.
+                            folders_stale |= deletes_folder(&batch);
+                            if folders_stale {
+                                let reconcile =
+                                    self.reconcile_folders(session.as_ref(), account_id);
+                                let Some(reconciled) = unless_stopped(&mut stop, reconcile).await
+                                else {
+                                    return Ok(());
+                                };
+                                folders_stale = !reconciled?;
                             }
                         }
                         EventFrame::InitialSyncDone => {
@@ -408,6 +438,31 @@ impl WatchUseCase {
             }
         }
         Ok(batches)
+    }
+
+    /// Remove the mailboxes of folders that no longer exist on the server.
+    ///
+    /// `Ok(true)` means the stored folders now match the server's list;
+    /// every removed mailbox is announced so sessions that have it
+    /// selected notice. `Ok(false)` means the list could not be loaded
+    /// and the caller should try again later.
+    async fn reconcile_folders(&self, session: &dyn Session, account_id: i64) -> Result<bool> {
+        let engine = SyncEngine::new(Arc::clone(&self.state));
+        match engine.reconcile_folders(account_id, session.mail()).await {
+            Ok(removed) => {
+                if !removed.is_empty() {
+                    println!("removed {} deleted folders", removed.len());
+                }
+                if let Some(notifier) = &self.notifier {
+                    for mailbox in removed {
+                        let _ = notifier.send(MailboxChanged(mailbox));
+                    }
+                }
+                Ok(true)
+            }
+            Err(e) if is_fatal(&e) => Err(e),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Apply one batch, retrying it in place while it cannot be applied.

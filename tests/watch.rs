@@ -18,7 +18,7 @@ use tuta_bridge::config::Config;
 use tuta_bridge::domain::{
     AccountInfo, Address, EntityEvent, EntityOperation, Error, EventBatch, EventFrame, Folder,
     FolderKind, MailPlacement, MailboxId, MessageHeader, Result, StoredCredentials,
-    MAIL_SET_ENTRY_TYPE_ID, MAIL_TYPE_ID, TUTANOTA_APP,
+    MAIL_SET_ENTRY_TYPE_ID, MAIL_SET_TYPE_ID, MAIL_TYPE_ID, TUTANOTA_APP,
 };
 use tuta_bridge::ports::clock::Clock;
 use tuta_bridge::ports::mailbox_events::MailboxChanged;
@@ -1124,6 +1124,114 @@ async fn unreadable_frames_only_count_when_consecutive() {
         .unwrap_err();
     assert!(matches!(error, Error::Login(_)));
     assert!(session.mail.calls().is_empty(), "no sync may run");
+}
+
+/// One mail-set deletion, owned by `group`.
+fn folder_delete_batch(batch_id: &str, group: &str) -> EventBatch {
+    EventBatch {
+        batch_id: batch_id.to_string(),
+        owner_group_id: group.to_string(),
+        application_types_hash: "types-hash".to_string(),
+        events: vec![EntityEvent {
+            application: TUTANOTA_APP.to_string(),
+            type_id: MAIL_SET_TYPE_ID,
+            list_id: "sets".to_string(),
+            element_id: "set-b".to_string(),
+            operation: EntityOperation::Delete,
+        }],
+    }
+}
+
+/// A synced account with a second folder, `list-b`, holding one mail,
+/// and a session whose server only lists `list-a` any more.
+async fn account_with_deleted_folder(
+    state: &FakeStateStore,
+) -> (i64, MailboxId, Arc<FakeEventSession>) {
+    let (account, _marker) = synced_account(state).await;
+    let deleted = state
+        .upsert_mailbox(account, &folder("list-b"), 100)
+        .await
+        .unwrap();
+    state
+        .assign_uid(deleted, &header("list-b", "e1"))
+        .await
+        .unwrap();
+    let mut mail = FakeMailSource::new();
+    mail.folders = vec![folder("list-a")];
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()]).with_mail(Arc::new(mail)),
+    );
+    (account, deleted, session)
+}
+
+#[tokio::test]
+async fn folder_delete_event_removes_the_mailbox_while_watching() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, deleted, session) = account_with_deleted_folder(&state).await;
+    session.push_script(vec![
+        Ok(EventFrame::Batch(folder_delete_batch("batch-1", "group1"))),
+        Err(Error::Login("stop".into())),
+    ]);
+
+    let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .with_notifier(sender)
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+
+    // Only the folder list was loaded — no headers — and the mailbox of
+    // the deleted folder is gone together with its mail.
+    assert_eq!(session.mail.calls(), vec!["folders".to_string()]);
+    let remaining: Vec<String> = state
+        .mailboxes(account)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|mailbox| mailbox.list_id)
+        .collect();
+    assert_eq!(remaining, vec!["list-a".to_string()]);
+    assert!(state.messages(deleted).await.unwrap().is_empty());
+    // Sessions that had it selected are told.
+    assert_eq!(receiver.recv().await.unwrap(), MailboxChanged(deleted));
+}
+
+#[tokio::test]
+async fn failed_folder_reconciliation_is_retried_after_the_next_batch() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, _deleted, session) = account_with_deleted_folder(&state).await;
+    // The folder list cannot be loaded right after the delete event.
+    session.mail.fail_next_folders(1);
+    session.push_script(vec![
+        Ok(EventFrame::Batch(folder_delete_batch("batch-1", "group1"))),
+        Ok(EventFrame::Batch(empty_batch("batch-2", "group1"))),
+        Err(Error::Login("stop".into())),
+    ]);
+
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+    // The failed listing neither ended the watch nor was forgotten.
+    assert!(matches!(error, Error::Login(_)));
+    assert_eq!(
+        session.mail.calls(),
+        vec!["folders".to_string(), "folders".to_string()]
+    );
+    assert_eq!(state.mailboxes(account).await.unwrap().len(), 1);
+    assert_eq!(
+        state
+            .last_batch(account, "group1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("batch-2")
+    );
 }
 
 #[tokio::test]
