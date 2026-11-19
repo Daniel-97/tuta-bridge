@@ -128,6 +128,9 @@ pub struct FakeStateStore {
     next_mailbox_id: Mutex<i64>,
     /// Highest UIDVALIDITY ever handed out per account.
     uidvalidity_floors: Mutex<HashMap<i64, u32>>,
+    /// When nonzero, the next this many `apply_batch` calls fail like a
+    /// locked database, writing nothing.
+    busy_apply_batches: Mutex<usize>,
 }
 
 impl FakeStateStore {
@@ -141,7 +144,14 @@ impl FakeStateStore {
             next_account_id: Mutex::new(1),
             next_mailbox_id: Mutex::new(1),
             uidvalidity_floors: Mutex::new(HashMap::new()),
+            busy_apply_batches: Mutex::new(0),
         }
+    }
+
+    /// Make the next `count` `apply_batch` calls fail with the busy
+    /// storage error.
+    pub fn fail_next_apply_batches_busy(&self, count: usize) {
+        *self.busy_apply_batches.lock().unwrap() = count;
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -386,6 +396,8 @@ pub struct FakeEventLookup {
     /// When nonzero, the next this many lookups fail with a network
     /// error; consumed before the `fail` flag is consulted.
     pub failing_calls: Mutex<usize>,
+    /// When set, every mail lookup hangs forever.
+    pub hang: Mutex<bool>,
     pub calls: Mutex<Vec<String>>,
 }
 
@@ -397,8 +409,16 @@ impl FakeEventLookup {
             folders: Mutex::new(HashMap::new()),
             fail: Mutex::new(false),
             failing_calls: Mutex::new(0),
+            hang: Mutex::new(false),
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Make every mail lookup hang forever; only a stop future can end
+    /// a batch that needs one.
+    pub fn with_hang(self) -> Self {
+        *self.hang.lock().unwrap() = true;
+        self
     }
 
     /// Configure the placements of one mail; `None` marks the mail
@@ -480,6 +500,10 @@ impl EventLookup for FakeEventLookup {
         mail_element_id: &str,
     ) -> Result<Option<Vec<MailPlacement>>> {
         self.calls.lock().unwrap().push("headers_for_mail".into());
+        if *self.hang.lock().unwrap() {
+            // A hung lookup never resolves on its own.
+            return std::future::pending().await;
+        }
         if *self.fail.lock().unwrap() || self.consume_failing_call() {
             return Err(Error::Network("event entity unavailable".into()));
         }
@@ -577,6 +601,14 @@ impl StateStore for FakeStateStore {
         changes: &[StateChange],
     ) -> Result<BatchOutcome> {
         self.calls.lock().unwrap().push("apply_batch".into());
+        {
+            let mut busy = self.busy_apply_batches.lock().unwrap();
+            if *busy > 0 {
+                *busy -= 1;
+                // The SQLite adapter's message for a locked database.
+                return Err(Error::Storage("state database is busy".into()));
+            }
+        }
         // Mailboxes whose rows this batch changes, deduplicated and in
         // first-touch order.
         let mut touched: Vec<MailboxId> = Vec::new();
@@ -879,6 +911,10 @@ pub struct FakeMailSource {
     pub content: Option<MessageContent>,
     pub failing_elements: Vec<String>,
     pub fail_folders: bool,
+    /// When nonzero, the next this many `folders()` calls fail.
+    pub failing_folder_calls: Mutex<usize>,
+    /// When set, `folders()` hangs forever.
+    pub hang_folders: Mutex<bool>,
     pub headers_by_folder: Mutex<HashMap<String, Vec<MessageHeader>>>,
     pub failing_header_folders: Mutex<Vec<String>>,
     pub skipped_by_folder: Mutex<HashMap<String, usize>>,
@@ -897,6 +933,8 @@ impl FakeMailSource {
             content: None,
             failing_elements: Vec::new(),
             fail_folders: false,
+            failing_folder_calls: Mutex::new(0),
+            hang_folders: Mutex::new(false),
             headers_by_folder: Mutex::new(HashMap::new()),
             failing_header_folders: Mutex::new(Vec::new()),
             skipped_by_folder: Mutex::new(HashMap::new()),
@@ -914,6 +952,16 @@ impl FakeMailSource {
             .lock()
             .unwrap()
             .insert(list_id.to_string(), headers);
+    }
+
+    /// Make the next `count` `folders()` calls fail with a network error.
+    pub fn fail_next_folders(&self, count: usize) {
+        *self.failing_folder_calls.lock().unwrap() = count;
+    }
+
+    /// Make `folders()` hang forever; only a stop future can end a sync.
+    pub fn hang_folders(&self) {
+        *self.hang_folders.lock().unwrap() = true;
     }
 
     /// Make `headers_page` fail for `list_id`.
@@ -957,7 +1005,17 @@ impl Default for FakeMailSource {
 impl MailSource for FakeMailSource {
     async fn folders(&self) -> Result<Vec<Folder>> {
         self.calls.lock().unwrap().push("folders".to_string());
-        if self.fail_folders {
+        if *self.hang_folders.lock().unwrap() {
+            // A hung listing never resolves on its own.
+            return std::future::pending().await;
+        }
+        let scripted_failure = {
+            let mut failing = self.failing_folder_calls.lock().unwrap();
+            let fail = *failing > 0;
+            *failing = failing.saturating_sub(1);
+            fail
+        };
+        if self.fail_folders || scripted_failure {
             return Err(Error::Network("folders failed".into()));
         }
         Ok(self.folders.clone())

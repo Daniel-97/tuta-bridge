@@ -5,7 +5,8 @@
 //! mail events of each element into one authoritative action, and persists
 //! the resulting [`StateChange`]s together with the batch id in a single
 //! [`StateStore::apply_batch`] call, so a replayed batch is a no-op and the
-//! batch marker never advances past unapplied changes. All lookups are
+//! batch marker never advances past unapplied changes: a batch with a
+//! failed lookup is not persisted at all. All lookups are
 //! metadata-only, and the report carries counters and local mailbox ids:
 //! subjects, addresses, and entity ids never appear in it.
 
@@ -27,10 +28,12 @@ use crate::ports::state_store::StateStore;
 /// persist several (one upsert per placement plus a guard that drops stale
 /// placements). `skipped` counts the events left untouched, so
 /// `changes + skipped` always equals the number of events in the batch.
-/// `lookup_failures` counts the skipped events whose entity lookup failed
-/// with an error — unreadable entities and unhandled events stay out of
-/// it — because a long run of them desyncs the index and the watch loop
-/// heals that with a resync. `touched_mailboxes` lists every mailbox whose
+/// `lookup_failures` counts the events whose entity lookup failed with an
+/// error — unreadable entities and unhandled events stay out of it. A
+/// report with a nonzero count describes a batch that was not applied:
+/// nothing was persisted, the batch marker did not move, every event
+/// counts as skipped, and the watch loop retries the batch.
+/// `touched_mailboxes` lists every mailbox whose
 /// rows the batch changed, deduplicated, so idling sessions can learn
 /// their cached view is stale. All fields carry counters or mailbox ids
 /// only: entity data never appears in a report.
@@ -93,11 +96,14 @@ impl EventProcessor {
     /// mail's. A batch can therefore emit both a removal and an upsert
     /// for one mail — a `Mail` delete next to an entry create — and the
     /// delete wins because `apply_batch` applies removals after upserts.
-    /// Unreadable or failed lookups are skipped and keep the stored
-    /// rows; failed ones are counted in
-    /// [`EventReport::lookup_failures`]. Afterwards every action becomes
-    /// state changes and `apply_batch` runs exactly once, even when
-    /// nothing changed, so the batch id always advances.
+    /// Unreadable entities are skipped and keep their stored rows.
+    ///
+    /// When every lookup answered, the actions become state changes and
+    /// `apply_batch` runs exactly once, even when nothing changed, so
+    /// the batch id advances. When any lookup failed with an error the
+    /// batch is not applied at all: nothing is written, the batch id
+    /// stays where it was, and the report carries the failure count so
+    /// the caller can retry the same batch.
     pub async fn apply(
         &self,
         account_id: i64,
@@ -162,6 +168,19 @@ impl EventProcessor {
                 },
                 _ => skipped += 1,
             }
+        }
+
+        // A failed lookup means an event's effect is unknown. Persisting
+        // the rest would move the batch marker past that event and lose
+        // it for good, so nothing is written and the caller retries the
+        // whole batch.
+        if lookup_failures > 0 {
+            return Ok(EventReport {
+                changes: 0,
+                skipped: batch.events.len(),
+                lookup_failures,
+                touched_mailboxes: Vec::new(),
+            });
         }
 
         changes.extend(

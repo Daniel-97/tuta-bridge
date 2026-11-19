@@ -371,7 +371,71 @@ async fn mail_delete_removes_every_placement() {
 }
 
 #[tokio::test]
-async fn lookup_failure_is_skipped_and_the_batch_is_still_persisted() {
+async fn one_failed_lookup_keeps_the_whole_batch_unapplied_until_it_succeeds() {
+    let store = Arc::new(FakeStateStore::new());
+    let account = account(&store).await;
+    filed(&store, account, "list-a", "mail-list", "mail-1").await;
+    // Only the first lookup fails; the entry itself is loadable.
+    let lookup = FakeEventLookup::new()
+        .with_entry_placement(
+            "list-a",
+            "entry-2",
+            placement("list-a", "mail-list", "mail-2"),
+        )
+        .fail_next(1);
+    // A new mail whose lookup fails, next to a delete that needs none.
+    let batch = batch(vec![
+        event(
+            "tutanota",
+            MAIL_SET_ENTRY_TYPE_ID,
+            "list-a",
+            "entry-2",
+            EntityOperation::Create,
+        ),
+        event(
+            "tutanota",
+            MAIL_TYPE_ID,
+            "mail-list",
+            "mail-1",
+            EntityOperation::Delete,
+        ),
+    ]);
+    let processor = EventProcessor::new(store.clone());
+    let mailbox = store.mailbox_id(account, "list-a");
+
+    let failed = processor.apply(account, &lookup, 7, &batch).await.unwrap();
+    assert_eq!(
+        failed,
+        EventReport {
+            changes: 0,
+            skipped: 2,
+            lookup_failures: 1,
+            touched_mailboxes: Vec::new()
+        }
+    );
+    // Nothing was written — not even the delete that needed no lookup —
+    // and the batch marker did not move past the unresolved event.
+    assert!(!store.calls().iter().any(|call| call == "apply_batch"));
+    assert_eq!(store.uid_for(mailbox, "mail-list", "mail-1"), Some(1));
+    assert!(store.last_batches_for(account).is_empty());
+
+    // The retry of the same batch applies all of it.
+    let retried = processor.apply(account, &lookup, 7, &batch).await.unwrap();
+    assert_eq!(retried.changes, 2);
+    assert_eq!(retried.lookup_failures, 0);
+    assert_eq!(store.uid_for(mailbox, "mail-list", "mail-1"), None);
+    assert_eq!(store.uid_for(mailbox, "mail-list", "mail-2"), Some(2));
+    assert_eq!(
+        store
+            .last_batches_for(account)
+            .get("group-1")
+            .map(String::as_str),
+        Some("batch-1")
+    );
+}
+
+#[tokio::test]
+async fn every_failed_lookup_is_counted() {
     let store = Arc::new(FakeStateStore::new());
     let account = account(&store).await;
     filed(&store, account, "list-a", "mail-list", "mail-1").await;
@@ -422,13 +486,8 @@ async fn lookup_failure_is_skipped_and_the_batch_is_still_persisted() {
         store.uid_for(store.mailbox_id(account, "list-a"), "mail-list", "mail-1"),
         Some(1)
     );
-    assert_eq!(
-        store
-            .last_batches_for(account)
-            .get("group-1")
-            .map(String::as_str),
-        Some("batch-1")
-    );
+    // The failed batch left no marker behind.
+    assert!(store.last_batches_for(account).is_empty());
 }
 
 #[tokio::test]

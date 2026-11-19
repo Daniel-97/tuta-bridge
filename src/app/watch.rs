@@ -1,16 +1,20 @@
 //! Long-running Tuta event-bus watcher, and the `serve` command that
 //! hosts it next to the IMAP listener.
 //!
-//! [`WatchUseCase`] resumes the stored session, reconciles the local index
-//! with a baseline (re)sync, and then consumes the event bus until it is
-//! stopped. Network failures — including connects that hang until the
-//! connect timeout — reconnect with a capped backoff; every other error is
-//! fatal because it needs the user to act. A run of batches whose entity
-//! lookups fail resyncs the index, exactly like an expired marker. The
-//! output is fixed text and counters only: ids, tokens, subjects,
-//! addresses, and URLs never appear in it. An optional notifier
-//! additionally broadcasts local mailbox ids — nothing else — after
-//! each applied batch and after each resync.
+//! [`WatchUseCase`] resumes the stored session, brings the local index up
+//! to date with a sync when the stored batch markers cannot do it, and
+//! then consumes the event bus until it is stopped. Network failures —
+//! a failed sync, connects that hang until the connect timeout, a
+//! dropped stream — retry with a capped backoff; every other error is
+//! fatal because it needs the user to act. A batch whose entity lookups
+//! fail is retried without moving its marker, and when it keeps failing
+//! the index is synced instead. That sync is the ordinary
+//! non-destructive one: the watch loop never resets the index, so UIDs
+//! and UIDVALIDITY survive every recovery. The output is fixed text and
+//! counters only: ids, tokens, subjects, addresses, and URLs never
+//! appear in it. An optional notifier additionally broadcasts local
+//! mailbox ids — nothing else — after each applied batch and after each
+//! sync.
 //!
 //! [`ServeUseCase`] runs that watch loop as a task next to a TLS-only
 //! loopback IMAP listener that answers from the same state store. One
@@ -23,7 +27,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,14 +38,19 @@ use crate::adapters::imap::backend::TutaImapBackend;
 use crate::adapters::imap::server::{ensure_certificate, tls_acceptor};
 use crate::adapters::imap::session::run_session;
 use crate::adapters::mime::MimeRenderer;
-use crate::adapters::tuta::generated_id::{batch_is_expired, timestamp_to_generated_id};
+use crate::adapters::sqlite_state::STATE_BUSY_MESSAGE;
+use crate::adapters::tuta::generated_id::{
+    batch_is_expired, generated_id_timestamp, timestamp_to_generated_id,
+};
 use crate::app::enrich::EnvelopeEnricher;
-use crate::app::event_sync::EventProcessor;
-use crate::app::state_sync::{current_uidvalidity, next_uidvalidity, resync_with, sync_with};
+use crate::app::event_sync::{EventProcessor, EventReport};
+use crate::app::state_sync::{current_uidvalidity, sync_with};
+use crate::app::sync::SyncReport;
 use crate::config::{resolve_imap_port, validate_imap_port, Config};
-use crate::domain::{AccountId, Error, EventFrame, Result};
+use crate::domain::{AccountId, Error, EventBatch, EventFrame, Result};
 use crate::ports::clock::Clock;
 use crate::ports::credentials::CredentialStore;
+use crate::ports::event_lookup::EventLookup;
 use crate::ports::imap_backend::ImapBackend;
 use crate::ports::local_password::LocalPasswordStore;
 use crate::ports::mailbox_events::{MailboxChanged, MailboxEventSender};
@@ -59,8 +68,8 @@ pub struct BackoffPolicy {
 /// Production bound on one event-bus connect attempt.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Production consecutive-batch count of lookup failures before the
-/// index is reset and resynced.
+/// Production number of attempts at applying one event batch before the
+/// index is synced instead.
 pub const LOOKUP_FAILURE_THRESHOLD: usize = 10;
 
 impl BackoffPolicy {
@@ -86,7 +95,9 @@ impl BackoffPolicy {
 /// Whether an error must end the watch loop.
 ///
 /// Only network errors are retried; authentication, storage, and
-/// configuration errors need the user to act, so they are fatal.
+/// configuration errors need the user to act, so they are fatal. The one
+/// storage error with a retry of its own is a momentarily locked state
+/// database while a batch is applied.
 pub fn is_fatal(error: &Error) -> bool {
     !matches!(error, Error::Network(_))
 }
@@ -102,11 +113,12 @@ pub struct WatchUseCase {
     /// How long one `events` connect may hang before it is abandoned
     /// and retried like a dropped connection.
     pub connect_timeout: Duration,
-    /// Consecutive batches with failed lookups before the index is
-    /// reset and resynced; unreadable or unhandled events never count.
+    /// Attempts at applying one batch whose entity lookups fail before
+    /// the index is synced instead; unreadable or unhandled events
+    /// never count as failures.
     pub lookup_failure_threshold: usize,
     /// Broadcasts one [`MailboxChanged`] per mailbox each applied batch
-    /// touched, and one per current mailbox after a resync. `None` — the
+    /// touched, and one per current mailbox after a sync. `None` — the
     /// default — publishes nothing; send errors from a closed channel
     /// are ignored because they only mean nobody idles.
     pub notifier: Option<MailboxEventSender>,
@@ -132,6 +144,13 @@ impl WatchUseCase {
     }
 
     /// Watch until `stop` resolves.
+    ///
+    /// `stop` is raced against every wait of the loop — the index sync,
+    /// the connect, each frame read, the application of a batch
+    /// including its retries, and every backoff sleep — so it takes
+    /// effect promptly wherever the loop is. Abandoning a step is safe:
+    /// a batch is written in one transaction together with its marker,
+    /// and an interrupted sync is simply repeated by the next one.
     pub async fn run_until<F>(&self, stop: F) -> Result<()>
     where
         F: Future<Output = ()>,
@@ -152,51 +171,70 @@ impl WatchUseCase {
             return Err(Error::Network("no event groups".into()));
         }
 
-        // 3. Baseline, then the UIDVALIDITY stamped on event folders.
-        let mut batches = self.baseline(session.as_ref(), account_id, &groups).await?;
-        let max_stored = self
-            .state
-            .mailboxes(account_id)
-            .await?
-            .into_iter()
-            .map(|mailbox| mailbox.uidvalidity)
-            .max();
-        let event_uidvalidity = next_uidvalidity(max_stored, current_uidvalidity())?;
+        // 3. The stored markers, and whether the index must be synced
+        //    before the stream can be trusted to bring it up to date.
+        let (mut batches, mut needs_sync) = self.stored_markers(account_id, &groups).await?;
 
-        // 4. Reconnect loop: network errors retry, everything else is fatal.
+        // 4. Sync-and-reconnect loop: network errors retry with the
+        //    backoff, everything else is fatal.
         let processor = EventProcessor::new(Arc::clone(&self.state));
         let mut stop = pin!(stop);
         let mut attempt: u32 = 0;
-        // Consecutive batches with failed lookups; a long enough run
-        // triggers the resync valve below.
-        let mut failing_batches: usize = 0;
         loop {
+            // The index sync runs first whenever events alone cannot be
+            // trusted: at startup without usable markers, and after a
+            // batch that could not be applied. It never resets anything,
+            // so every UID and UIDVALIDITY survives it. A network
+            // failure leaves the markers alone and comes back here
+            // after the backoff.
+            if needs_sync {
+                let recovery = self.recover(session.as_ref(), account_id, &groups);
+                let Some(recovered) = unless_stopped(&mut stop, recovery).await else {
+                    return Ok(());
+                };
+                match recovered {
+                    Ok(markers) => {
+                        batches = markers;
+                        needs_sync = false;
+                    }
+                    Err(e) if is_fatal(&e) => return Err(e),
+                    Err(_) => {
+                        attempt += 1;
+                        let delay = self.backoff.delay_ms(attempt);
+                        println!("index sync failed; retrying in {delay} ms");
+                        let sleep = tokio::time::sleep(Duration::from_millis(delay));
+                        if unless_stopped(&mut stop, sleep).await.is_none() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // A failed or hung connect is retried like a dropped
             // connection: it shares the backoff below with frame errors.
             // The timeout bounds how long one connect may stall the
-            // loop, and the stop future stays responsive while it runs.
-            let connected = tokio::select! {
-                biased;
-                connected = tokio::time::timeout(
-                    self.connect_timeout,
-                    session.events(&batches, self.clock.now_ms()),
-                ) => match connected {
-                    Ok(Ok(handles)) => Some(handles),
-                    Ok(Err(e)) if is_fatal(&e) => return Err(e),
-                    // A network error or a timed-out connect is retried
-                    // on a fresh connection.
-                    Ok(Err(_)) | Err(_) => None,
-                },
-                () = &mut stop => return Ok(()),
+            // loop.
+            let connected_ms = self.clock.now_ms();
+            let connect =
+                tokio::time::timeout(self.connect_timeout, session.events(&batches, connected_ms));
+            let Some(connected) = unless_stopped(&mut stop, connect).await else {
+                return Ok(());
+            };
+            let handles = match connected {
+                Ok(Ok(handles)) => Some(handles),
+                Ok(Err(e)) if is_fatal(&e) => return Err(e),
+                // A network error or a timed-out connect is retried
+                // on a fresh connection.
+                Ok(Err(_)) | Err(_) => None,
             };
 
-            if let Some(handles) = connected {
+            if let Some(handles) = handles {
                 let lookup = handles.lookup;
                 let mut stream = handles.stream;
                 loop {
-                    let frame = tokio::select! {
-                        () = &mut stop => return Ok(()),
-                        frame = stream.next_frame() => frame,
+                    let Some(frame) = unless_stopped(&mut stop, stream.next_frame()).await else {
+                        return Ok(());
                     };
                     let frame = match frame {
                         Ok(frame) => frame,
@@ -208,9 +246,25 @@ impl WatchUseCase {
                     attempt = 0;
                     match frame {
                         EventFrame::Batch(batch) => {
-                            let report = processor
-                                .apply(account_id, lookup.as_ref(), event_uidvalidity, &batch)
-                                .await?;
+                            let applying = self.apply_with_retries(
+                                &processor,
+                                account_id,
+                                lookup.as_ref(),
+                                &batch,
+                            );
+                            let Some(applied) = unless_stopped(&mut stop, applying).await else {
+                                return Ok(());
+                            };
+                            let Some(report) = applied? else {
+                                // The batch kept failing. Its marker
+                                // never moved, so nothing is lost yet:
+                                // the sync at the top of the loop reads
+                                // the current state instead and resumes
+                                // the stream after it.
+                                println!("event batch could not be applied; syncing the index");
+                                needs_sync = true;
+                                break;
+                            };
                             batches.insert(batch.owner_group_id.clone(), batch.batch_id.clone());
                             if report.changes > 0 {
                                 println!("applied {} changes", report.changes);
@@ -223,132 +277,92 @@ impl WatchUseCase {
                                     let _ = notifier.send(MailboxChanged(*mailbox));
                                 }
                             }
-                            // A run of batches whose lookups failed has
-                            // silently skipped events, so the index may
-                            // have desynced. After enough consecutive
-                            // ones the account is reset, resynced, and
-                            // the markers re-stamped — the same path an
-                            // expired marker takes — and the stream
-                            // continues on the fresh state.
-                            if report.lookup_failures > 0 {
-                                failing_batches += 1;
-                                if failing_batches >= self.lookup_failure_threshold {
-                                    batches = self
-                                        .resync_and_remark(
-                                            session.as_ref(),
-                                            account_id,
-                                            &groups,
-                                            self.clock.now_ms(),
-                                        )
-                                        .await?;
-                                    println!("event lookups failed repeatedly; index resynced");
-                                    failing_batches = 0;
-                                }
-                            } else {
-                                failing_batches = 0;
-                            }
                         }
-                        EventFrame::InitialSyncDone => println!("event stream caught up"),
+                        EventFrame::InitialSyncDone => {
+                            println!("event stream caught up");
+                            self.refresh_quiet_markers(
+                                account_id,
+                                &groups,
+                                &mut batches,
+                                connected_ms,
+                            )
+                            .await?;
+                        }
                         EventFrame::Ignored => continue,
                     }
                 }
             }
 
+            if needs_sync {
+                // The sync replaces the failed batch right away.
+                continue;
+            }
             attempt += 1;
             let delay = self.backoff.delay_ms(attempt);
             println!("event stream lost; retrying in {delay} ms");
-            tokio::select! {
-                () = &mut stop => return Ok(()),
-                () = tokio::time::sleep(Duration::from_millis(delay)) => {}
+            let sleep = tokio::time::sleep(Duration::from_millis(delay));
+            if unless_stopped(&mut stop, sleep).await.is_none() {
+                return Ok(());
             }
         }
     }
 
-    /// Reconcile the index with a baseline (re)sync and return the batch
-    /// markers to resume from.
+    /// Load the stored batch markers and decide whether the index needs
+    /// a sync before events are consumed.
     ///
-    /// An expired marker can no longer be replayed by the server, so the
-    /// account is reset and resynced through [`Self::resync_and_remark`];
-    /// that sync already ran, so no ordinary sync follows it. A missing
-    /// marker — or a still-empty index — runs the ordinary sync instead.
-    /// Groups still without a marker afterwards resume from five seconds
-    /// ago, and the stamp is persisted so a restart does not replay from
-    /// the beginning.
-    async fn baseline(
+    /// It does when the index is still empty, when a group has no marker
+    /// yet, or when a marker is older than the server's replay window:
+    /// in each case the events since the stored state cannot be replayed
+    /// in full. Only replayable markers are returned.
+    async fn stored_markers(
         &self,
-        session: &dyn Session,
         account_id: i64,
         groups: &[String],
-    ) -> Result<HashMap<String, String>> {
+    ) -> Result<(HashMap<String, String>, bool)> {
         let now_ms = self.clock.now_ms();
-        let mailboxes = self.state.mailboxes(account_id).await?;
-
+        let mut needs_sync = self.state.mailboxes(account_id).await?.is_empty();
         let mut batches: HashMap<String, String> = HashMap::new();
-        let mut missing = false;
-        let mut expired = false;
         for group in groups {
             match self.state.last_batch(account_id, group).await? {
-                Some(marker) if batch_is_expired(&marker, now_ms) => expired = true,
-                Some(marker) => {
+                Some(marker) if !batch_is_expired(&marker, now_ms) => {
                     batches.insert(group.clone(), marker);
                 }
-                None => missing = true,
+                _ => needs_sync = true,
             }
         }
-
-        if expired {
-            batches = self
-                .resync_and_remark(session, account_id, groups, now_ms)
-                .await?;
-        } else if mailboxes.is_empty() || missing {
-            sync_with(
-                Arc::clone(&self.state),
-                session.mail(),
-                account_id,
-                current_uidvalidity(),
-            )
-            .await?;
-        }
-
-        let resume_id = timestamp_to_generated_id((now_ms - 5_000).max(0));
-        for group in groups {
-            if batches.contains_key(group) {
-                continue;
-            }
-            self.state
-                .set_last_batch(account_id, group, &resume_id)
-                .await?;
-            batches.insert(group.clone(), resume_id.clone());
-        }
-
-        Ok(batches)
+        Ok((batches, needs_sync))
     }
 
-    /// Reset the account, resync it, and re-stamp every group's resume
-    /// marker; returns the fresh markers.
+    /// Bring the index up to date with a sync and return fresh markers.
     ///
-    /// Shared by the expired-marker path in [`Self::baseline`] and the
-    /// lookup-failure valve in [`Self::run_until`]: both mean the stored
-    /// index can no longer be brought up to date by events alone, so it
-    /// is rebuilt and the stream resumes from five seconds before
-    /// `now_ms`.
-    async fn resync_and_remark(
+    /// This is the one recovery path for an index that events alone
+    /// cannot repair: no usable marker at startup, or a batch that could
+    /// not be applied. The sync is the ordinary non-destructive one —
+    /// known mail keeps its UID and no UIDVALIDITY changes — so IMAP
+    /// clients keep their caches.
+    ///
+    /// The resume stamp is taken five seconds before the sync starts and
+    /// written for every group only after it succeeded: events that
+    /// arrive while it runs postdate the stamp and are replayed, and a
+    /// failed sync leaves the old markers in place. Stamping every group
+    /// is safe because the sync has just read the complete mail state
+    /// and events of other applications are skipped anyway.
+    async fn recover(
         &self,
         session: &dyn Session,
         account_id: i64,
         groups: &[String],
-        now_ms: i64,
     ) -> Result<HashMap<String, String>> {
-        // `resync_with` resets the account and syncs it again, so the
-        // stored markers are gone together with the rest of the state.
-        resync_with(
+        let resume_id = timestamp_to_generated_id((self.clock.now_ms() - 5_000).max(0));
+        let report = sync_with(
             Arc::clone(&self.state),
             session.mail(),
             account_id,
             current_uidvalidity(),
         )
         .await?;
-        let resume_id = timestamp_to_generated_id((now_ms - 5_000).max(0));
+        print_sync_report(&report);
+
         let mut batches = HashMap::new();
         for group in groups {
             self.state
@@ -356,10 +370,10 @@ impl WatchUseCase {
                 .await?;
             batches.insert(group.clone(), resume_id.clone());
         }
-        // A resync never goes through `apply_batch`, so every current
+        // A sync never goes through `apply_batch`, so every current
         // mailbox is announced here: idling sessions must re-examine
-        // UIDVALIDITY and their cached views. A closed channel only
-        // means nobody idles, so send errors are ignored.
+        // their cached views. A closed channel only means nobody idles,
+        // so send errors are ignored.
         if let Some(notifier) = &self.notifier {
             for mailbox in self.state.mailboxes(account_id).await? {
                 let _ = notifier.send(MailboxChanged(mailbox.id));
@@ -367,6 +381,115 @@ impl WatchUseCase {
         }
         Ok(batches)
     }
+
+    /// Apply one batch, retrying it in place while it cannot be applied.
+    ///
+    /// A batch whose entity lookup failed is not persisted and its
+    /// marker does not move, so the same batch is tried again after the
+    /// backoff delay, up to `lookup_failure_threshold` attempts in all;
+    /// `Ok(None)` then tells the caller to fall back to the index sync.
+    /// A state database that is momentarily locked by another process is
+    /// retried the same way, but if it stays locked the error is
+    /// returned: a sync could not write either. Every other error is
+    /// returned at once.
+    async fn apply_with_retries(
+        &self,
+        processor: &EventProcessor,
+        account_id: i64,
+        lookup: &dyn EventLookup,
+        batch: &EventBatch,
+    ) -> Result<Option<EventReport>> {
+        let mut failures: usize = 0;
+        loop {
+            let applied = processor
+                .apply(account_id, lookup, current_uidvalidity(), batch)
+                .await;
+            let busy = match applied {
+                Ok(report) if report.lookup_failures == 0 => return Ok(Some(report)),
+                Ok(_) => None,
+                Err(Error::Storage(message)) if message == STATE_BUSY_MESSAGE => {
+                    Some(Error::Storage(message))
+                }
+                Err(e) => return Err(e),
+            };
+            failures += 1;
+            if failures >= self.lookup_failure_threshold {
+                return match busy {
+                    Some(error) => Err(error),
+                    None => Ok(None),
+                };
+            }
+            let delay = self
+                .backoff
+                .delay_ms(u32::try_from(failures).unwrap_or(u32::MAX));
+            println!("event batch not applied; retrying in {delay} ms");
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+    }
+
+    /// Move the markers of groups without recent events up to the
+    /// moment this connection was opened.
+    ///
+    /// A marker only advances when a batch of its group is applied, so a
+    /// group that never has events would keep its first stamp until it
+    /// fell out of the server's replay window and forced a sync at the
+    /// next start. The server announces `initialSyncDone` once it has
+    /// replayed everything the markers of this connection were missing,
+    /// so at that point no group has an unprocessed batch older than
+    /// the connect: markers older than five seconds before it are
+    /// re-stamped to that instant. Markers that are newer, or that do
+    /// not decode as generated ids, are left alone.
+    async fn refresh_quiet_markers(
+        &self,
+        account_id: i64,
+        groups: &[String],
+        batches: &mut HashMap<String, String>,
+        connected_ms: i64,
+    ) -> Result<()> {
+        let floor_ms = (connected_ms - 5_000).max(0);
+        let floor_id = timestamp_to_generated_id(floor_ms);
+        for group in groups {
+            let quiet = batches
+                .get(group)
+                .and_then(|marker| generated_id_timestamp(marker))
+                .is_some_and(|stamped_ms| stamped_ms < floor_ms);
+            if quiet {
+                self.state
+                    .set_last_batch(account_id, group, &floor_id)
+                    .await?;
+                batches.insert(group.clone(), floor_id.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run `work` to completion unless `stop` resolves first.
+///
+/// `None` means the stop won and `work` was dropped where it stood; the
+/// caller must return without polling `stop` again.
+async fn unless_stopped<S, W>(stop: &mut Pin<&mut S>, work: W) -> Option<W::Output>
+where
+    S: Future<Output = ()>,
+    W: Future,
+{
+    tokio::select! {
+        biased;
+        output = work => Some(output),
+        () = stop.as_mut() => None,
+    }
+}
+
+/// Print the counters of an index sync; counts only, never mail data.
+fn print_sync_report(report: &SyncReport) {
+    println!(
+        "index synced: {} folders, {} messages, {} removed, {} messages skipped, {} folders skipped",
+        report.folders,
+        report.messages,
+        report.removed,
+        report.skipped_messages,
+        report.skipped_folders
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +497,7 @@ impl WatchUseCase {
 // ---------------------------------------------------------------------------
 
 /// Capacity of the mailbox-change broadcast: one event per touched
-/// mailbox per batch, plus one per mailbox after a resync. A consumer
+/// mailbox per batch, plus one per mailbox after a sync. A consumer
 /// that falls behind treats the lag as "everything changed", so the
 /// exact size only bounds buffer memory.
 const NOTIFIER_CAPACITY: usize = 256;
@@ -400,8 +523,8 @@ pub struct ServeUseCase {
     /// How long one watch `events` connect may hang before it is
     /// abandoned and retried like a dropped connection.
     pub connect_timeout: Duration,
-    /// Consecutive watch batches with failed lookups before the index
-    /// is reset and resynced.
+    /// Attempts at applying one watch batch whose lookups fail before
+    /// the index is synced instead.
     pub lookup_failure_threshold: usize,
 }
 
