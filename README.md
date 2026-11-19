@@ -6,7 +6,7 @@ Status: M0–M5 complete for a single account (login, status/logout, dump, minim
 
 ## Credentials
 
-- Credentials are stored only in the system Secret Service (service name `tuta-bridge`, username = mail address). There is no file fallback.
+- Credentials are stored only in the system keyring — the Secret Service on Linux, the Keychain on macOS, the Credential Manager on Windows (service name `tuta-bridge`, username = mail address). There is no file fallback.
 - The password and TOTP code are never accepted from command-line arguments or environment variables.
 
 ## State and sync
@@ -128,7 +128,8 @@ Port 9930
 User <the Tuta address>
 TLSType IMAPS
 CertificateFile ~/.local/share/tuta-bridge/imap-cert.pem
-# Read the password from the Secret Service instead of storing it:
+# Read the password from the Secret Service instead of storing it
+# (on macOS: "security find-generic-password -s tuta-bridge -a imap-bridge -w"):
 PassCmd "secret-tool lookup service tuta-bridge username imap-bridge"
 
 IMAPStore tuta-bridge-remote

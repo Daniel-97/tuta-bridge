@@ -20,6 +20,7 @@
 
 - `keyring` 3.x has no default features. Without a platform feature it falls back to the in-memory `mock` store, which does not persist.
 - The crate enables `async-secret-service`, `async-io` and `crypto-rust` so that on Linux it uses the Secret Service via zbus, with an encrypted DH session and without a system libdbus dependency.
+- `apple-native` and `windows-native` are enabled too, so macOS uses the Keychain and Windows the Credential Manager instead of the mock store. The features only pull platform-gated dependencies, so the Linux build is unchanged. Only the Linux backend has been exercised against a real account.
 - Service `tuta-bridge` in production, username = mail address. Credentials are stored as JSON in the password field.
 - Ignored test `keyring_store::tests::keyring_roundtrip`: run manually with `cargo test --lib adapters::keyring_store -- --ignored`. Result on 2026-11-15 (GNOME keyring, login collection unlocked): passed.
 

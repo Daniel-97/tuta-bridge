@@ -91,7 +91,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Secret Service; run manually"]
+    #[ignore = "requires the system keyring; run manually"]
     async fn keyring_password_roundtrip() {
         let store = KeyringPasswordStore;
         store

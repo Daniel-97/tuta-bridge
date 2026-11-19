@@ -11,7 +11,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signa
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 rpassword = "7"
-keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust", "apple-native", "windows-native"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
