@@ -21,6 +21,40 @@ pub trait StateStore: Send + Sync {
     ) -> Result<MailboxId>;
     async fn mailboxes(&self, account_id: i64) -> Result<Vec<StoredMailbox>>;
     async fn assign_uid(&self, mailbox: MailboxId, header: &MessageHeader) -> Result<u32>;
+    /// Store one folder's header page as a unit and return how many
+    /// stored messages it removed.
+    ///
+    /// Every header keeps its UID or is assigned the next one, in the
+    /// order given. With `reconcile`, stored messages of the mailbox that
+    /// are absent from `headers` are removed; pass it only for a complete
+    /// page. Adapters with transactions run the whole page in one, so a
+    /// failure leaves the mailbox as it was; this default applies the
+    /// same steps one call at a time.
+    async fn store_page(
+        &self,
+        mailbox: MailboxId,
+        headers: &[MessageHeader],
+        reconcile: bool,
+    ) -> Result<usize> {
+        for header in headers {
+            self.assign_uid(mailbox, header).await?;
+        }
+        if !reconcile {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for stored in self.messages(mailbox).await? {
+            let fetched = headers.iter().any(|header| {
+                header.list_id == stored.header.list_id
+                    && header.element_id == stored.header.element_id
+            });
+            if !fetched {
+                self.remove_message(mailbox, stored.uid).await?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
     /// Apply every change and record `batch_id` in one transaction.
     ///
     /// The outcome lists every mailbox whose rows the transaction

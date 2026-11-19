@@ -82,24 +82,13 @@ impl SyncEngine {
                     .then_with(|| a.element_id.cmp(&b.element_id))
             });
 
-            let mut fetched = HashSet::with_capacity(headers.len());
-            for header in &headers {
-                self.store.assign_uid(mailbox, header).await?;
-                messages += 1;
-                fetched.insert((header.list_id.clone(), header.element_id.clone()));
-            }
-
             // A page with skipped mails or a follow-up page is incomplete: its
             // absence is not evidence that a stored mail was deleted.
-            if page.skipped == 0 && page.next_start.is_none() {
-                for stored in self.store.messages(mailbox).await? {
-                    let key = (stored.header.list_id, stored.header.element_id);
-                    if !fetched.contains(&key) {
-                        self.store.remove_message(mailbox, stored.uid).await?;
-                        removed += 1;
-                    }
-                }
-            }
+            let complete = page.skipped == 0 && page.next_start.is_none();
+            // The whole page is stored as one unit, so a folder costs one
+            // transaction rather than one per message.
+            removed += self.store.store_page(mailbox, &headers, complete).await?;
+            messages += headers.len();
         }
 
         // Folders absent from a successful source listing were deleted on the

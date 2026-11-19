@@ -70,9 +70,7 @@ impl StateSyncUseCase {
 /// Open the SQLite state store at the platform data path.
 pub async fn open_state_store() -> Result<Arc<dyn StateStore>> {
     let path = state_path().map_err(|e| Error::Config(e.to_string()))?;
-    let store = SqliteStateStore::open(&path)
-        .await
-        .map_err(open_error)?;
+    let store = SqliteStateStore::open(&path).await.map_err(open_error)?;
     Ok(Arc::new(store))
 }
 

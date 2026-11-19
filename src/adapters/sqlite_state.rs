@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,7 +20,7 @@ use crate::ports::StateStore;
 /// Opening migrates an older database forward inside one transaction and
 /// refuses a newer one: a binary that does not know a later schema must
 /// not write to it.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The database carries a schema version newer than [`SCHEMA_VERSION`].
 #[derive(Debug, thiserror::Error)]
@@ -464,6 +465,11 @@ async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
             sqlx::query(statement).execute(&mut *transaction).await?;
         }
     }
+    if version < 5 {
+        sqlx::query(MESSAGES_BY_ELEMENT_INDEX_SQL)
+            .execute(&mut *transaction)
+            .await?;
+    }
 
     // The caller switched foreign keys off for the table rebuild; nothing
     // may commit with a dangling reference.
@@ -510,6 +516,15 @@ const MAILBOX_AUTOINCREMENT_STATEMENTS: &[&str] = &[
     "DROP TABLE mailboxes",
     "ALTER TABLE mailboxes_rebuilt RENAME TO mailboxes",
 ];
+
+/// v5 migration: index messages by Tuta element id.
+///
+/// Every mail event removes placements by element id across the
+/// account's mailboxes. The table's own indexes lead with the mailbox
+/// and the list id, so without this one each removal scanned every
+/// stored message of the account.
+const MESSAGES_BY_ELEMENT_INDEX_SQL: &str =
+    "CREATE INDEX messages_by_element ON messages (tuta_element_id, mailbox_id)";
 
 /// v4 migration: a per-account UIDVALIDITY high-water mark.
 ///
@@ -615,6 +630,11 @@ FROM messages WHERE mailbox_id = ? AND uid = ?";
 
 const SET_MIME_STRUCTURE_SQL: &str = "\
 UPDATE messages SET mime_structure = ? WHERE mailbox_id = ? AND uid = ?";
+
+const LIST_MESSAGE_KEYS_SQL: &str =
+    "SELECT uid, tuta_list_id, tuta_element_id FROM messages WHERE mailbox_id = ?";
+
+const DELETE_MESSAGE_SQL: &str = "DELETE FROM messages WHERE mailbox_id = ? AND uid = ?";
 
 const SELECT_LAST_BATCH_SQL: &str =
     "SELECT last_batch_id FROM sync_state WHERE account_id = ? AND group_id = ?";
@@ -951,6 +971,49 @@ impl StateStore for SqliteStateStore {
         Ok(uid)
     }
 
+    async fn store_page(
+        &self,
+        mailbox: MailboxId,
+        headers: &[MessageHeader],
+        reconcile: bool,
+    ) -> Result<usize> {
+        // One transaction per page: a folder costs one commit instead of
+        // one per message, and a failure leaves the mailbox untouched.
+        let mut transaction = self.begin_write().await?;
+        for header in headers {
+            self.assign_uid_in(&mut transaction, mailbox, header)
+                .await?;
+        }
+
+        let mut removed = 0;
+        if reconcile {
+            let fetched: HashSet<(&str, &str)> = headers
+                .iter()
+                .map(|header| (header.list_id.as_str(), header.element_id.as_str()))
+                .collect();
+            let stored: Vec<(i64, String, String)> = sqlx::query_as(LIST_MESSAGE_KEYS_SQL)
+                .bind(mailbox.0)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            for (uid, list_id, element_id) in stored {
+                if fetched.contains(&(list_id.as_str(), element_id.as_str())) {
+                    continue;
+                }
+                sqlx::query(DELETE_MESSAGE_SQL)
+                    .bind(mailbox.0)
+                    .bind(uid)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+                removed += 1;
+            }
+        }
+
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(removed)
+    }
+
     async fn apply_batch(
         &self,
         account_id: i64,
@@ -1110,7 +1173,7 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn remove_message(&self, mailbox: MailboxId, uid: u32) -> Result<()> {
-        sqlx::query("DELETE FROM messages WHERE mailbox_id = ? AND uid = ?")
+        sqlx::query(DELETE_MESSAGE_SQL)
             .bind(mailbox.0)
             .bind(i64::from(uid))
             .execute(&self.pool)
@@ -2006,6 +2069,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_page_assigns_reconciles_and_reports_removals() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (account, mailbox) = account_and_mailbox(&store).await;
+        let first = [header("mail", "e1"), header("mail", "e2")];
+        assert_eq!(store.store_page(mailbox, &first, true).await.unwrap(), 0);
+
+        // e1 is gone from the next complete page and e3 is new: e2 keeps
+        // its UID, e3 gets the next one, and e1's UID is not reused.
+        let second = [header("mail", "e2"), header("mail", "e3")];
+        assert_eq!(store.store_page(mailbox, &second, true).await.unwrap(), 1);
+        let stored: Vec<(u32, String)> = store
+            .messages(mailbox)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| (message.uid, message.header.element_id))
+            .collect();
+        assert_eq!(stored, vec![(2, "e2".to_string()), (3, "e3".to_string())]);
+
+        // An incomplete page removes nothing.
+        let partial = [header("mail", "e3")];
+        assert_eq!(store.store_page(mailbox, &partial, false).await.unwrap(), 0);
+        assert_eq!(store.messages(mailbox).await.unwrap().len(), 2);
+        assert_eq!(store.mailboxes(account).await.unwrap()[0].next_uid, 4);
+    }
+
+    #[tokio::test]
+    async fn store_page_is_all_or_nothing() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let (account, mailbox) = account_and_mailbox(&store).await;
+        store
+            .store_page(mailbox, &[header("mail", "e1")], true)
+            .await
+            .unwrap();
+        // The second new message of the page fails to insert.
+        sqlx::query(
+            "CREATE TRIGGER fail_one_insert BEFORE INSERT ON messages
+             WHEN NEW.tuta_element_id = 'e3'
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let page = [header("mail", "e2"), header("mail", "e3")];
+        assert!(store.store_page(mailbox, &page, true).await.is_err());
+
+        // Neither the first insert nor the removal of e1 was kept.
+        let stored = store.messages(mailbox).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].header.element_id, "e1");
+        assert_eq!(store.mailboxes(account).await.unwrap()[0].next_uid, 2);
+    }
+
+    #[tokio::test]
+    async fn element_removals_use_the_element_index() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        for sql in [DELETE_ELEMENT_HEADERS_SQL, SELECT_ELEMENT_MAILBOXES_SQL] {
+            let plan: Vec<String> = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .bind("e1")
+                .bind(1_i64)
+                .fetch_all(store.pool())
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter().any(|step| step.contains("messages_by_element")),
+                "expected the element index in {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn messages_roundtrip_headers_without_content() {
         let store = SqliteStateStore::open_in_memory().await.unwrap();
         let (_, mailbox) = account_and_mailbox(&store).await;
@@ -2315,10 +2453,18 @@ mod tests {
             })
             .collect();
         assert_eq!(seen, vec![(1, "Inbox", 100, 8), (2, "Work", 100, 4)]);
-        let first = store.message_by_uid(MailboxId(1), 7).await.unwrap().unwrap();
+        let first = store
+            .message_by_uid(MailboxId(1), 7)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(first.header.element_id, "e1");
         assert_eq!(first.mime_structure.as_deref(), Some("structure"));
-        let second = store.message_by_uid(MailboxId(2), 3).await.unwrap().unwrap();
+        let second = store
+            .message_by_uid(MailboxId(2), 3)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(second.header.element_id, "e2");
         assert_eq!(
             store.last_batch(1, "group1").await.unwrap().as_deref(),
