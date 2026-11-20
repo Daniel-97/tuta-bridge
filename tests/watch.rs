@@ -98,6 +98,7 @@ fn temp_config() -> (tempfile::TempDir, PathBuf) {
         imap_port: None,
         pop3_port: None,
         smtp_port: None,
+        caldav_port: None,
     }
     .save(&path)
     .unwrap();
@@ -153,6 +154,7 @@ fn use_case(
         connect_timeout: Duration::from_secs(5),
         lookup_failure_threshold: 10,
         notifier: None,
+        calendar: None,
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod caldav;
 pub mod cli;
 pub mod dav;
 pub mod imap;
@@ -6,6 +7,7 @@ pub mod mime;
 pub mod password_store;
 pub mod pop3;
 pub mod smtp;
+pub mod sqlite_calendar;
 pub mod sqlite_state;
 pub mod stall;
 pub mod terminal_prompt;

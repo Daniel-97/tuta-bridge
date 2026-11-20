@@ -283,6 +283,106 @@ pop3_port = 9950
   `fetchmail --keep`). POP3 has no folders, flags, push, or server-side
   search; use IMAP for those.
 
+## CalDAV server (optional)
+
+`serve` can also publish your Tuta calendars, read-only, over CalDAV
+(HTTPS) so Thunderbird and other calendar clients can show them. It is
+off unless the config file names a port:
+
+```toml
+caldav_port = 9933
+```
+
+`serve` then prints `serving CalDAV on https://127.0.0.1:9933/
+(read-only)`. Same listener rules as IMAP: `127.0.0.1` only, the same
+self-signed certificate, the same bridge password (HTTP Basic over
+TLS), the same failed-login delay shared with IMAP/POP3/SMTP. A port
+another process holds stops `serve` with exit code 10.
+
+### Thunderbird
+
+1. Accept the self-signed certificate once. The calendar dialog cannot
+   show the exception prompt, so add it by hand: *Settings → Privacy &
+   Security → Certificates → Manage Certificates → Servers → Add
+   Exception…*, enter `https://127.0.0.1:9933/`, *Get Certificate*,
+   *Confirm Security Exception* (keep "Permanently store" checked).
+2. *New Calendar → On the Network*. Username: the Tuta address of the
+   logged-in account. Location: `https://127.0.0.1:9933/`. Leave "This
+   location doesn't require credentials" unchecked.
+3. *Find Calendars*, enter the bridge password when asked, and
+   subscribe to the calendars you want. Each Tuta calendar is its own
+   collection, with its Tuta name and colour. The server advertises
+   read access only, and every write is refused.
+
+### URL layout
+
+| URL | What |
+|---|---|
+| `/`, `/caldav/` | entry points; name the principal and the home set |
+| `/.well-known/caldav` | redirects to the principal |
+| `/caldav/principal/` | the account's principal |
+| `/caldav/calendars/` | the calendar home set |
+| `/caldav/calendars/<calendar>/` | one Tuta calendar |
+| `/caldav/calendars/<calendar>/<event>.ics` | one event (with its moved occurrences) |
+
+`<calendar>` is the Tuta calendar id, `<event>` a hash of the event's
+UID. Tuta's birthday calendar is not served: Tuta builds it in the
+client from your contacts, it is not a calendar on the server.
+
+### How events are mapped
+
+- `SUMMARY`, `DESCRIPTION`, `LOCATION`, `ORGANIZER`, `ATTENDEE` (with
+  `PARTSTAT`: accepted, declined, tentative, needs action) and the UID
+  come from the Tuta event. Tuta descriptions are HTML: `DESCRIPTION`
+  carries a plain-text version, `X-ALT-DESC` the original.
+- Reminders: your own Tuta alarms become `VALARM`s (display alarms,
+  minutes to weeks before the start), so Thunderbird rings them.
+  Other attendees' alarms are not visible to you and are not served.
+- Time zones: a single event is written in UTC — Tuta stores UTC
+  instants, so this is exact and every client shows it in its own
+  zone. All-day events are dates (`VALUE=DATE`, exclusive end). A
+  repeating event is written in the time zone its Tuta repeat rule
+  uses (`DTSTART;TZID=Europe/Berlin` plus a `VTIMEZONE`), so it keeps
+  its wall-clock time across daylight-saving changes exactly as in
+  Tuta.
+- Repeating events become an `RRULE` (daily/weekly/monthly/yearly,
+  interval, end after a count or on a date, the advanced "by
+  weekday/month day/…" options), removed occurrences `EXDATE`s, and
+  occurrences moved in Tuta are served in the same `.ics` as the
+  series (`RECURRENCE-ID`). Where Tuta and RFC 5545 disagree, the rule
+  is rewritten to match what Tuta shows: a monthly event on the 29th–31st
+  falls on the last day of shorter months, a yearly one on Feb 29 on
+  Feb 28, and "ends after N" does not count removed occurrences.
+- **Degradation.** A repeat rule that cannot be expressed in iCalendar
+  (an unknown repeat type, or a combination RFC 5545 forbids) is never
+  approximated: the event is served as its first occurrence only, its
+  description starts with *"[tuta-bridge: this event repeats in Tuta,
+  but its repeat rule cannot be expressed in iCalendar …]"*, and it
+  carries `X-TUTA-BRIDGE-RECURRENCE:UNSUPPORTED`.
+
+### Freshness
+
+On start `serve` loads every calendar and the events from two years
+back to two years ahead (every repeating event that has not ended
+yet, whatever its start), and keeps them current from the Tuta event
+stream: an event created or changed in the Tuta app is visible on
+Thunderbird's next refresh. Unchanged events keep their ETags and the
+calendar its `getctag`, so a refresh with no change transfers nothing.
+Event bodies are not stored: they are decrypted and rendered on demand.
+
+### Limits of v1
+
+- Read-only: `PUT`, `DELETE`, `PROPPATCH`, `MKCALENDAR`, … answer
+  `403`. Events are created and edited in the Tuta app.
+- Events starting more than two years in the past or in the future
+  are not served (repeating events excepted).
+- Reports: `calendar-query` (the first `time-range` of the filter is
+  applied; `expand` is ignored, clients expand rules themselves) and
+  `calendar-multiget`. No `sync-collection` (WebDAV sync): clients
+  use `getctag`/`getetag`. `Depth: infinity` is answered as `Depth: 1`.
+- No scheduling (iTIP): invitations are answered in the Tuta app.
+- No tasks (`VTODO`) — Tuta has none.
+
 ## SMTP submission (optional)
 
 `serve` can accept mail to send over SMTP submission with implicit TLS.

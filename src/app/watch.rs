@@ -34,7 +34,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::adapters::dav::DavServeLimits;
+use crate::adapters::caldav::CalDavHandler;
+use crate::adapters::dav::{serve_dav, DavServeLimits};
 use crate::adapters::imap::backend::TutaImapBackend;
 use crate::adapters::imap::server::{self, ensure_certificate, tls_acceptor, ServeLimits};
 use crate::adapters::mime::MimeRenderer;
@@ -45,6 +46,7 @@ use crate::adapters::tuta::event_wire::is_invalid_event;
 use crate::adapters::tuta::generated_id::{
     batch_is_expired, generated_id_timestamp, timestamp_to_generated_id,
 };
+use crate::app::calendar_sync::CalendarSync;
 use crate::app::enrich::EnvelopeEnricher;
 use crate::app::event_sync::{deletes_folder, EventProcessor, EventReport};
 use crate::app::state_sync::{current_uidvalidity, sync_with};
@@ -173,6 +175,11 @@ pub struct WatchUseCase {
     /// default — publishes nothing; send errors from a closed channel
     /// are ignored because they only mean nobody idles.
     pub notifier: Option<MailboxEventSender>,
+    /// The CalDAV metadata cache to keep fresh: loaded once the
+    /// session is up and after every index sync, updated from the
+    /// calendar events of each applied batch. `None` (`watch`, or
+    /// `serve` without `caldav_port`) touches no calendar.
+    pub calendar: Option<Arc<CalendarSync>>,
 }
 
 impl WatchUseCase {
@@ -233,6 +240,15 @@ impl WatchUseCase {
         //    before the stream can be trusted to bring it up to date.
         let (mut batches, mut needs_sync) = self.stored_markers(account_id, &groups).await?;
 
+        // The CalDAV cache loads its baseline now, unless the index
+        // sync below is about to (it reloads the calendars as well).
+        if !needs_sync && self.calendar.is_some() {
+            let refresh = self.refresh_calendar(None);
+            if unless_stopped(&mut stop, refresh).await.is_none() {
+                return Ok(());
+            }
+        }
+
         // 4. Sync-and-reconnect loop: network errors retry with the
         //    backoff, everything else is fatal.
         let processor = EventProcessor::new(Arc::clone(&self.state));
@@ -259,6 +275,14 @@ impl WatchUseCase {
                         needs_sync = false;
                         // The sync reconciled the folder list as well.
                         folders_stale = false;
+                        // The new markers skip every calendar event
+                        // since the old ones: reload the calendars too.
+                        if self.calendar.is_some() {
+                            let refresh = self.refresh_calendar(None);
+                            if unless_stopped(&mut stop, refresh).await.is_none() {
+                                return Ok(());
+                            }
+                        }
                     }
                     Err(e) if is_fatal(&e) => return Err(e),
                     Err(_) => {
@@ -349,6 +373,14 @@ impl WatchUseCase {
                                 break;
                             };
                             batches.insert(batch.owner_group_id.clone(), batch.batch_id.clone());
+                            // Calendar updates go to the CalDAV cache
+                            // only; IMAP hears nothing of them.
+                            if self.calendar.is_some() {
+                                let refresh = self.refresh_calendar(Some(&batch));
+                                if unless_stopped(&mut stop, refresh).await.is_none() {
+                                    return Ok(());
+                                }
+                            }
                             // Counts by kind only: no subject, address or id.
                             if !report.counts.is_empty() {
                                 println!("{}", report.counts.summary());
@@ -414,6 +446,31 @@ impl WatchUseCase {
             let sleep = tokio::time::sleep(Duration::from_millis(delay));
             if unless_stopped(&mut stop, sleep).await.is_none() {
                 return Ok(());
+            }
+        }
+    }
+
+    /// Bring the CalDAV cache up to date: a full reload without a
+    /// batch, the batch's calendar updates with one. Never fatal: a
+    /// failure leaves the cache stale and the next batch reloads it.
+    /// The output is fixed text and counters.
+    async fn refresh_calendar(&self, batch: Option<&EventBatch>) {
+        let Some(calendar) = &self.calendar else {
+            return;
+        };
+        let refreshed = match batch {
+            Some(batch) => calendar.apply(batch).await,
+            None => calendar.reload().await,
+        };
+        match refreshed {
+            Ok(report) => {
+                if let Some(line) = report.summary() {
+                    println!("{line}");
+                }
+            }
+            Err(_) => {
+                calendar.mark_stale();
+                println!("calendar refresh failed; retrying with the next event batch");
             }
         }
     }
@@ -775,6 +832,36 @@ impl ServeUseCase {
             writer: session.shared_writer(),
         });
         let mail_sender = session.shared_sender();
+
+        // CalDAV is opt-in like POP3 and SMTP. Its cache is wired here,
+        // before the watch starts, so the watch keeps it fresh.
+        let caldav = match config.caldav_port {
+            Some(caldav_port) => {
+                validate_imap_port(caldav_port)
+                    .map_err(|_| Error::Config("caldav_port must be between 1 and 65535".into()))?;
+                let source = session.shared_calendar().ok_or_else(|| {
+                    Error::Unsupported("calendars are not available for this session".into())
+                })?;
+                let store = Arc::clone(&self.state).calendar_store().ok_or_else(|| {
+                    Error::Unsupported("the state store keeps no calendar cache".into())
+                })?;
+                let sync = Arc::new(CalendarSync::new(
+                    account_id,
+                    Arc::clone(&store),
+                    Arc::clone(&source),
+                    Arc::clone(&self.clock),
+                ));
+                let handler: Arc<dyn crate::adapters::dav::DavHandler> = Arc::new(CalDavHandler {
+                    account_id,
+                    user_address: session.account().mail_address,
+                    store,
+                    source,
+                    clock: Arc::clone(&self.clock),
+                });
+                Some((caldav_port, sync, handler))
+            }
+            None => None,
+        };
         let _session = session;
 
         // 5. The watch task feeds the same store and broadcasts every
@@ -795,6 +882,7 @@ impl ServeUseCase {
             connect_timeout: self.connect_timeout,
             lookup_failure_threshold: self.lookup_failure_threshold,
             notifier: None,
+            calendar: caldav.as_ref().map(|(_, sync, _)| Arc::clone(sync)),
         }
         .with_notifier(sender.clone());
         let mut watch_task = tokio::spawn(async move {
@@ -836,6 +924,16 @@ impl ServeUseCase {
             }
             None => None,
         };
+        // CalDAV: read-only calendars over HTTPS with the same
+        // certificate and bridge password.
+        let caldav_listener = match &caldav {
+            Some((caldav_port, _, handler)) => {
+                let caldav_listener = bind_loopback("caldav", *caldav_port).await?;
+                println!("serving CalDAV on https://127.0.0.1:{caldav_port}/ (read-only)");
+                Some((caldav_listener, Arc::clone(handler)))
+            }
+            None => None,
+        };
         println!("serving IMAP on 127.0.0.1:{port}; press Ctrl-C to stop");
 
         // 7. Accept until the stop future resolves, then end the
@@ -843,7 +941,18 @@ impl ServeUseCase {
         //    its own — only a fatal error can — ends serve with that
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
-        let (imap_limits, pop3_limits, smtp_limits, _dav_limits) = shared_listener_limits();
+        let (imap_limits, pop3_limits, smtp_limits, dav_limits) = shared_listener_limits();
+        let caldav_auth = Arc::clone(&backend);
+        let caldav_tls = tls.clone();
+        let caldav_limits = dav_limits.clone();
+        let mut caldav_accepting = pin!(async move {
+            match caldav_listener {
+                Some((listener, handler)) => {
+                    serve_dav(listener, caldav_tls, caldav_auth, handler, caldav_limits).await
+                }
+                None => std::future::pending().await,
+            }
+        });
         let smtp_auth = Arc::clone(&backend);
         let smtp_tls = tls.clone();
         let mut smtp_accepting = pin!(async move {
@@ -877,6 +986,7 @@ impl ServeUseCase {
             () = &mut accepting => {}
             () = &mut pop3_accepting => {}
             () = &mut smtp_accepting => {}
+            () = &mut caldav_accepting => {}
         }
         let _ = stop_watch.send(());
         match watch_task.await {

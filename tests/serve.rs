@@ -218,6 +218,7 @@ fn temp_config(port: u16) -> (tempfile::TempDir, PathBuf) {
         imap_port: Some(port),
         pop3_port: None,
         smtp_port: None,
+        caldav_port: None,
     }
     .save(&path)
     .unwrap();
@@ -534,4 +535,223 @@ async fn serve_refuses_a_reserved_port() {
         .iter()
         .any(|call| call == "load"));
     assert!(!cert_dir.path().join("imap-cert.pem").exists());
+}
+
+// ---------------------------------------------------------------------------
+// CalDAV
+// ---------------------------------------------------------------------------
+
+/// Write a temp config naming both the IMAP and the CalDAV port.
+fn caldav_config(imap_port: u16, caldav_port: u16) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    Config {
+        active_account: Some(LOGIN.to_string()),
+        base_url: "http://127.0.0.1:9".to_string(),
+        imap_port: Some(imap_port),
+        pop3_port: None,
+        smtp_port: None,
+        caldav_port: Some(caldav_port),
+    }
+    .save(&path)
+    .unwrap();
+    (dir, path)
+}
+
+fn calendar_event(element: &str, start_ms: i64) -> tuta_bridge::domain::CalendarEvent {
+    tuta_bridge::domain::CalendarEvent {
+        list_id: "cal-short".into(),
+        element_id: element.into(),
+        uid: Some(format!("uid-{element}")),
+        summary: format!("Event {element}"),
+        description: String::new(),
+        location: String::new(),
+        start_ms,
+        end_ms: start_ms + 3_600_000,
+        sequence: 0,
+        recurrence_id_ms: None,
+        repeat: None,
+        alarm_ids: Vec::new(),
+        organizer: None,
+        attendees: Vec::new(),
+    }
+}
+
+/// One HTTP/1.1 request over the TLS wire: `(status, body)`.
+async fn http<R, W>(wire: &mut Wire<R, W>, method: &str, path: &str, depth: &str) -> (u16, String)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use base64::Engine as _;
+    let credentials =
+        base64::engine::general_purpose::STANDARD.encode(format!("{LOGIN}:{BRIDGE_PASSWORD}"));
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {credentials}\r\nDepth: {depth}\r\n\r\n"
+    );
+    wire.writer.write_all(request.as_bytes()).await.unwrap();
+    wire.writer.flush().await.unwrap();
+    let status: u16 = wire
+        .line()
+        .await
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut length = 0;
+    loop {
+        let line = wire.line().await;
+        if line.is_empty() {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length: ") {
+            length = value.parse().unwrap();
+        }
+    }
+    let mut body = vec![0; length];
+    wire.reader.read_exact(&mut body).await.unwrap();
+    (status, String::from_utf8(body).unwrap())
+}
+
+#[tokio::test]
+async fn serve_serves_caldav_and_keeps_it_fresh_from_the_event_bus() {
+    use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
+    use tuta_bridge::domain::{
+        CalendarInfo, EntityEvent, EntityOperation, EventBatch, EventFrame, CALENDAR_EVENT_TYPE_ID,
+        TUTANOTA_APP,
+    };
+    use tuta_bridge::ports::calendar::CalendarStore;
+
+    let imap_port = free_port();
+    let caldav_port = free_port();
+    let (_config_dir, config_path) = caldav_config(imap_port, caldav_port);
+    let cert_dir = tempfile::tempdir().unwrap();
+
+    // The calendar cache lives in a real SQLite store next to the fake
+    // mail state; both know the account as id 1.
+    let state = seeded_state().await;
+    let cache = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    cache.upsert_account(LOGIN).await.unwrap();
+    *state.calendar_cache.lock().unwrap() = Some(cache as Arc<dyn CalendarStore>);
+
+    let calendars = Arc::new(support::FakeCalendarSource::new());
+    calendars.add_calendar(CalendarInfo {
+        calendar_id: "cal".into(),
+        name: "Private".into(),
+        color: "ff0000".into(),
+        short_list_id: "cal-short".into(),
+        long_list_id: "cal-long".into(),
+    });
+    calendars.put_event(calendar_event("first", NOW_MS + 86_400_000));
+
+    let mut mail = FakeMailSource::new();
+    mail.folders.push(inbox());
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()])
+            .with_mail(Arc::new(mail))
+            .with_calendar(Arc::clone(&calendars)),
+    );
+    // The bus delivers one calendar event, drops, then idles.
+    let created = EventBatch {
+        batch_id: timestamp_to_generated_id(NOW_MS),
+        owner_group_id: "group1".into(),
+        application_types_hash: String::new(),
+        events: vec![EntityEvent {
+            application: TUTANOTA_APP.into(),
+            type_id: CALENDAR_EVENT_TYPE_ID,
+            list_id: "cal-short".into(),
+            element_id: "second".into(),
+            operation: EntityOperation::Create,
+        }],
+    };
+    calendars.put_event(calendar_event("second", NOW_MS + 2 * 86_400_000));
+    session.push_script(vec![
+        Ok(EventFrame::Batch(created)),
+        Err(Error::Network("dropped".into())),
+    ]);
+    session.push_pending();
+
+    let uc = serve_use_case(
+        &session,
+        fake_credentials(),
+        Arc::new(FakePasswordStore::with(BRIDGE_PASSWORD)),
+        config_path,
+        Arc::clone(&state),
+        cert_dir.path(),
+    );
+    let (stop_serve, stop_rx) = oneshot::channel::<()>();
+    let serve_task = tokio::spawn(async move {
+        uc.run_until(async move {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+
+    let mut wire = tls_client(caldav_port).await;
+    // The watch task loads the baseline; poll until it has.
+    let mut body = String::new();
+    for _ in 0..200 {
+        let (status, listed) = http(&mut wire, "PROPFIND", "/caldav/calendars/", "1").await;
+        assert_eq!(status, 207);
+        body = listed;
+        if body.contains("<d:href>/caldav/calendars/cal/</d:href>") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(body.contains("<d:href>/caldav/calendars/cal/</d:href>"));
+    assert!(body.contains("<d:displayname>Private</d:displayname>"));
+
+    // Both the baseline event and the one the bus announced show up.
+    let mut items = 0;
+    for _ in 0..200 {
+        let (_, body) = http(&mut wire, "PROPFIND", "/caldav/calendars/cal/", "1").await;
+        items = body.matches(".ics</d:href>").count();
+        if items == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(items, 2);
+    drop(wire);
+
+    stop_serve.send(()).unwrap();
+    let result = serve_task.await.unwrap();
+    assert!(result.is_ok(), "serve ended with {result:?}");
+}
+
+#[tokio::test]
+async fn serve_reports_a_held_caldav_port_as_in_use() {
+    use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
+    use tuta_bridge::ports::calendar::CalendarStore;
+
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let caldav_port = held.local_addr().unwrap().port();
+    let (_config_dir, config_path) = caldav_config(free_port(), caldav_port);
+    let cert_dir = tempfile::tempdir().unwrap();
+    let state = seeded_state().await;
+    let cache = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    *state.calendar_cache.lock().unwrap() = Some(cache as Arc<dyn CalendarStore>);
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()])
+            .with_calendar(Arc::new(support::FakeCalendarSource::new())),
+    );
+    session.push_pending();
+    let uc = serve_use_case(
+        &session,
+        fake_credentials(),
+        Arc::new(FakePasswordStore::with(BRIDGE_PASSWORD)),
+        config_path,
+        state,
+        cert_dir.path(),
+    );
+    let error = uc
+        .run_until(std::future::pending::<()>())
+        .await
+        .expect_err("a held port must stop serve");
+    assert!(
+        matches!(error, Error::InUse(ref message) if message == &format!("caldav port {caldav_port} is already in use"))
+    );
+    assert_eq!(error.exit_code(), 10);
 }
