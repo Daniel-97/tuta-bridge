@@ -93,8 +93,27 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()>
         .and_then(|()| fs::rename(&temp, path));
     if written.is_err() {
         let _ = fs::remove_file(&temp);
+        return written;
     }
-    written
+    sync_parent_dir(path)
+}
+
+/// Flush the directory entry the rename just changed, so the replacement
+/// itself survives a crash and not only the file's bytes.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::File::open(parent)?.sync_all()
+}
+
+/// Directories cannot be opened for syncing outside Unix; the rename is
+/// as durable as the platform makes it.
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn validate_base_url(url: &str) -> std::result::Result<(), String> {
