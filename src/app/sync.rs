@@ -187,8 +187,16 @@ impl SyncEngine {
 }
 
 /// The source's folder list; a failed listing fails the whole run.
+///
+/// So does an empty one: every Tuta account has its system folders, so a
+/// listing without any can only be a broken response, and reconciling
+/// against it would remove every stored mailbox.
 async fn load_folders(source: &dyn MailSource) -> Result<Vec<Folder>> {
-    source.folders().await.map_err(|_| all_folders_failed())
+    let folders = source.folders().await.map_err(|_| all_folders_failed())?;
+    if folders.is_empty() {
+        return Err(all_folders_failed());
+    }
+    Ok(folders)
 }
 
 fn all_folders_failed() -> Error {

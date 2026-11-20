@@ -344,6 +344,36 @@ async fn sync_fails_when_folder_listing_fails() {
 }
 
 #[tokio::test]
+async fn an_empty_folder_listing_removes_nothing() {
+    // Every account has system folders, so an empty listing is a broken
+    // response. Reconciling against it would delete every mailbox.
+    let store = Arc::new(support::FakeStateStore::new());
+    let engine = SyncEngine::new(store.clone());
+    let inbox = folder("inbox-list", "Inbox", FolderKind::Inbox);
+    let mut source = support::FakeMailSource::new();
+    source.folders = vec![inbox.clone()];
+    source.set_headers(&inbox.list_id, vec![header(&inbox.list_id, "e1")]);
+    engine.sync(ACCOUNT_ID, &source, UIDVALIDITY).await.unwrap();
+
+    source.folders = Vec::new();
+    match engine.sync(ACCOUNT_ID, &source, UIDVALIDITY).await {
+        Err(Error::Network(message)) => assert_eq!(message, "sync failed for all folders"),
+        other => panic!("expected fixed all-folders error, got {other:?}"),
+    }
+    assert!(matches!(
+        engine.reconcile_folders(ACCOUNT_ID, &source).await,
+        Err(Error::Network(_))
+    ));
+    assert!(matches!(
+        engine.resync(ACCOUNT_ID, &source, UIDVALIDITY + 1).await,
+        Err(Error::Network(_))
+    ));
+    assert_eq!(store.mailboxes(ACCOUNT_ID).await.unwrap().len(), 1);
+    let mailbox = store.mailbox_id(ACCOUNT_ID, &inbox.list_id);
+    assert_eq!(store.messages(mailbox).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn sync_fetches_headers_only() {
     let store = Arc::new(support::FakeStateStore::new());
     let engine = SyncEngine::new(store.clone());
