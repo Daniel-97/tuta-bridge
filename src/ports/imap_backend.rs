@@ -102,6 +102,19 @@ pub trait ImapBackend: Send + Sync {
         uid: u32,
         items: &[FetchItem],
     ) -> Result<Option<FetchResponse>>;
+    /// How many of `uids` would need a content load from Tuta to answer
+    /// a FETCH of `items`: a body item always does, a structure or size
+    /// item only when the stored metadata lacks it. The session uses
+    /// the count to warn the client before a slow mass FETCH; the
+    /// default — nothing to load — never warns.
+    async fn pending_loads(
+        &self,
+        _mailbox: MailboxId,
+        _uids: &[u32],
+        _items: &[FetchItem],
+    ) -> Result<usize> {
+        Ok(0)
+    }
     /// Evaluate SEARCH keys — every one must match — over the stored
     /// index; the returned numbers are UIDs, ascending.
     ///

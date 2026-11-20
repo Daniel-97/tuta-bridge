@@ -530,6 +530,39 @@ fn stale_complete(stored: &StoredMessage) -> bool {
     stored.header.envelope_complete && stored.header.sent_at_ms <= 0
 }
 
+/// Which costly parts a FETCH item list asks for.
+struct Wants {
+    body: bool,
+    structure: bool,
+    size: bool,
+}
+
+impl Wants {
+    fn of(items: &[FetchItem]) -> Self {
+        Self {
+            body: items.iter().any(FetchItem::is_body),
+            structure: items
+                .iter()
+                .any(|item| matches!(item, FetchItem::BodyStructure | FetchItem::BodyBasic)),
+            size: items.contains(&FetchItem::Rfc822Size),
+        }
+    }
+
+    /// Whether answering needs an enrichment of `stored` first: a
+    /// requested structure or size that is not stored, or a stale row.
+    fn needs_enrichment(&self, stored: &StoredMessage) -> bool {
+        (self.structure && stored.mime_structure.is_none())
+            || (self.size && stored.rfc822_size.is_none())
+            || ((self.structure || self.size || self.body) && stale_complete(stored))
+    }
+
+    /// Whether answering loads content from Tuta at all: every body
+    /// re-renders, everything else only through an enrichment.
+    fn needs_load(&self, stored: &StoredMessage) -> bool {
+        self.body || self.needs_enrichment(stored)
+    }
+}
+
 #[async_trait::async_trait]
 impl ImapBackend for TutaImapBackend {
     async fn login(&self, user: &str, password: &SecretString) -> Result<bool> {
@@ -618,11 +651,10 @@ impl ImapBackend for TutaImapBackend {
             return Err(unsupported_part_section());
         }
 
-        let wants_body = items.iter().any(FetchItem::is_body);
-        let wants_structure = items
-            .iter()
-            .any(|item| matches!(item, FetchItem::BodyStructure | FetchItem::BodyBasic));
-        let wants_size = items.contains(&FetchItem::Rfc822Size);
+        let wants = Wants::of(items);
+        let wants_body = wants.body;
+        let wants_structure = wants.structure;
+        let wants_size = wants.size;
 
         // One content load serves the whole request: the enricher and
         // the body renderer read through the same once-only source.
@@ -632,10 +664,7 @@ impl ImapBackend for TutaImapBackend {
         // one costs exactly one enrichment, already persisted. A stale
         // row — marked complete, zero sent date — heals through the
         // same enrichment before anything is rendered from it.
-        if (wants_structure && stored.mime_structure.is_none())
-            || (wants_size && stored.rfc822_size.is_none())
-            || ((wants_structure || wants_size || wants_body) && stale_complete(&stored))
-        {
+        if wants.needs_enrichment(&stored) {
             stored = self.enricher.enrich(mailbox, &stored, &source).await?;
         }
 
@@ -701,6 +730,26 @@ impl ImapBackend for TutaImapBackend {
             rfc822_size: if wants_size { stored.rfc822_size } else { None },
             bodies,
         }))
+    }
+
+    async fn pending_loads(
+        &self,
+        mailbox: MailboxId,
+        uids: &[u32],
+        items: &[FetchItem],
+    ) -> Result<usize> {
+        let wants = Wants::of(items);
+        if !(wants.body || wants.structure || wants.size) {
+            return Ok(0);
+        }
+        // `uids` is ascending (the session's view order), so each
+        // stored row is looked up with a binary search.
+        let messages = self.store.messages(mailbox).await?;
+        Ok(messages
+            .iter()
+            .filter(|message| uids.binary_search(&message.uid).is_ok())
+            .filter(|message| wants.needs_load(message))
+            .count())
     }
 
     async fn search(
