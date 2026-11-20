@@ -3,6 +3,7 @@ name = "tuta-bridge"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.84"
+license = "GPL-3.0-only"
 
 [dependencies]
 tuta-sdk = { git = "https://github.com/tutao/tutanota.git", rev = "5dba96493532804ebd5a541024aa217ca3b7874d", features = ["net"] }

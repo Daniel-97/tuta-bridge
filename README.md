@@ -292,3 +292,8 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 See `NOTES.md` for SDK pinning and protocol notes.
+
+## License
+
+GPL-3.0-only — see [LICENSE](LICENSE). The bridge links the GPL-3.0
+`tuta-sdk`, so it carries the same terms.
