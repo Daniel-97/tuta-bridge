@@ -32,10 +32,11 @@ use tutasdk::entities::generated::tutanota::{
     MailDetailsTransferAggregatedType, MailTransferAggregatedType, NewDraftAttachment,
     RecipientsTransferAggregatedType, SendDraftData, SendDraftParameters,
 };
+use tutasdk::rest_error::HttpError;
 use tutasdk::services::generated::tutanota::{DraftService, SendDraftService};
 use tutasdk::services::ExtraServiceParams;
 use tutasdk::tutanota_constants::ArchiveDataType;
-use tutasdk::{CustomId, IdTupleGenerated, LoggedInSdk};
+use tutasdk::{ApiCallError, CustomId, GeneratedId, IdTupleGenerated, LoggedInSdk};
 
 use crate::domain::{Error, Result};
 use crate::ports::mail_sender::{MailSender, OutgoingAddress, OutgoingMail};
@@ -202,6 +203,30 @@ pub fn send_request(
     }
 }
 
+/// The canonical form of a sender address for the lookup: Tuta keeps
+/// account addresses and aliases in lower case, so `Me@Tuta.example`
+/// must match `me@tuta.example` (SMTP practice is case-insensitive).
+pub fn canonical_sender(address: &str) -> String {
+    address.trim().to_lowercase()
+}
+
+/// Classify the outcome of the SDK's sender lookup: the group when the
+/// address is the account's, `None` when the SDK says it is not (it
+/// answers `NotFound` after checking every mail group), and a transient
+/// network error for anything else — a failed request must make the
+/// client retry, never bounce the mail as "not your address".
+pub fn classify_sender_lookup(
+    outcome: std::result::Result<GeneratedId, ApiCallError>,
+) -> Result<Option<GeneratedId>> {
+    match outcome {
+        Ok(group) => Ok(Some(group)),
+        Err(ApiCallError::ServerResponseError {
+            source: HttpError::NotFoundError,
+        }) => Ok(None),
+        Err(_) => Err(Error::Network("sender lookup failed".into())),
+    }
+}
+
 /// [`MailSender`] over the logged-in Tuta SDK.
 pub struct TutaMailSender {
     logged: Arc<LoggedInSdk>,
@@ -211,6 +236,15 @@ impl TutaMailSender {
     pub fn new(logged: Arc<LoggedInSdk>) -> Self {
         Self { logged }
     }
+
+    async fn sender_group(&self, address: &str) -> Result<Option<GeneratedId>> {
+        classify_sender_lookup(
+            self.logged
+                .mail_facade()
+                .get_group_id_for_mail_address(&canonical_sender(address))
+                .await,
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -219,12 +253,16 @@ impl MailSender for TutaMailSender {
         let mail_facade = self.logged.mail_facade();
         // The sender must be one of the account's enabled addresses or
         // aliases; its mail group owns the draft.
-        let group = mail_facade
-            .get_group_id_for_mail_address(&mail.from.address)
-            .await
-            .map_err(|_| {
+        let group = self
+            .sender_group(&mail.from.address)
+            .await?
+            .ok_or_else(|| {
                 Error::Unsupported("sender address is not an address of this account".into())
             })?;
+        // The draft carries the address as the account spells it.
+        let mut mail = mail.clone();
+        mail.from.address = canonical_sender(&mail.from.address);
+        let mail = &mail;
         let group_key = self
             .logged
             .get_current_sym_group_key(&group)
@@ -328,6 +366,10 @@ impl MailSender for TutaMailSender {
             .map_err(|_| send_failed())?;
         Ok(())
     }
+
+    async fn accepts_sender(&self, address: &str) -> Result<bool> {
+        Ok(self.sender_group(address).await?.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +395,42 @@ mod tests {
             html_body: "<p>hi</p>".into(),
             attachments: vec![],
         }
+    }
+
+    #[test]
+    fn sender_lookup_failures_are_transient_unless_the_address_is_foreign() {
+        let group = GeneratedId("group".into());
+        assert!(matches!(
+            classify_sender_lookup(Ok(group.clone())),
+            Ok(Some(found)) if found == group
+        ));
+        assert!(matches!(
+            classify_sender_lookup(Err(ApiCallError::ServerResponseError {
+                source: HttpError::NotFoundError
+            })),
+            Ok(None)
+        ));
+        for error in [
+            ApiCallError::ServerResponseError {
+                source: HttpError::ConnectionError,
+            },
+            ApiCallError::RestClient {
+                source: tutasdk::bindings::rest_client::RestClientError::NetworkError,
+            },
+            ApiCallError::InternalSdkError {
+                error_message: "x".into(),
+            },
+        ] {
+            assert!(matches!(
+                classify_sender_lookup(Err(error)),
+                Err(Error::Network(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn sender_addresses_compare_case_insensitively() {
+        assert_eq!(canonical_sender(" Me@Tuta.Example "), "me@tuta.example");
     }
 
     #[test]

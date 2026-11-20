@@ -7,7 +7,7 @@
 //! Bcc — which is how clients submit Bcc (they strip the header). A
 //! header recipient missing from the envelope is not sent to.
 
-use mail_parser::{AddressList, MessageParser};
+use mail_parser::{AddressList, MessageParser, MessagePart, PartId};
 
 use crate::ports::mail_sender::{OutgoingAddress, OutgoingAttachment, OutgoingMail};
 
@@ -27,6 +27,40 @@ pub enum OutgoingError {
     BodyTooLarge,
     /// No recipient at all.
     NoRecipients,
+    /// A header address that is not a plain `local@domain`, or a display
+    /// name with control characters.
+    InvalidAddress,
+}
+
+/// Whether `address` is a plain `local@domain` the draft may carry: no
+/// control characters, no whitespace, no angle brackets or list
+/// separators, exactly one `@` with both sides non-empty, and at most
+/// 254 octets (RFC 5321 §4.5.3.1.3). Quoted local parts are not
+/// accepted.
+pub fn is_valid_address(address: &str) -> bool {
+    if address.is_empty() || address.len() > 254 {
+        return false;
+    }
+    if address
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | '"'))
+    {
+        return false;
+    }
+    match address.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && !domain.contains('@')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+        }
+        None => false,
+    }
+}
+
+fn has_control(text: &str) -> bool {
+    text.chars().any(char::is_control)
 }
 
 fn same_address(a: &str, b: &str) -> bool {
@@ -121,59 +155,113 @@ pub fn outgoing_from_message(
     if to.is_empty() && cc.is_empty() && bcc.is_empty() {
         return Err(OutgoingError::NoRecipients);
     }
+    let reply_to = addresses(message.reply_to());
+    let every = std::iter::once(&from)
+        .chain(&to)
+        .chain(&cc)
+        .chain(&bcc)
+        .chain(&reply_to);
+    for address in every {
+        if !is_valid_address(&address.address) || has_control(&address.name) {
+            return Err(OutgoingError::InvalidAddress);
+        }
+    }
 
     // mail-parser synthesizes an HTML body from a text-only mail; only a
     // real text/html part is taken as HTML, a text body is escaped.
-    let has_html_part = message
-        .html_body()
-        .any(|part| part.is_content_type("text", "html"));
-    let html_body = match (has_html_part, message.body_html(0), message.body_text(0)) {
-        (true, Some(html), _) => html.into_owned(),
-        (_, _, Some(text)) => text_to_html(&text),
-        (_, Some(html), None) => html.into_owned(),
-        (_, None, None) => String::new(),
+    // The HTML body is the first real text/html part. mail-parser can
+    // file it outside the HTML body list: in a multipart/related that
+    // starts with an inline image, the image becomes "the body" and the
+    // text/html part an attachment. So the body list is searched first,
+    // then undeclared (not `Content-Disposition: attachment`) text/html
+    // parts among the attachments — and the part chosen is not sent as an
+    // attachment too. mail-parser also synthesizes HTML from a text-only
+    // mail, so without a real HTML part the text body is escaped instead.
+    let is_html = |part: &MessagePart<'_>| part.is_content_type("text", "html");
+    let declared_attachment = |part: &MessagePart<'_>| {
+        part.content_disposition()
+            .is_some_and(|disposition| disposition.ctype().eq_ignore_ascii_case("attachment"))
+    };
+    let mut html_from_attachment: Option<PartId> = None;
+    let html_part = match message.html_body().find(|part| is_html(part)) {
+        Some(part) => part.text(),
+        None => message
+            .attachments()
+            .find(|part| is_html(part) && !declared_attachment(part))
+            .and_then(|part| {
+                html_from_attachment = Some(part.id());
+                part.text()
+            }),
+    };
+    let html_body = match (html_part, message.body_text(0)) {
+        (Some(html), _) => html.into_owned(),
+        (None, Some(text)) => text_to_html(&text),
+        (None, None) => message
+            .body_html(0)
+            .map(|html| html.into_owned())
+            .unwrap_or_default(),
     };
     if html_body.len() > MAX_BODY_BYTES {
         return Err(OutgoingError::BodyTooLarge);
     }
 
-    let attachments = message
-        .attachments()
-        .map(|part| {
-            let mime_type = part
-                .content_type()
-                .map(|ct| match ct.subtype() {
-                    Some(sub) => format!("{}/{}", ct.ctype(), sub),
-                    None => ct.ctype().to_string(),
-                })
-                .unwrap_or_else(|| "application/octet-stream".to_string())
-                .to_ascii_lowercase();
-            OutgoingAttachment {
-                name: part
-                    .attachment_name()
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or("attachment")
-                    .to_string(),
-                mime_type,
-                cid: part
-                    .content_id()
-                    .map(|cid| cid.trim_matches(|c| c == '<' || c == '>').to_string())
-                    .filter(|cid| !cid.is_empty()),
-                data: part.decoded().into_owned(),
-            }
-        })
-        .collect();
+    // Attachments: the attachment list minus the part used as the body,
+    // plus non-text parts mail-parser filed as body (an inline image at
+    // the start of a multipart/related), each part once.
+    let mut seen: Vec<PartId> = Vec::new();
+    let mut attachments = Vec::new();
+    let body_parts = message.html_body().chain(message.text_body());
+    for part in message.attachments().chain(body_parts) {
+        let id = part.id();
+        if seen.contains(&id) || Some(id) == html_from_attachment {
+            continue;
+        }
+        let is_body_text = part.is_text() && !declared_attachment(&part);
+        let from_body_list = !message
+            .attachments()
+            .any(|attachment| attachment.id() == id);
+        if from_body_list && is_body_text {
+            continue;
+        }
+        seen.push(id);
+        attachments.push(attachment_of(&part));
+    }
 
     Ok(OutgoingMail {
         from,
         to,
         cc,
         bcc,
-        reply_to: addresses(message.reply_to()),
+        reply_to,
         subject: message.subject().unwrap_or("").to_string(),
         html_body,
         attachments,
     })
+}
+
+/// One MIME part as a draft attachment.
+fn attachment_of(part: &MessagePart<'_>) -> OutgoingAttachment {
+    let mime_type = part
+        .content_type()
+        .map(|ct| match ct.subtype() {
+            Some(sub) => format!("{}/{}", ct.ctype(), sub),
+            None => ct.ctype().to_string(),
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+        .to_ascii_lowercase();
+    OutgoingAttachment {
+        name: part
+            .attachment_name()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("attachment")
+            .to_string(),
+        mime_type,
+        cid: part
+            .content_id()
+            .map(|cid| cid.trim_matches(|c| c == '<' || c == '>').to_string())
+            .filter(|cid| !cid.is_empty()),
+        data: part.decoded().into_owned(),
+    }
 }
 
 #[cfg(test)]

@@ -26,6 +26,8 @@ const PASSWORD: &str = "hunter2";
 struct FakeSender {
     sent: Mutex<Vec<OutgoingMail>>,
     failing: Mutex<Option<Error>>,
+    /// While set, the sender check fails like a network error.
+    check_failing: Mutex<bool>,
 }
 
 #[async_trait::async_trait]
@@ -36,6 +38,13 @@ impl MailSender for FakeSender {
         }
         self.sent.lock().unwrap().push(mail.clone());
         Ok(())
+    }
+
+    async fn accepts_sender(&self, address: &str) -> Result<bool> {
+        if *self.check_failing.lock().unwrap() {
+            return Err(Error::Network("sender lookup failed".into()));
+        }
+        Ok(address.eq_ignore_ascii_case(USER))
     }
 }
 
@@ -257,4 +266,192 @@ async fn oversized_and_failed_messages_get_their_replies() {
     wire.send("QUIT").await;
     wire.expect("221 2.0.0 tuta-bridge closing").await;
     session.await.unwrap().unwrap();
+}
+
+async fn begin(wire: &mut Wire, rcpt: &str) {
+    wire.send("MAIL FROM:<me@tuta.example>").await;
+    wire.expect("250 2.1.0 ok").await;
+    wire.send(&format!("RCPT TO:<{rcpt}>")).await;
+    wire.expect("250 2.1.5 ok").await;
+    wire.send("DATA").await;
+    wire.expect("354 end data with <CR><LF>.<CR><LF>").await;
+}
+
+#[tokio::test]
+async fn the_sender_is_checked_at_mail_from() {
+    let sender = Arc::new(FakeSender::default());
+    let (mut wire, session) = spawn(Arc::clone(&sender)).await;
+    ehlo(&mut wire).await;
+    auth_plain(&mut wire).await;
+
+    wire.send("MAIL FROM:<stranger@x.example>").await;
+    wire.expect("553 5.7.1 sender address is not an address of this account")
+        .await;
+    // Case does not matter.
+    wire.send("MAIL FROM:<Me@Tuta.Example>").await;
+    wire.expect("250 2.1.0 ok").await;
+    wire.send("RSET").await;
+    wire.expect("250 2.0.0 ok").await;
+    // A failed check is temporary: the client retries.
+    *sender.check_failing.lock().unwrap() = true;
+    wire.send("MAIL FROM:<me@tuta.example>").await;
+    wire.expect("451 4.4.0 sender check failed; try again")
+        .await;
+
+    wire.send("QUIT").await;
+    wire.expect("221 2.0.0 tuta-bridge closing").await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn malformed_addresses_are_refused() {
+    let sender = Arc::new(FakeSender::default());
+    let (mut wire, session) = spawn(Arc::clone(&sender)).await;
+    ehlo(&mut wire).await;
+    auth_plain(&mut wire).await;
+
+    wire.send("MAIL FROM:<me tuta.example>").await;
+    wire.expect("553 5.1.7 invalid sender address").await;
+    wire.send("MAIL FROM:<me@tuta.example>").await;
+    wire.expect("250 2.1.0 ok").await;
+    for bad in [
+        "a@b\rc@d",
+        "a b@c.example",
+        "a@@b.example",
+        "@b.example",
+        "a@",
+    ] {
+        wire.send(&format!("RCPT TO:<{bad}>")).await;
+        wire.expect("553 5.1.3 invalid recipient address").await;
+    }
+    wire.send("RSET").await;
+    wire.expect("250 2.0.0 ok").await;
+
+    // A header address with a space never reaches the sender.
+    begin(&mut wire, "a@b.example").await;
+    for line in [
+        "From: me@tuta.example",
+        "To: a@b.example",
+        "Reply-To: <c d@e.example>",
+        "",
+        "hi",
+        ".",
+    ] {
+        wire.send(line).await;
+    }
+    let answer = wire.line().await;
+    assert!(answer.starts_with("554 "), "{answer}");
+    assert!(sender.sent.lock().unwrap().is_empty());
+
+    wire.send("QUIT").await;
+    wire.expect("221 2.0.0 tuta-bridge closing").await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn the_real_html_part_wins_over_a_leading_inline_image() {
+    let sender = Arc::new(FakeSender::default());
+    let (mut wire, session) = spawn(Arc::clone(&sender)).await;
+    ehlo(&mut wire).await;
+    auth_plain(&mut wire).await;
+    begin(&mut wire, "a@b.example").await;
+    for line in [
+        "From: me@tuta.example",
+        "To: a@b.example",
+        "MIME-Version: 1.0",
+        "Content-Type: multipart/related; boundary=\"r\"",
+        "",
+        "--r",
+        "Content-Type: image/png",
+        "Content-Disposition: inline",
+        "Content-ID: <img1>",
+        "Content-Transfer-Encoding: base64",
+        "",
+        "aGVsbG8=",
+        "--r",
+        "Content-Type: text/html",
+        "",
+        "<p>real html</p>",
+        "--r--",
+        ".",
+    ] {
+        wire.send(line).await;
+    }
+    wire.expect("250 2.0.0 message sent").await;
+    {
+        let sent = sender.sent.lock().unwrap();
+        assert!(sent[0].html_body.contains("<p>real html</p>"));
+        // The inline image is still sent, once, with its cid; the HTML
+        // part is not sent again as an attachment.
+        assert_eq!(sent[0].attachments.len(), 1);
+        assert_eq!(sent[0].attachments[0].cid.as_deref(), Some("img1"));
+        assert_eq!(sent[0].attachments[0].data, b"hello");
+    }
+    wire.send("QUIT").await;
+    wire.expect("221 2.0.0 tuta-bridge closing").await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn an_unauthenticated_connection_is_closed_at_its_deadline() {
+    let backend = Arc::new(FakeImapBackend::new(USER, PASSWORD));
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let limits = SmtpLimits {
+        pre_auth_timeout: Duration::from_millis(50),
+        ..SmtpLimits::default()
+    };
+    let session = tokio::spawn(run_smtp_session(
+        server,
+        backend as Arc<dyn ImapBackend>,
+        Arc::new(FakeSender::default()) as Arc<dyn MailSender>,
+        limits,
+    ));
+    let (reader, writer) = split(client);
+    let mut wire = Wire {
+        reader: BufReader::new(reader),
+        writer,
+    };
+    wire.expect("220 tuta-bridge ESMTP ready").await;
+    // Commands keep coming, but the pre-auth phase still ends.
+    wire.send("NOOP").await;
+    wire.expect("250 2.0.0 ok").await;
+    wire.expect("421 4.4.2 idle for too long; closing").await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_dripping_data_transfer_is_bounded_as_a_whole() {
+    let backend = Arc::new(FakeImapBackend::new(USER, PASSWORD));
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let limits = SmtpLimits {
+        max_data_duration: Duration::from_millis(100),
+        max_message_bytes: 4096,
+        ..SmtpLimits::default()
+    };
+    let session = tokio::spawn(run_smtp_session(
+        server,
+        backend as Arc<dyn ImapBackend>,
+        Arc::new(FakeSender::default()) as Arc<dyn MailSender>,
+        limits,
+    ));
+    let (reader, writer) = split(client);
+    let mut wire = Wire {
+        reader: BufReader::new(reader),
+        writer,
+    };
+    wire.expect("220 tuta-bridge ESMTP ready").await;
+    ehlo(&mut wire).await;
+    auth_plain(&mut wire).await;
+    begin(&mut wire, "a@b.example").await;
+    // Each line arrives well within the idle timeout; the session may
+    // already be gone before the last ones, so write errors are ignored.
+    for _ in 0..6 {
+        let _ = wire.writer.write_all(b"drip\r\n").await;
+        let _ = wire.writer.flush().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    // The session ended on the DATA deadline without a reply.
+    wire.expect_eof().await;
+    assert!(session.await.unwrap().is_err());
 }

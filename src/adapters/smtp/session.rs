@@ -14,9 +14,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use secrecy::SecretString;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, timeout_at, Instant};
 
-use super::outgoing::{outgoing_from_message, OutgoingError};
+use super::outgoing::{is_valid_address, outgoing_from_message, OutgoingError};
+use crate::adapters::stall::StallGuard;
 use crate::domain::{Error, Result};
 use crate::ports::imap_backend::ImapBackend;
 use crate::ports::mail_sender::MailSender;
@@ -24,9 +25,17 @@ use crate::ports::mail_sender::MailSender;
 /// The bounds of one SMTP session.
 #[derive(Clone)]
 pub struct SmtpLimits {
+    /// How long a connection may stay unauthenticated, measured from the
+    /// greeting — the whole phase, like IMAP.
+    pub pre_auth_timeout: Duration,
     /// Inactivity before the session is closed (RFC 5321 §4.5.3.2 asks
     /// servers for at least 5 minutes).
     pub idle_timeout: Duration,
+    /// How long one write may make no progress before the session ends.
+    pub write_timeout: Duration,
+    /// How long one whole DATA transfer may take, however steadily the
+    /// lines trickle in.
+    pub max_data_duration: Duration,
     /// The largest message accepted, advertised as `SIZE`.
     pub max_message_bytes: usize,
     /// Recipients accepted per message.
@@ -40,7 +49,10 @@ pub struct SmtpLimits {
 impl Default for SmtpLimits {
     fn default() -> Self {
         Self {
+            pre_auth_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(5 * 60),
+            write_timeout: Duration::from_secs(60),
+            max_data_duration: Duration::from_secs(10 * 60),
             max_message_bytes: 25 * 1024 * 1024,
             max_recipients: 100,
             login_failure_delay: Duration::from_secs(3),
@@ -165,6 +177,7 @@ fn refusal(error: &OutgoingError) -> &'static str {
         OutgoingError::MissingFrom => "554 5.6.0 message has no From header",
         OutgoingError::BodyTooLarge => "552 5.3.4 message body too large for Tuta",
         OutgoingError::NoRecipients => "554 5.5.1 no valid recipients",
+        OutgoingError::InvalidAddress => "554 5.1.7 message has an invalid address or name",
     }
 }
 
@@ -204,8 +217,10 @@ pub async fn run_smtp_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (reader, mut writer) = tokio::io::split(stream);
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
+    let mut writer = StallGuard::new(writer, limits.write_timeout);
+    let pre_auth_deadline = Instant::now() + limits.pre_auth_timeout;
     let mut session = Session {
         auth,
         sender,
@@ -218,12 +233,12 @@ where
     };
     reply(&mut writer, "220 tuta-bridge ESMTP ready").await?;
     loop {
-        let line = match timeout(
-            session.limits.idle_timeout,
-            read_line(&mut reader, MAX_COMMAND_LINE),
-        )
-        .await
-        {
+        let deadline = if session.authenticated {
+            Instant::now() + session.limits.idle_timeout
+        } else {
+            pre_auth_deadline
+        };
+        let line = match timeout_at(deadline, read_line(&mut reader, MAX_COMMAND_LINE)).await {
             Err(_) => {
                 reply(&mut writer, "421 4.4.2 idle for too long; closing").await?;
                 break;
@@ -420,6 +435,9 @@ impl Session {
         let Some((address, params)) = path_argument(rest, "FROM:") else {
             return reply(writer, "501 5.5.4 syntax: MAIL FROM:<address>").await;
         };
+        if !is_valid_address(address) {
+            return reply(writer, "553 5.1.7 invalid sender address").await;
+        }
         for param in params.split_whitespace() {
             if let Some(size) = param
                 .get(..5)
@@ -430,6 +448,19 @@ impl Session {
                     return reply(writer, "552 5.3.4 message size exceeds the limit").await;
                 }
             }
+        }
+        // RFC 6409 §8.3: refuse a sender the account may not use here,
+        // before the client uploads the message.
+        match self.sender.accepts_sender(address).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return reply(
+                    writer,
+                    "553 5.7.1 sender address is not an address of this account",
+                )
+                .await
+            }
+            Err(_) => return reply(writer, "451 4.4.0 sender check failed; try again").await,
         }
         self.mail_from = Some(address.to_string());
         reply(writer, "250 2.1.0 ok").await
@@ -446,7 +477,7 @@ impl Session {
         let Some((address, _)) = path_argument(rest, "TO:") else {
             return reply(writer, "501 5.5.4 syntax: RCPT TO:<address>").await;
         };
-        if address.is_empty() || !address.contains('@') {
+        if !is_valid_address(address) {
             return reply(writer, "553 5.1.3 invalid recipient address").await;
         }
         if self.rcpt_to.len() >= self.limits.max_recipients {
@@ -473,19 +504,20 @@ impl Session {
         // too large, so the stream stays in sync with the client.
         let mut message = Vec::new();
         let mut oversized = false;
+        let data_deadline = Instant::now() + self.limits.max_data_duration;
         loop {
-            let line =
-                match timeout(self.limits.idle_timeout, read_line(reader, MAX_DATA_LINE)).await {
-                    Err(_) => return Err(Error::Network(IO_FAILED.into())),
-                    Ok(result) => match result? {
-                        None => return Err(Error::Network(IO_FAILED.into())),
-                        Some(Line::TooLong) => {
-                            oversized = true;
-                            continue;
-                        }
-                        Some(Line::Text(bytes)) => bytes,
-                    },
-                };
+            let line_deadline = (Instant::now() + self.limits.idle_timeout).min(data_deadline);
+            let line = match timeout_at(line_deadline, read_line(reader, MAX_DATA_LINE)).await {
+                Err(_) => return Err(Error::Network(IO_FAILED.into())),
+                Ok(result) => match result? {
+                    None => return Err(Error::Network(IO_FAILED.into())),
+                    Some(Line::TooLong) => {
+                        oversized = true;
+                        continue;
+                    }
+                    Some(Line::Text(bytes)) => bytes,
+                },
+            };
             if line == b"." {
                 break;
             }

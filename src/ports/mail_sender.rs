@@ -49,4 +49,14 @@ impl OutgoingMail {
 #[async_trait::async_trait]
 pub trait MailSender: Send + Sync {
     async fn send(&self, mail: &OutgoingMail) -> Result<()>;
+
+    /// Whether `address` may be used as the sender: `Ok(false)` when it
+    /// is not one of the account's addresses, an error when that cannot
+    /// be determined right now (a network failure — the caller answers
+    /// with a temporary failure). Compared ASCII-case-insensitively.
+    /// Defaults to accepting every address; `send` checks again.
+    async fn accepts_sender(&self, address: &str) -> Result<bool> {
+        let _ = address;
+        Ok(true)
+    }
 }
