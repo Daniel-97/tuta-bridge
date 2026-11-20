@@ -189,6 +189,7 @@ async fn expect_select_block<R, W>(
     wire: &mut Wire<R, W>,
     tag: &str,
     exists: usize,
+    // The message number of the first unseen message, not a count.
     unseen: Option<usize>,
     uidvalidity: u32,
     uidnext: u32,
@@ -219,7 +220,7 @@ async fn expect_select_block<R, W>(
 
 async fn select_inbox(wire: &mut DuplexWire) {
     wire.send("a3 SELECT Inbox").await;
-    expect_select_block(wire, "a3", 2, Some(1), 7, 4, false).await;
+    expect_select_block(wire, "a3", 2, Some(2), 7, 4, false).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -472,11 +473,11 @@ async fn select_reports_counts_and_read_only_flags() {
     login(&mut wire).await;
 
     wire.send("a3 SELECT Inbox").await;
-    expect_select_block(&mut wire, "a3", 2, Some(1), 7, 4, false).await;
+    expect_select_block(&mut wire, "a3", 2, Some(2), 7, 4, false).await;
 
     // EXAMINE reports the same block but answers READ-ONLY.
     wire.send("a4 EXAMINE Inbox").await;
-    expect_select_block(&mut wire, "a4", 2, Some(1), 7, 4, true).await;
+    expect_select_block(&mut wire, "a4", 2, Some(2), 7, 4, true).await;
 
     // A mailbox without unseen messages skips the UNSEEN line.
     wire.send("a5 SELECT Archive").await;
@@ -642,7 +643,7 @@ async fn a_chunked_download_loads_its_message_once() {
 
     // … and go when another mailbox view is selected.
     wire.send("b2 SELECT Inbox").await;
-    expect_select_block(&mut wire, "b2", 2, Some(1), 7, 4, false).await;
+    expect_select_block(&mut wire, "b2", 2, Some(2), 7, 4, false).await;
     wire.send("b3 UID FETCH 3 (BODY.PEEK[]<5.3>)").await;
     assert_eq!(wire.literal("* 2 FETCH (BODY[]<5> ").await, b" me");
     wire.expect(" UID 3)").await;
@@ -728,7 +729,7 @@ async fn oversized_lines_answer_bad_and_keep_the_session_framed() {
     // The same refusal during IDLE: the BAD ends the idling state
     // and the dispatch loop continues on the next line.
     wire.send("a3 SELECT Inbox").await;
-    expect_select_block(&mut wire, "a3", 2, Some(1), 7, 4, false).await;
+    expect_select_block(&mut wire, "a3", 2, Some(2), 7, 4, false).await;
     wire.send("i1 IDLE").await;
     wire.expect("+ idling").await;
     let mut oversized_idle = String::from("x");
@@ -1202,7 +1203,7 @@ async fn id_command_answers_and_noop_flushes_notifications() {
     wire.expect("a2 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed")
         .await;
     wire.send("a3 SELECT Inbox").await;
-    expect_select_block(&mut wire, "a3", 2, Some(1), 7, 4, false).await;
+    expect_select_block(&mut wire, "a3", 2, Some(2), 7, 4, false).await;
 
     // A stored change for the selected mailbox arrives: NOOP reports the
     // new count even outside IDLE.

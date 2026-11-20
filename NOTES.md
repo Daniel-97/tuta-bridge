@@ -137,14 +137,14 @@
 - Response shapes worth remembering:
   - The `SELECT` untagged block ships in Dovecot order, FLAGS first:
     `* FLAGS (\Seen)`, `* <n> EXISTS`, `* 0 RECENT`, `* OK [UNSEEN
-    <n>]` (omitted at zero), `* OK [PERMANENTFLAGS ()] Read-only
+    <n>]` (omitted when nothing is unseen), `* OK [PERMANENTFLAGS ()] Read-only
     mailbox`, `* OK [UIDVALIDITY <v>]`, `* OK [UIDNEXT <n>]`, then
     `<tag> OK [READ-WRITE] SELECT completed`. RFC 3501 mandates
     presence, not order; `[READ-WRITE]` with `PERMANENTFLAGS ()` keeps
     clients working while every write answers NO.
-  - `* OK [UNSEEN <n>]` carries the unseen COUNT, not the
-    first-unseen message number RFC 3501 §6.3.1 describes — a
-    conformance deviation every tested client tolerates.
+  - `* OK [UNSEEN <n>]` carries the message number of the first
+    unseen message, as RFC 3501 §7.1 defines it (earlier versions sent
+    the unseen count); `STATUS (UNSEEN)` is the count.
   - Server-sent literals are inline `{n}\r\n<bytes>` — no continuation
     round-trip; bodies stream in 64 KiB chunks with at most one
     rendered message in memory. Client literals get a `+ ` continuation

@@ -1061,11 +1061,11 @@ impl Session {
         };
 
         write_line(writer, "* FLAGS (\\Seen)").await?;
-        let (exists, unseen) = (selected.messages.len(), selected.unseen());
+        let (exists, first_unseen) = (selected.messages.len(), selected.first_unseen());
         write_line(writer, &format!("* {exists} EXISTS")).await?;
         write_line(writer, "* 0 RECENT").await?;
-        if unseen > 0 {
-            write_line(writer, &format!("* OK [UNSEEN {unseen}]")).await?;
+        if let Some(first_unseen) = first_unseen {
+            write_line(writer, &format!("* OK [UNSEEN {first_unseen}]")).await?;
         }
         write_line(writer, "* OK [PERMANENTFLAGS ()] Read-only mailbox").await?;
         write_line(
@@ -1075,7 +1075,12 @@ impl Session {
         .await?;
         write_line(writer, &format!("* OK [UIDNEXT {}]", selected.uidnext)).await?;
 
-        tracing::debug!(exists, unseen, read_only = examine, "mailbox selected");
+        tracing::debug!(
+            exists,
+            unseen = selected.unseen(),
+            read_only = examine,
+            "mailbox selected"
+        );
         // Notifications queued before this view was taken are already
         // part of it, and bytes kept for the previous mailbox go.
         self.drain_notifications();

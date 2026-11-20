@@ -28,9 +28,19 @@ pub struct SelectedMailbox {
 }
 
 impl SelectedMailbox {
-    /// How many messages are unread.
+    /// How many messages are unread — the STATUS `UNSEEN` count.
     pub fn unseen(&self) -> usize {
         self.messages.iter().filter(|(_, unread)| *unread).count()
+    }
+
+    /// The message number of the first unread message — the SELECT
+    /// `[UNSEEN n]` response code (RFC 3501 §7.1), unlike STATUS, which
+    /// reports a count. `None` when every message is read.
+    pub fn first_unseen(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .position(|(_, unread)| *unread)
+            .map(|index| index + 1)
     }
 }
 
@@ -104,4 +114,33 @@ pub trait ImapBackend: Send + Sync {
         keys: &[SearchKey],
         view: &[u32],
     ) -> Result<Vec<u32>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selected(messages: Vec<(u32, bool)>) -> SelectedMailbox {
+        SelectedMailbox {
+            view: MailboxView {
+                id: MailboxId(1),
+                name: "Inbox".into(),
+                special_use: "",
+            },
+            uidvalidity: 7,
+            uidnext: 9,
+            messages,
+        }
+    }
+
+    #[test]
+    fn select_reports_the_first_unseen_number_and_status_the_count() {
+        let mailbox = selected(vec![(1, false), (3, true), (4, false), (8, true)]);
+        assert_eq!(mailbox.first_unseen(), Some(2));
+        assert_eq!(mailbox.unseen(), 2);
+
+        let all_read = selected(vec![(1, false), (2, false)]);
+        assert_eq!(all_read.first_unseen(), None);
+        assert_eq!(all_read.unseen(), 0);
+    }
 }
