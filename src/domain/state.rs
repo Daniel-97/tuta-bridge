@@ -13,6 +13,51 @@ pub struct MailboxId(pub i64);
 #[derive(Clone)]
 pub struct BatchOutcome {
     pub touched: Vec<MailboxId>,
+    /// What the batch did, by kind: counts only, never a name or id.
+    pub counts: BatchCounts,
+}
+
+/// The per-kind tally of one applied batch, for the watcher's progress
+/// line. A placement is one mail in one mailbox.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BatchCounts {
+    /// Placements inserted (new mail, or mail moved in).
+    pub new_mails: usize,
+    /// Existing placements whose read state flipped.
+    pub read_state_changes: usize,
+    /// Existing placements refreshed otherwise (header updates).
+    pub updated_mails: usize,
+    /// Placements removed because the mail now lives elsewhere (moves).
+    pub moved_out: usize,
+    /// Placements removed because the mail was deleted.
+    pub deleted: usize,
+    /// Folders created or refreshed (renames included).
+    pub folders_upserted: usize,
+}
+
+impl BatchCounts {
+    /// Whether the batch changed anything at all.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The progress line: only the non-zero kinds, e.g.
+    /// `applied 2 new, 1 read-state, 1 moved out`.
+    pub fn summary(&self) -> String {
+        let parts: Vec<String> = [
+            (self.new_mails, "new"),
+            (self.read_state_changes, "read-state"),
+            (self.updated_mails, "updated"),
+            (self.moved_out, "moved out"),
+            (self.deleted, "deleted"),
+            (self.folders_upserted, "folder"),
+        ]
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, kind)| format!("{count} {kind}"))
+        .collect();
+        format!("applied {}", parts.join(", "))
+    }
 }
 
 /// One stored placement of a mail: the mailbox it belongs to and its header.

@@ -167,7 +167,8 @@ async fn mail_set_create_upserts_a_folder() {
             changes: 1,
             skipped: 0,
             lookup_failures: 0,
-            touched_mailboxes: vec![created]
+            touched_mailboxes: vec![created],
+            counts: report.counts,
         }
     );
     let mailboxes = store.mailboxes(account).await.unwrap();
@@ -224,7 +225,8 @@ async fn mail_update_adds_every_placement_and_removes_old_ones() {
             lookup_failures: 0,
             // The upserts touched list-a and list-b first; the removal
             // guard then dropped the stale row in list-c.
-            touched_mailboxes: vec![list_a, list_b, list_c]
+            touched_mailboxes: vec![list_a, list_b, list_c],
+            counts: report.counts,
         }
     );
     assert_eq!(store.uid_for(list_a, "mail-list", "mail-1"), Some(1));
@@ -263,7 +265,8 @@ async fn mail_update_with_no_placements_removes_the_mail() {
             touched_mailboxes: vec![
                 store.mailbox_id(account, "list-a"),
                 store.mailbox_id(account, "list-b")
-            ]
+            ],
+            counts: report.counts,
         }
     );
     assert_eq!(
@@ -303,7 +306,8 @@ async fn unreadable_mail_is_skipped_and_keeps_the_existing_row() {
             skipped: 1,
             // An unreadable mail (Ok(None)) is not a lookup failure.
             lookup_failures: 0,
-            touched_mailboxes: Vec::new()
+            touched_mailboxes: Vec::new(),
+            counts: report.counts,
         }
     );
     assert_eq!(
@@ -350,7 +354,8 @@ async fn mail_delete_removes_every_placement() {
             touched_mailboxes: vec![
                 store.mailbox_id(account, "list-a"),
                 store.mailbox_id(account, "list-b")
-            ]
+            ],
+            counts: report.counts,
         }
     );
     assert_eq!(
@@ -410,7 +415,8 @@ async fn one_failed_lookup_keeps_the_whole_batch_unapplied_until_it_succeeds() {
             changes: 0,
             skipped: 2,
             lookup_failures: 1,
-            touched_mailboxes: Vec::new()
+            touched_mailboxes: Vec::new(),
+            counts: failed.counts,
         }
     );
     // Nothing was written — not even the delete that needed no lookup —
@@ -479,7 +485,8 @@ async fn every_failed_lookup_is_counted() {
             // Every skipped event was skipped because its lookup
             // failed.
             lookup_failures: 3,
-            touched_mailboxes: Vec::new()
+            touched_mailboxes: Vec::new(),
+            counts: report.counts,
         }
     );
     assert_eq!(
@@ -530,7 +537,8 @@ async fn unknown_types_and_entry_deletes_are_skipped_but_persisted() {
             // Unknown types, foreign applications, and entry deletes
             // never reach a lookup, so none counts as a failure.
             lookup_failures: 0,
-            touched_mailboxes: Vec::new()
+            touched_mailboxes: Vec::new(),
+            counts: report.counts,
         }
     );
     assert_eq!(store.mailboxes(account).await.unwrap().len(), 0);
@@ -670,7 +678,12 @@ async fn reapplying_the_same_batch_does_not_change_uids() {
 
     let second = processor.apply(account, &lookup, 7, &batch).await.unwrap();
 
-    assert_eq!(second, first);
+    assert_eq!(second.changes, first.changes);
+    assert_eq!(second.touched_mailboxes, first.touched_mailboxes);
+    // The replay finds the row already there: an update, never a new mail.
+    assert_eq!(first.counts.new_mails, 1);
+    assert_eq!(second.counts.new_mails, 0);
+    assert_eq!(second.counts.updated_mails, 1);
     assert_eq!(store.uid_for(mailbox, "mail-list", "mail-1"), Some(1));
     // The batch was applied twice; the second run kept the same UID.
     assert_eq!(

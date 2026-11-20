@@ -8,8 +8,8 @@ use secrecy::{ExposeSecret, SecretString};
 use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem, ImapArg};
 use tuta_bridge::adapters::imap::search::{parse_search, SearchKey};
 use tuta_bridge::domain::{
-    AccountId, AccountInfo, BatchOutcome, Error, EventFrame, Folder, MailPlacement, MailboxId,
-    MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
+    AccountId, AccountInfo, BatchCounts, BatchOutcome, Error, EventFrame, Folder, MailPlacement,
+    MailboxId, MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
     StoredCredentials, StoredMailbox, StoredMessage,
 };
 use tuta_bridge::ports::credentials::CredentialStore;
@@ -614,6 +614,7 @@ impl StateStore for FakeStateStore {
         // Mailboxes whose rows this batch changes, deduplicated and in
         // first-touch order.
         let mut touched: Vec<MailboxId> = Vec::new();
+        let mut counts = BatchCounts::default();
 
         for change in changes {
             if let StateChange::UpsertMailbox {
@@ -625,6 +626,7 @@ impl StateStore for FakeStateStore {
                 // count as a change.
                 let mailbox = self.upsert_mailbox_entry(account_id, folder, *uidvalidity);
                 touch_mailbox(&mut touched, mailbox);
+                counts.folders_upserted += 1;
             }
         }
 
@@ -655,6 +657,17 @@ impl StateStore for FakeStateStore {
                 .get(&(account_id, mailbox_list_id.to_string()))
                 .map(|mailbox| mailbox.id);
             if let Some(mailbox) = mailbox {
+                let previous = self
+                    .messages
+                    .lock()
+                    .unwrap()
+                    .get(&(mailbox, header.list_id.clone(), header.element_id.clone()))
+                    .map(|message| message.header.unread);
+                match previous {
+                    None => counts.new_mails += 1,
+                    Some(unread) if unread != header.unread => counts.read_state_changes += 1,
+                    Some(_) => counts.updated_mails += 1,
+                }
                 // A successful write always inserts or updates a row.
                 self.assign_uid_entry(mailbox, header)?;
                 touch_mailbox(&mut touched, mailbox);
@@ -664,7 +677,9 @@ impl StateStore for FakeStateStore {
         for change in changes {
             match change {
                 StateChange::RemoveHeaderEverywhere { element_id } => {
-                    for mailbox in self.remove_element_headers(account_id, element_id) {
+                    let removed = self.remove_element_headers(account_id, element_id);
+                    counts.deleted += removed.len();
+                    for mailbox in removed {
                         touch_mailbox(&mut touched, mailbox);
                     }
                 }
@@ -674,6 +689,7 @@ impl StateStore for FakeStateStore {
                 } => {
                     let removed =
                         self.remove_other_placements(account_id, element_id, keep_list_ids);
+                    counts.moved_out += removed.len();
                     for mailbox in removed {
                         touch_mailbox(&mut touched, mailbox);
                     }
@@ -686,7 +702,7 @@ impl StateStore for FakeStateStore {
             .lock()
             .unwrap()
             .insert((account_id, group_id.to_string()), batch_id.to_string());
-        Ok(BatchOutcome { touched })
+        Ok(BatchOutcome { touched, counts })
     }
 
     async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {
@@ -1131,6 +1147,8 @@ pub struct FakeEventSession {
     pub mail: Arc<FakeMailSource>,
     /// Batch markers passed to each `events()` call.
     pub marker_calls: Mutex<Vec<HashMap<String, String>>>,
+    /// The write seam handed to `serve` through `shared_writer`.
+    pub writer: Arc<FakeMailboxWriter>,
 }
 
 impl FakeEventSession {
@@ -1145,6 +1163,7 @@ impl FakeEventSession {
             lookup: Arc::new(FakeEventLookup::new()),
             mail: Arc::new(FakeMailSource::new()),
             marker_calls: Mutex::new(Vec::new()),
+            writer: Arc::new(FakeMailboxWriter::new()),
         }
     }
 
@@ -1209,6 +1228,10 @@ impl Session for FakeEventSessionHandle {
 
     fn shared_mail(&self) -> Arc<dyn MailSource> {
         Arc::clone(&self.0.mail) as Arc<dyn MailSource>
+    }
+
+    fn shared_writer(&self) -> Arc<dyn MailboxWriter> {
+        Arc::clone(&self.0.writer) as Arc<dyn MailboxWriter>
     }
 
     fn event_groups(&self) -> Vec<String> {

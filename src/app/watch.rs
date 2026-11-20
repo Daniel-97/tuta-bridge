@@ -298,8 +298,9 @@ impl WatchUseCase {
                                 break;
                             };
                             batches.insert(batch.owner_group_id.clone(), batch.batch_id.clone());
-                            if report.changes > 0 {
-                                println!("applied {} changes", report.changes);
+                            // Counts by kind only: no subject, address or id.
+                            if !report.counts.is_empty() {
+                                println!("{}", report.counts.summary());
                             }
                             // Idling sessions learn which mailboxes the
                             // batch changed; a closed channel only means
