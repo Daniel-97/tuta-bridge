@@ -20,7 +20,7 @@ use crate::ports::StateStore;
 /// Opening migrates an older database forward inside one transaction and
 /// refuses a newer one: a binary that does not know a later schema must
 /// not write to it.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The database carries a schema version newer than [`SCHEMA_VERSION`].
 #[derive(Debug, thiserror::Error)]
@@ -562,6 +562,12 @@ async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
             sqlx::query(statement).execute(&mut *transaction).await?;
         }
     }
+    // v8: the CalDAV calendar cache (see `sqlite_calendar`).
+    if version < 8 {
+        for statement in crate::adapters::sqlite_calendar::CALENDAR_SCHEMA_STATEMENTS {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+    }
 
     // The caller switched foreign keys off for the table rebuild; nothing
     // may commit with a dangling reference.
@@ -1082,6 +1088,12 @@ where
 #[async_trait::async_trait]
 impl StateStore for SqliteStateStore {
     fn contact_store(&self) -> Option<&dyn crate::ports::contact_store::ContactStore> {
+        Some(self)
+    }
+
+    fn calendar_store(
+        self: std::sync::Arc<Self>,
+    ) -> Option<std::sync::Arc<dyn crate::ports::calendar::CalendarStore>> {
         Some(self)
     }
 
@@ -3301,9 +3313,10 @@ mod tests {
                 .fetch_all(store.pool())
                 .await
                 .unwrap();
-        // The four schema tables, the two contact tables (v7), plus
-        // SQLite's own `sqlite_sequence`.
-        assert_eq!(tables.len(), 7);
+        // The four schema tables, SQLite's own `sqlite_sequence`, the
+        // two contact tables of step 7 and the two calendar tables of
+        // step 8.
+        assert_eq!(tables.len(), 9);
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(store.pool())
             .await

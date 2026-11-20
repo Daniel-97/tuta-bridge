@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use crate::domain::{
     BatchCounts, EntityEvent, EntityOperation, EventBatch, MailPlacement, MailboxId, Result,
-    StateChange, MAIL_SET_ENTRY_TYPE_ID, MAIL_SET_TYPE_ID, MAIL_TYPE_ID, TUTANOTA_APP,
+    StateChange, CALENDAR_EVENT_TYPE_ID, MAIL_SET_ENTRY_TYPE_ID, MAIL_SET_TYPE_ID, MAIL_TYPE_ID,
+    TUTANOTA_APP,
 };
 use crate::ports::event_lookup::EventLookup;
 use crate::ports::state_store::StateStore;
@@ -168,6 +169,10 @@ impl EventProcessor {
                         lookup_failures += 1;
                     }
                 },
+                // Calendar events belong to the CalDAV cache, which the
+                // watch loop updates from the same batch
+                // (`CalendarSync::apply`); they change no mail state.
+                CALENDAR_EVENT_TYPE_ID => skipped += 1,
                 _ => skipped += 1,
             }
         }

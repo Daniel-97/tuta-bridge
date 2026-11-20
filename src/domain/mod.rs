@@ -1,4 +1,5 @@
 pub mod account;
+pub mod calendar;
 pub mod contact;
 pub mod error;
 pub mod event;
@@ -6,6 +7,10 @@ pub mod mail;
 pub mod state;
 
 pub use account::{AccountId, AccountInfo, StoredCredentials};
+pub use calendar::{
+    CalendarEvent, CalendarInfo, CalendarRow, EventAttendee, EventPerson, RepeatRule,
+    CALENDAR_EVENT_TYPE_ID,
+};
 pub use contact::{
     ContactCard, ContactField, ContactFieldKind, ContactRelation, ContactRelationKind,
 };

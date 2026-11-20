@@ -1,4 +1,7 @@
 use super::contact_store::ContactStore;
+use std::sync::Arc;
+
+use super::calendar::CalendarStore;
 use crate::domain::{
     BatchOutcome, Folder, MailboxId, MessageHeader, Result, StateChange, StoredMailbox,
     StoredMessage,
@@ -9,6 +12,12 @@ pub trait StateStore: Send + Sync {
     /// The CardDAV contact cache kept in the same database, if this
     /// store has one. Defaults to none.
     fn contact_store(&self) -> Option<&dyn ContactStore> {
+        None
+    }
+
+    /// The calendar metadata cache kept in the same database, for the
+    /// CalDAV server. Defaults to none.
+    fn calendar_store(self: Arc<Self>) -> Option<Arc<dyn CalendarStore>> {
         None
     }
 

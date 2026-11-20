@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use secrecy::SecretString;
 
+use super::calendar::CalendarSource;
 use super::contact_source::{ContactSource, NoContacts};
 use super::event_stream::EventHandles;
 use super::mail_sender::{MailSender, OutgoingMail};
@@ -52,6 +53,12 @@ pub trait Session: Send + Sync {
     /// to a source that refuses every load.
     fn shared_contacts(&self) -> Arc<dyn ContactSource> {
         Arc::new(NoContacts)
+    }
+
+    /// The calendar seam `serve` hands to the CalDAV listener. Defaults
+    /// to none: adapters without calendars serve no CalDAV.
+    fn shared_calendar(&self) -> Option<Arc<dyn CalendarSource>> {
+        None
     }
 
     /// Group ids the event bus must be subscribed to, in subscription order.

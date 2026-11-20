@@ -99,6 +99,7 @@ fn temp_config() -> (tempfile::TempDir, PathBuf) {
         pop3_port: None,
         smtp_port: None,
         carddav_port: None,
+        caldav_port: None,
     }
     .save(&path)
     .unwrap();
@@ -155,6 +156,7 @@ fn use_case(
         lookup_failure_threshold: 10,
         notifier: None,
         contacts: None,
+        calendar: None,
     }
 }
 

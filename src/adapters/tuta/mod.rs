@@ -1,4 +1,5 @@
 pub mod blob;
+pub mod calendar_source;
 pub mod contact_source;
 pub mod content;
 pub mod event_lookup;

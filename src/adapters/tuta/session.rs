@@ -9,6 +9,7 @@ use tutasdk::services::generated::sys::CloseSessionService;
 use tutasdk::services::ExtraServiceParams;
 use tutasdk::{ApiCallError, CustomId, GeneratedId, IdTupleCustom, LoggedInSdk, Sdk};
 
+use super::calendar_source::TutaCalendarSource;
 use super::contact_source::TutaContactSource;
 use super::event_lookup::TutaEventLookup;
 use super::event_stream::{
@@ -21,6 +22,7 @@ use super::mail_source::TutaMailSource;
 use super::mailbox_writer::TutaMailboxWriter;
 use super::pre_session::TutaPreSession;
 use crate::domain::{AccountInfo, Error, Result, StoredCredentials};
+use crate::ports::calendar::CalendarSource;
 use crate::ports::contact_source::ContactSource;
 use crate::ports::event_stream::EventHandles;
 use crate::ports::mail_sender::MailSender;
@@ -169,6 +171,10 @@ impl Session for TutaSession {
 
     fn shared_contacts(&self) -> Arc<dyn ContactSource> {
         Arc::new(TutaContactSource::new(Arc::clone(&self.logged)))
+    }
+
+    fn shared_calendar(&self) -> Option<Arc<dyn CalendarSource>> {
+        Some(Arc::new(TutaCalendarSource::new(Arc::clone(&self.logged))))
     }
 
     fn event_groups(&self) -> Vec<String> {
