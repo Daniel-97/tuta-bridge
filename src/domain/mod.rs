@@ -12,6 +12,6 @@ pub use event::{
 };
 pub use mail::{Address, Attachment, Folder, FolderKind, MessageContent, MessageSummary};
 pub use state::{
-    BatchOutcome, MailPlacement, MailboxId, MessageHeader, MessagePage, StateChange, StoredMailbox,
-    StoredMessage,
+    BatchCounts, BatchOutcome, MailPlacement, MailboxId, MessageHeader, MessagePage, StateChange,
+    StoredMailbox, StoredMessage,
 };

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::domain::{
-    EntityEvent, EntityOperation, EventBatch, MailPlacement, MailboxId, Result, StateChange,
-    MAIL_SET_ENTRY_TYPE_ID, MAIL_SET_TYPE_ID, MAIL_TYPE_ID, TUTANOTA_APP,
+    BatchCounts, EntityEvent, EntityOperation, EventBatch, MailPlacement, MailboxId, Result,
+    StateChange, MAIL_SET_ENTRY_TYPE_ID, MAIL_SET_TYPE_ID, MAIL_TYPE_ID, TUTANOTA_APP,
 };
 use crate::ports::event_lookup::EventLookup;
 use crate::ports::state_store::StateStore;
@@ -50,6 +50,8 @@ pub struct EventReport {
     /// Mailboxes whose rows the batch inserted, updated, or deleted,
     /// deduplicated and in first-touch order.
     pub touched_mailboxes: Vec<MailboxId>,
+    /// What the store actually did, by kind.
+    pub counts: BatchCounts,
 }
 
 /// Coalesced effect of one element's mail events within a batch.
@@ -180,6 +182,7 @@ impl EventProcessor {
                 skipped: batch.events.len(),
                 lookup_failures,
                 touched_mailboxes: Vec::new(),
+                counts: BatchCounts::default(),
             });
         }
 
@@ -207,6 +210,7 @@ impl EventProcessor {
             skipped,
             lookup_failures,
             touched_mailboxes: outcome.touched,
+            counts: outcome.counts,
         })
     }
 }

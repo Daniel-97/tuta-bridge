@@ -146,6 +146,7 @@ struct TestWorld {
     backend: TutaImapBackend,
     store: Arc<support::FakeStateStore>,
     source: Arc<support::FakeMailSource>,
+    writer: Arc<support::FakeMailboxWriter>,
     account: i64,
     inbox: MailboxId,
 }
@@ -166,6 +167,8 @@ async fn world_with(passwords: Arc<dyn LocalPasswordStore>) -> TestWorld {
     let backend_store = Arc::clone(&store);
     let enricher_store = Arc::clone(&store);
     let backend_source = Arc::clone(&source);
+    let writer = Arc::new(support::FakeMailboxWriter::new());
+    let backend_writer = Arc::clone(&writer);
     let backend = TutaImapBackend {
         account_id: account,
         expected_user: "owner@example.invalid".into(),
@@ -177,11 +180,13 @@ async fn world_with(passwords: Arc<dyn LocalPasswordStore>) -> TestWorld {
         }),
         source: backend_source,
         renderer: Arc::new(MimeRenderer),
+        writer: backend_writer,
     };
     TestWorld {
         backend,
         store,
         source,
+        writer,
         account,
         inbox,
     }
@@ -1257,4 +1262,277 @@ async fn one_fetch_returns_every_body_item_from_a_single_content_load() {
     assert!(!text.is_empty());
     assert_eq!([header.as_slice(), text.as_slice()].concat(), rendered);
     assert_eq!(&response.bodies[2], header);
+}
+
+// ---------------------------------------------------------------------------
+// Writes (M6)
+// ---------------------------------------------------------------------------
+
+fn folder(list_id: &str, name: &str, kind: FolderKind) -> Folder {
+    Folder {
+        list_id: list_id.into(),
+        name: name.into(),
+        kind,
+    }
+}
+
+async fn seed(world: &TestWorld, mailbox: MailboxId, element_id: &str, unread: bool) -> u32 {
+    world
+        .store
+        .assign_uid(
+            mailbox,
+            &partial_header(element_id, "s", 1_700_000_000_000, unread),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn store_seen_updates_remotely_then_locally() {
+    let w = world().await;
+    let unread = seed(&w, w.inbox, "e1", true).await;
+    let read = seed(&w, w.inbox, "e2", false).await;
+
+    let applied = w
+        .backend
+        .store_seen(w.inbox, &[read, unread, 999], true)
+        .await
+        .unwrap();
+
+    // Both existing rows answer; the missing uid is skipped; only the
+    // row that actually changes goes to Tuta.
+    assert_eq!(applied, vec![(unread, false), (read, false)]);
+    assert_eq!(
+        w.writer.calls(),
+        vec![support::WriterCall::SetUnread(vec!["e1".into()], false)]
+    );
+    let row = w
+        .store
+        .message_by_uid(w.inbox, unread)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!row.header.unread);
+}
+
+#[tokio::test]
+async fn store_seen_without_changes_makes_no_remote_call() {
+    let w = world().await;
+    let uid = seed(&w, w.inbox, "e1", false).await;
+    let applied = w.backend.store_seen(w.inbox, &[uid], true).await.unwrap();
+    assert_eq!(applied, vec![(uid, false)]);
+    assert!(w.writer.calls().is_empty());
+}
+
+#[tokio::test]
+async fn move_removes_rows_and_never_touches_target_uids() {
+    let w = world().await;
+    let archive = w
+        .store
+        .upsert_mailbox(
+            w.account,
+            &folder("archive-entries", "Archive", FolderKind::Archive),
+            100,
+        )
+        .await
+        .unwrap();
+    let first = seed(&w, w.inbox, "e1", false).await;
+    let second = seed(&w, w.inbox, "e2", false).await;
+
+    let removed = w
+        .backend
+        .move_mails(w.inbox, &[second], archive)
+        .await
+        .unwrap();
+
+    assert_eq!(removed, vec![second]);
+    assert_eq!(
+        w.writer.calls(),
+        vec![support::WriterCall::MoveToFolder(
+            "archive-entries".into(),
+            vec!["e2".into()]
+        )]
+    );
+    assert!(w
+        .store
+        .message_by_uid(w.inbox, second)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(w
+        .store
+        .message_by_uid(w.inbox, first)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(w.store.messages(archive).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn move_into_the_same_mailbox_is_a_no_op() {
+    let w = world().await;
+    let uid = seed(&w, w.inbox, "e1", false).await;
+    assert!(w
+        .backend
+        .move_mails(w.inbox, &[uid], w.inbox)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(w.writer.calls().is_empty());
+}
+
+#[tokio::test]
+async fn expunge_moves_to_trash_outside_trash_and_deletes_inside_trash() {
+    let w = world().await;
+    let trash = w
+        .store
+        .upsert_mailbox(
+            w.account,
+            &folder("trash-entries", "Trash", FolderKind::Trash),
+            100,
+        )
+        .await
+        .unwrap();
+    let in_inbox = seed(&w, w.inbox, "e1", false).await;
+    let in_trash = seed(&w, trash, "e2", false).await;
+
+    assert_eq!(
+        w.backend.expunge_mails(w.inbox, &[in_inbox]).await.unwrap(),
+        vec![in_inbox]
+    );
+    assert_eq!(
+        w.backend.expunge_mails(trash, &[in_trash]).await.unwrap(),
+        vec![in_trash]
+    );
+    assert_eq!(
+        w.writer.calls(),
+        vec![
+            support::WriterCall::MoveToTrash(vec!["e1".into()]),
+            support::WriterCall::DeletePermanently("trash-entries".into(), vec!["e2".into()]),
+        ]
+    );
+    assert!(w.store.messages(w.inbox).await.unwrap().is_empty());
+    assert!(w.store.messages(trash).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_remote_write_changes_nothing() {
+    let w = world().await;
+    let archive = w
+        .store
+        .upsert_mailbox(
+            w.account,
+            &folder("archive-entries", "Archive", FolderKind::Archive),
+            100,
+        )
+        .await
+        .unwrap();
+    let uid = seed(&w, w.inbox, "e1", true).await;
+    *w.writer.failing.lock().unwrap() = true;
+
+    assert!(w.backend.store_seen(w.inbox, &[uid], true).await.is_err());
+    assert!(w
+        .backend
+        .move_mails(w.inbox, &[uid], archive)
+        .await
+        .is_err());
+    assert!(w.backend.expunge_mails(w.inbox, &[uid]).await.is_err());
+
+    assert_eq!(w.writer.calls().len(), 3);
+    let row = w.store.message_by_uid(w.inbox, uid).await.unwrap().unwrap();
+    assert!(row.header.unread, "a failed write must not touch the row");
+}
+
+#[tokio::test]
+async fn the_echo_event_after_our_own_write_is_idempotent() {
+    let w = world().await;
+    let uid = seed(&w, w.inbox, "e1", true).await;
+    w.backend.store_seen(w.inbox, &[uid], true).await.unwrap();
+
+    // The event bus later delivers the same change.
+    w.store
+        .apply_batch(
+            w.account,
+            "group",
+            "batch-1",
+            &[tuta_bridge::domain::StateChange::UpsertHeader {
+                mailbox_list_id: "entries".into(),
+                header: partial_header("e1", "s", 1_700_000_000_000, false),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let rows = w.store.messages(w.inbox).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].uid, uid);
+    assert!(!rows[0].header.unread);
+}
+
+/// A writer that removes one row from the store while its remote call
+/// is in flight — the event loop racing the write.
+struct RacingWriter {
+    store: Arc<support::FakeStateStore>,
+    mailbox: MailboxId,
+    uid: u32,
+}
+
+#[async_trait::async_trait]
+impl tuta_bridge::ports::mailbox_writer::MailboxWriter for RacingWriter {
+    async fn set_unread(
+        &self,
+        _mails: &[tuta_bridge::ports::mailbox_writer::MailRef],
+        _unread: bool,
+    ) -> Result<()> {
+        self.store.remove_message(self.mailbox, self.uid).await
+    }
+    async fn move_to_folder(
+        &self,
+        _target: &str,
+        _mails: &[tuta_bridge::ports::mailbox_writer::MailRef],
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn move_to_trash(
+        &self,
+        _mails: &[tuta_bridge::ports::mailbox_writer::MailRef],
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_permanently(
+        &self,
+        _folder: &str,
+        _mails: &[tuta_bridge::ports::mailbox_writer::MailRef],
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_row_vanishing_during_the_remote_write_is_skipped() {
+    let w = world().await;
+    let kept = seed(&w, w.inbox, "e1", true).await;
+    let racing = seed(&w, w.inbox, "e2", true).await;
+    let backend = TutaImapBackend {
+        writer: Arc::new(RacingWriter {
+            store: Arc::clone(&w.store),
+            mailbox: w.inbox,
+            uid: racing,
+        }),
+        ..w.backend
+    };
+
+    let applied = backend
+        .store_seen(w.inbox, &[kept, racing], true)
+        .await
+        .unwrap();
+
+    assert_eq!(applied, vec![(kept, false)]);
+    let row = w
+        .store
+        .message_by_uid(w.inbox, kept)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!row.header.unread);
 }

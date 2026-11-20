@@ -40,10 +40,8 @@
 //!   credentials, and argument vectors never reach a log line, and no
 //!   `Debug` printing exists for the types that carry them.
 
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use secrecy::SecretString;
@@ -52,11 +50,12 @@ use tokio::io::{
     BufReader, BufWriter,
 };
 use tokio::sync::broadcast;
-use tokio::time::{sleep, sleep_until, timeout_at, Instant, Sleep};
+use tokio::time::{sleep, sleep_until, timeout_at, Instant};
 
 use super::codec::{self, BodySection, FetchItem, ImapArg, Request};
 use super::render;
 use super::search;
+use crate::adapters::stall::StallGuard;
 use crate::domain::MailboxId;
 use crate::domain::{Error, Result};
 use crate::ports::imap_backend::{FetchResponse, ImapBackend};
@@ -66,7 +65,7 @@ use crate::ports::mailbox_events::MailboxChanged;
 /// LOGIN OK carry: the RFC 3501 base plus the extensions this bridge
 /// speaks. LOGINDISABLED never appears — the listener is TLS-only, so
 /// LOGIN is always available.
-const CAPABILITIES: &str = "IMAP4rev1 IDLE ID";
+const CAPABILITIES: &str = "IMAP4rev1 IDLE ID MOVE";
 
 /// The text of the connection's own io error.
 const IO_FAILED: &str = "imap connection io failed";
@@ -157,69 +156,6 @@ impl Default for SessionLimits {
     }
 }
 
-/// A writer whose every operation fails once it has made no progress
-/// for `limit`: the peer is not reading, and the session ends on the
-/// io error.
-struct StallGuard<W> {
-    inner: W,
-    limit: Duration,
-    /// Armed while an operation is pending; reset on every progress.
-    stalled: Option<Pin<Box<Sleep>>>,
-}
-
-impl<W> StallGuard<W> {
-    fn new(inner: W, limit: Duration) -> Self {
-        Self {
-            inner,
-            limit,
-            stalled: None,
-        }
-    }
-
-    /// Fold the stall timer into one poll result: progress disarms it,
-    /// a pending operation arms it (once) and fails when it fires.
-    fn guard<T>(
-        &mut self,
-        cx: &mut Context<'_>,
-        polled: Poll<std::io::Result<T>>,
-    ) -> Poll<std::io::Result<T>> {
-        if polled.is_ready() {
-            self.stalled = None;
-            return polled;
-        }
-        let limit = self.limit;
-        let timer = self.stalled.get_or_insert_with(|| Box::pin(sleep(limit)));
-        match timer.as_mut().poll(cx) {
-            Poll::Ready(()) => {
-                self.stalled = None;
-                Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for StallGuard<W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
-        self.guard(cx, polled)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let polled = Pin::new(&mut self.inner).poll_flush(cx);
-        self.guard(cx, polled)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let polled = Pin::new(&mut self.inner).poll_shutdown(cx);
-        self.guard(cx, polled)
-    }
-}
-
 /// The most rendered bytes a session keeps between the chunks of a
 /// partial fetch — the same figure that bounds a client literal.
 const MAX_PARTIAL_CACHE_BYTES: usize = MAX_LITERAL_BYTES;
@@ -262,10 +198,8 @@ enum State {
         /// The mailbox, addressed by id from here on: its name is
         /// never resolved again.
         mailbox: MailboxId,
-        /// Opened with EXAMINE rather than SELECT. Every write is
-        /// refused today whichever it was; the flag is recorded so a
-        /// write-capable server can refuse them on an EXAMINEd mailbox.
-        #[allow(dead_code)]
+        /// Opened with EXAMINE rather than SELECT: every write is
+        /// refused with NO.
         read_only: bool,
         uidvalidity: u32,
         /// The session's view: `(uid, unread)` in ascending UID order.
@@ -299,6 +233,11 @@ struct Session {
     /// Failed LOGINs on this connection so far.
     failed_logins: u32,
     partial_cache: Option<PartialCache>,
+    /// UIDs of the selected mailbox this session marked `\Deleted`.
+    /// Tuta has no such flag, so it lives here only (it is not in
+    /// PERMANENTFLAGS) until EXPUNGE or CLOSE acts on it; selecting
+    /// another mailbox forgets it.
+    deleted: HashSet<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +267,7 @@ where
         limits,
         failed_logins: 0,
         partial_cache: None,
+        deleted: HashSet::new(),
     };
 
     write_line(&mut writer, &greeting()).await?;
@@ -702,6 +642,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "UNSUBSCRIBE",
     "UID STORE",
     "UID COPY",
+    "UID MOVE",
 ];
 
 /// The placeholder logged for a command the session does not know.
@@ -949,8 +890,10 @@ impl Session {
             }
             "CLOSE" => {
                 if self.state.selected() {
+                    self.close_expunge().await;
                     self.state = State::Authenticated;
                     self.partial_cache = None;
+                    self.deleted.clear();
                     write_line(writer, &format!("{tag} OK CLOSE completed")).await?;
                 } else {
                     write_line(
@@ -960,15 +903,74 @@ impl Session {
                     .await?;
                 }
             }
-            "STORE" | "APPEND" | "EXPUNGE" | "COPY" | "MOVE" | "CREATE" | "DELETE" | "RENAME"
-            | "SUBSCRIBE" | "UNSUBSCRIBE" | "UID STORE" | "UID COPY" => {
-                // Understood, always refused: the bridge is read-only.
-                if self.state.authenticated() {
+            "STORE" | "UID STORE" | "EXPUNGE" | "MOVE" | "UID MOVE" => {
+                if !self.state.selected() {
                     write_line(
                         writer,
-                        &format!("{tag} NO not supported by this read-only bridge"),
+                        &format!("{tag} BAD command not valid in this state"),
                     )
                     .await?;
+                } else if matches!(
+                    self.state,
+                    State::Selected {
+                        read_only: true,
+                        ..
+                    }
+                ) {
+                    write_line(writer, &format!("{tag} NO mailbox is read-only")).await?;
+                } else {
+                    let uid_command = verb.starts_with("UID ");
+                    let args = if uid_command {
+                        &args[1.min(args.len())..]
+                    } else {
+                        args
+                    };
+                    match verb {
+                        "STORE" | "UID STORE" => {
+                            self.handle_store(writer, tag, uid_command, args).await?
+                        }
+                        "EXPUNGE" => self.handle_expunge(writer, tag).await?,
+                        _ => self.handle_move(writer, tag, uid_command, args).await?,
+                    }
+                }
+            }
+            "COPY" | "UID COPY" => {
+                if self.state.authenticated() {
+                    // Tuta has no copy: a mail lives in exactly one folder.
+                    // A missing target still gets TRYCREATE, like MOVE.
+                    let target = args.last().map(mailbox_name);
+                    let exists = match &target {
+                        Some(name) => self.backend.select(name).await?.is_some(),
+                        None => false,
+                    };
+                    let answer = if exists {
+                        "NO COPY is not supported by Tuta; use MOVE"
+                    } else {
+                        "NO [TRYCREATE] no such mailbox"
+                    };
+                    write_line(writer, &format!("{tag} {answer}")).await?;
+                } else {
+                    write_line(
+                        writer,
+                        &format!("{tag} BAD command not valid in this state"),
+                    )
+                    .await?;
+                }
+            }
+            "APPEND" if self.state.authenticated() && self.appends_to_sent(args).await? => {
+                // A client filing its own copy of a mail it just sent
+                // through the bridge: Tuta already filed one in Sent
+                // (it arrives through the event stream), so the upload
+                // is accepted and discarded rather than refused — a NO
+                // here makes Thunderbird report a failed send.
+                tracing::debug!("append to sent discarded; tuta files the sent copy");
+                write_line(writer, &format!("{tag} OK APPEND completed")).await?;
+            }
+            "APPEND" | "CREATE" | "DELETE" | "RENAME" | "SUBSCRIBE" | "UNSUBSCRIBE" => {
+                // Understood, always refused: folder management and
+                // uploads are not bridged.
+                if self.state.authenticated() {
+                    write_line(writer, &format!("{tag} NO not supported by this bridge")).await?;
                 } else {
                     write_line(
                         writer,
@@ -1060,14 +1062,20 @@ impl Session {
             return Ok(());
         };
 
-        write_line(writer, "* FLAGS (\\Seen)").await?;
+        write_line(writer, "* FLAGS (\\Seen \\Deleted)").await?;
         let (exists, first_unseen) = (selected.messages.len(), selected.first_unseen());
         write_line(writer, &format!("* {exists} EXISTS")).await?;
         write_line(writer, "* 0 RECENT").await?;
         if let Some(first_unseen) = first_unseen {
             write_line(writer, &format!("* OK [UNSEEN {first_unseen}]")).await?;
         }
-        write_line(writer, "* OK [PERMANENTFLAGS ()] Read-only mailbox").await?;
+        if examine {
+            write_line(writer, "* OK [PERMANENTFLAGS ()] Read-only mailbox").await?;
+        } else {
+            // \Deleted is accepted but kept for the session only, so it
+            // is not a permanent flag (RFC 3501 §7.1).
+            write_line(writer, "* OK [PERMANENTFLAGS (\\Seen)] Flags permitted").await?;
+        }
         write_line(
             writer,
             &format!("* OK [UIDVALIDITY {}]", selected.uidvalidity),
@@ -1085,6 +1093,7 @@ impl Session {
         // part of it, and bytes kept for the previous mailbox go.
         self.drain_notifications();
         self.partial_cache = None;
+        self.deleted.clear();
         self.state = State::Selected {
             mailbox: selected.view.id,
             read_only: examine,
@@ -1286,6 +1295,9 @@ impl Session {
                 Err(error @ Error::Unsupported(_)) => return Err(error),
                 Err(_) => continue,
             };
+            if self.deleted.contains(uid) {
+                response.flags = with_deleted(&response.flags);
+            }
             for piece in render_fetch(msn, &mut response, &items) {
                 match piece {
                     Piece::Text(text) => {
@@ -1648,6 +1660,353 @@ impl Session {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+// -- Writes (STORE / EXPUNGE / MOVE) ---------------------------------------
+
+/// How a STORE changes the flags it names (RFC 3501 §6.4.6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StoreMode {
+    Add,
+    Remove,
+    Replace,
+}
+
+/// A parsed STORE request: the mode, whether untagged FETCH answers are
+/// suppressed, and which of the two supported flags it names.
+#[derive(Debug, PartialEq, Eq)]
+struct StoreRequest {
+    mode: StoreMode,
+    silent: bool,
+    seen: bool,
+    deleted: bool,
+}
+
+/// Why a STORE request was refused.
+#[derive(Debug, PartialEq, Eq)]
+enum StoreRefusal {
+    /// Malformed: answered BAD.
+    Invalid,
+    /// Well-formed, but names a flag Tuta cannot keep: answered NO.
+    Unsupported,
+}
+
+/// Parse the item and flag list of a STORE (everything after the
+/// sequence set). Only `\Seen` and `\Deleted` are accepted: Tuta keeps
+/// a read state and nothing else, and `\Deleted` lives in the session.
+fn parse_store(args: &[ImapArg]) -> std::result::Result<StoreRequest, StoreRefusal> {
+    let (item, flag_args) = match args {
+        [ImapArg::Atom(item), rest @ ..] if !rest.is_empty() => (item.to_ascii_uppercase(), rest),
+        _ => return Err(StoreRefusal::Invalid),
+    };
+    let (mode, rest) = if let Some(rest) = item.strip_prefix('+') {
+        (StoreMode::Add, rest)
+    } else if let Some(rest) = item.strip_prefix('-') {
+        (StoreMode::Remove, rest)
+    } else {
+        (StoreMode::Replace, item.as_str())
+    };
+    let silent = match rest {
+        "FLAGS" => false,
+        "FLAGS.SILENT" => true,
+        _ => return Err(StoreRefusal::Invalid),
+    };
+    let flags: Vec<&ImapArg> = match flag_args {
+        [ImapArg::List(list)] => list.iter().collect(),
+        atoms => atoms.iter().collect(),
+    };
+    let mut request = StoreRequest {
+        mode,
+        silent,
+        seen: false,
+        deleted: false,
+    };
+    for flag in flags {
+        let ImapArg::Atom(flag) = flag else {
+            return Err(StoreRefusal::Invalid);
+        };
+        match flag.to_ascii_uppercase().as_str() {
+            "\\SEEN" => request.seen = true,
+            "\\DELETED" => request.deleted = true,
+            _ => return Err(StoreRefusal::Unsupported),
+        }
+    }
+    Ok(request)
+}
+
+/// A flag list with `\Deleted` appended.
+fn with_deleted(flags: &str) -> String {
+    if flags.is_empty() {
+        "\\Deleted".to_string()
+    } else {
+        format!("{flags} \\Deleted")
+    }
+}
+
+/// The flag list of one message as this session knows it.
+fn session_flags(unread: bool, deleted: bool) -> String {
+    let flags = render::flags(unread);
+    if deleted {
+        with_deleted(&flags)
+    } else {
+        flags.to_string()
+    }
+}
+
+/// Whether a STORE mode sets (`Some(true)`), clears (`Some(false)`), or
+/// leaves alone (`None`) a flag the request did or did not name.
+fn store_effect(mode: StoreMode, named: bool) -> Option<bool> {
+    match mode {
+        StoreMode::Add if named => Some(true),
+        StoreMode::Remove if named => Some(false),
+        StoreMode::Replace => Some(named),
+        _ => None,
+    }
+}
+
+impl Session {
+    /// Whether an APPEND targets the Sent mailbox with a message literal.
+    async fn appends_to_sent(&self, args: &[ImapArg]) -> Result<bool> {
+        let (Some(target), Some(ImapArg::Literal(_))) = (args.first(), args.last()) else {
+            return Ok(false);
+        };
+        Ok(self
+            .backend
+            .select(&mailbox_name(target))
+            .await?
+            .is_some_and(|mailbox| mailbox.view.special_use == "\\Sent"))
+    }
+
+    /// The `(msn, uid)` pairs of the session view a sequence set names,
+    /// ascending.
+    fn targets(&self, set: &codec::SeqSet, uid_command: bool) -> Vec<(u32, u32)> {
+        let State::Selected { messages, .. } = &self.state else {
+            return Vec::new();
+        };
+        let count = u32::try_from(messages.len()).unwrap_or(u32::MAX);
+        let max_uid = messages.last().map_or(0, |(uid, _)| *uid);
+        messages
+            .iter()
+            .enumerate()
+            .map(|(index, (uid, _))| (u32::try_from(index + 1).unwrap_or(u32::MAX), *uid))
+            .filter(|(msn, uid)| {
+                if uid_command {
+                    set.contains(*uid, max_uid)
+                } else {
+                    set.contains(*msn, count)
+                }
+            })
+            .collect()
+    }
+
+    fn selected_mailbox(&self) -> Option<MailboxId> {
+        match &self.state {
+            State::Selected { mailbox, .. } => Some(*mailbox),
+            _ => None,
+        }
+    }
+
+    /// Drop `removed` from the view and announce each as EXPUNGE, in
+    /// descending message-number order so every number stays valid while
+    /// the client applies them (RFC 3501 §7.4.1).
+    async fn expunge_from_view<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        removed: &[u32],
+    ) -> Result<()> {
+        let State::Selected { messages, .. } = &mut self.state else {
+            return Ok(());
+        };
+        let removed: HashSet<u32> = removed.iter().copied().collect();
+        let mut lines = Vec::new();
+        for index in (0..messages.len()).rev() {
+            if removed.contains(&messages[index].0) {
+                self.deleted.remove(&messages[index].0);
+                messages.remove(index);
+                lines.push(format!("* {} EXPUNGE", index + 1));
+            }
+        }
+        for line in lines {
+            write_line(writer, &line).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_store<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        tag: &str,
+        uid_command: bool,
+        args: &[ImapArg],
+    ) -> Result<()> {
+        let verb = if uid_command { "UID STORE" } else { "STORE" };
+        let Some(set) = args
+            .first()
+            .and_then(|arg| codec::parse_seq_set(&arg_string(arg)).ok())
+        else {
+            write_line(writer, &format!("{tag} BAD invalid {verb}")).await?;
+            return Ok(());
+        };
+        let request = match parse_store(&args[1.min(args.len())..]) {
+            Ok(request) => request,
+            Err(StoreRefusal::Invalid) => {
+                write_line(writer, &format!("{tag} BAD invalid {verb}")).await?;
+                return Ok(());
+            }
+            Err(StoreRefusal::Unsupported) => {
+                write_line(
+                    writer,
+                    &format!("{tag} NO only \\Seen and \\Deleted are supported"),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let Some(mailbox) = self.selected_mailbox() else {
+            return Ok(());
+        };
+        let targets = self.targets(&set, uid_command);
+        let uids: Vec<u32> = targets.iter().map(|(_, uid)| *uid).collect();
+
+        // The read state goes to Tuta first; rows the store no longer
+        // has answer nothing, like FETCH. Without a read-state change
+        // every targeted row stays as the view knows it.
+        let present: HashSet<u32> = match store_effect(request.mode, request.seen) {
+            Some(seen) if !uids.is_empty() => {
+                let applied = self.backend.store_seen(mailbox, &uids, seen).await?;
+                if let State::Selected { messages, .. } = &mut self.state {
+                    for (uid, unread) in &applied {
+                        if let Ok(at) = messages.binary_search_by_key(uid, |(known, _)| *known) {
+                            messages[at].1 = *unread;
+                        }
+                    }
+                }
+                applied.iter().map(|(uid, _)| *uid).collect()
+            }
+            _ => uids.iter().copied().collect(),
+        };
+
+        if let Some(deleted) = store_effect(request.mode, request.deleted) {
+            for uid in &present {
+                if deleted {
+                    self.deleted.insert(*uid);
+                } else {
+                    self.deleted.remove(uid);
+                }
+            }
+        }
+
+        if !request.silent {
+            let State::Selected { messages, .. } = &self.state else {
+                return Ok(());
+            };
+            let mut lines = Vec::new();
+            for (msn, uid) in &targets {
+                if !present.contains(uid) {
+                    continue;
+                }
+                let unread = messages
+                    .binary_search_by_key(uid, |(known, _)| *known)
+                    .map(|at| messages[at].1)
+                    .unwrap_or(false);
+                let flags = session_flags(unread, self.deleted.contains(uid));
+                lines.push(if uid_command {
+                    format!("* {msn} FETCH (FLAGS ({flags}) UID {uid})")
+                } else {
+                    format!("* {msn} FETCH (FLAGS ({flags}))")
+                });
+            }
+            for line in lines {
+                write_line(writer, &line).await?;
+            }
+        }
+        write_line(writer, &format!("{tag} OK {verb} completed")).await?;
+        Ok(())
+    }
+
+    async fn handle_expunge<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        tag: &str,
+    ) -> Result<()> {
+        let Some(mailbox) = self.selected_mailbox() else {
+            return Ok(());
+        };
+        let mut uids: Vec<u32> = self.deleted.iter().copied().collect();
+        uids.sort_unstable();
+        if !uids.is_empty() {
+            let removed = self.backend.expunge_mails(mailbox, &uids).await?;
+            self.expunge_from_view(writer, &removed).await?;
+            // Marked rows the store had already lost go too; the next
+            // sync point announces them.
+            self.deleted.clear();
+        }
+        write_line(writer, &format!("{tag} OK EXPUNGE completed")).await?;
+        Ok(())
+    }
+
+    async fn handle_move<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        tag: &str,
+        uid_command: bool,
+        args: &[ImapArg],
+    ) -> Result<()> {
+        let verb = if uid_command { "UID MOVE" } else { "MOVE" };
+        let parsed = match args {
+            [set_arg, target_arg] => codec::parse_seq_set(&arg_string(set_arg))
+                .ok()
+                .map(|set| (set, mailbox_name(target_arg))),
+            _ => None,
+        };
+        let Some((set, target)) = parsed else {
+            write_line(writer, &format!("{tag} BAD invalid {verb}")).await?;
+            return Ok(());
+        };
+        let Some(mailbox) = self.selected_mailbox() else {
+            return Ok(());
+        };
+        let Some(target) = self.backend.select(&target).await? else {
+            write_line(writer, &format!("{tag} NO [TRYCREATE] no such mailbox")).await?;
+            return Ok(());
+        };
+        let uids: Vec<u32> = self
+            .targets(&set, uid_command)
+            .into_iter()
+            .map(|(_, uid)| uid)
+            .collect();
+        if !uids.is_empty() {
+            let removed = self
+                .backend
+                .move_mails(mailbox, &uids, target.view.id)
+                .await?;
+            self.expunge_from_view(writer, &removed).await?;
+        }
+        write_line(writer, &format!("{tag} OK {verb} completed")).await?;
+        Ok(())
+    }
+
+    /// CLOSE on a read-write mailbox silently expunges what the session
+    /// marked `\Deleted` (RFC 3501 §6.4.2). CLOSE itself always
+    /// succeeds, so a failed write only leaves the mail where it was.
+    async fn close_expunge(&mut self) {
+        let mailbox = match &self.state {
+            State::Selected {
+                mailbox,
+                read_only: false,
+                ..
+            } => *mailbox,
+            _ => return,
+        };
+        let mut uids: Vec<u32> = self.deleted.iter().copied().collect();
+        if uids.is_empty() {
+            return;
+        }
+        uids.sort_unstable();
+        if self.backend.expunge_mails(mailbox, &uids).await.is_err() {
+            tracing::warn!(count = uids.len(), "close expunge failed");
+        }
+    }
+}
 
 /// Fold a `UID` command into its verb — `UID FETCH` becomes
 /// `"UID FETCH"` — and pass anything else through unchanged.

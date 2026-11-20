@@ -40,8 +40,8 @@ const BRIDGE_PASSWORD: &str = "bridge-hunter2";
 /// Fixed instant for the expiry decisions the watch baseline makes.
 const NOW_MS: i64 = 2_000_000_000_000;
 
-const GREETING: &str = "* OK [CAPABILITY IMAP4rev1 IDLE ID] tuta-bridge ready";
-const LOGIN_OK: &str = "a1 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed";
+const GREETING: &str = "* OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] tuta-bridge ready";
+const LOGIN_OK: &str = "a1 OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] LOGIN completed";
 /// ENVELOPE of the seeded partial header: NIL date (no `sent_at_ms`),
 /// the one sender tripled into from/sender/reply-to, no recipients.
 const ENVELOPE: &str = "(NIL \"subject\" ((NIL NIL \"sender\" \"example.invalid\")) ((NIL NIL \"sender\" \"example.invalid\")) ((NIL NIL \"sender\" \"example.invalid\")) NIL NIL NIL NIL NIL)";
@@ -216,6 +216,8 @@ fn temp_config(port: u16) -> (tempfile::TempDir, PathBuf) {
         active_account: Some(LOGIN.to_string()),
         base_url: "http://127.0.0.1:9".to_string(),
         imap_port: Some(port),
+        pop3_port: None,
+        smtp_port: None,
     }
     .save(&path)
     .unwrap();
@@ -430,11 +432,11 @@ async fn serve_logs_in_lists_and_fetches_end_to_end() {
     wire.expect("a2 OK LIST completed").await;
 
     wire.send("a3 SELECT INBOX").await;
-    wire.expect("* FLAGS (\\Seen)").await;
+    wire.expect("* FLAGS (\\Seen \\Deleted)").await;
     wire.expect("* 1 EXISTS").await;
     wire.expect("* 0 RECENT").await;
     wire.expect("* OK [UNSEEN 1]").await;
-    wire.expect("* OK [PERMANENTFLAGS ()] Read-only mailbox")
+    wire.expect("* OK [PERMANENTFLAGS (\\Seen)] Flags permitted")
         .await;
     wire.expect("* OK [UIDVALIDITY 7]").await;
     wire.expect("* OK [UIDNEXT 2]").await;
@@ -444,6 +446,13 @@ async fn serve_logs_in_lists_and_fetches_end_to_end() {
     wire.expect(&format!("* 1 FETCH (ENVELOPE {ENVELOPE} UID 1)"))
         .await;
     wire.expect("a4 OK UID FETCH completed").await;
+
+    // The write seam reaches serve through Session::shared_writer: a
+    // STORE goes to the session's writer and answers the new flags.
+    wire.send("a6 UID STORE 1 +FLAGS (\\Seen)").await;
+    wire.expect("* 1 FETCH (FLAGS (\\Seen) UID 1)").await;
+    wire.expect("a6 OK UID STORE completed").await;
+    assert_eq!(session.writer.calls().len(), 1);
 
     wire.send("a5 LOGOUT").await;
     wire.expect("* BYE tuta-bridge signing off").await;

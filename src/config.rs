@@ -19,6 +19,14 @@ pub struct Config {
     pub base_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imap_port: Option<u16>,
+    /// The POP3S listen port. POP3 is opt-in: without this key `serve`
+    /// does not listen for POP3 at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pop3_port: Option<u16>,
+    /// The SMTP submission (implicit TLS) listen port. SMTP is opt-in:
+    /// without this key `serve` does not accept mail to send.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smtp_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -27,6 +35,8 @@ impl Default for Config {
             active_account: None,
             base_url: DEFAULT_BASE_URL.to_owned(),
             imap_port: None,
+            pop3_port: None,
+            smtp_port: None,
         }
     }
 }
@@ -293,6 +303,8 @@ mod tests {
             active_account: None,
             base_url: "https://cfg.example".into(),
             imap_port: None,
+            pop3_port: None,
+            smtp_port: None,
         };
         assert_eq!(
             resolve_base_url(Some(""), Some(""), &cfg),
@@ -334,6 +346,8 @@ mod tests {
             active_account: Some("a@b.c".into()),
             base_url: "https://cfg.example".into(),
             imap_port: None,
+            pop3_port: None,
+            smtp_port: None,
         };
         cfg.save(&path).unwrap();
         assert!(Config::load(&path).unwrap() == cfg);
@@ -362,6 +376,8 @@ mod tests {
         // so the comparison is PartialEq.
         let cfg = Config {
             imap_port: Some(10143),
+            pop3_port: None,
+            smtp_port: None,
             ..Config::default()
         };
         cfg.save(&path).unwrap();

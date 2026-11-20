@@ -72,6 +72,8 @@ fn temp_config() -> (tempfile::TempDir, PathBuf) {
         active_account: Some(LOGIN.to_string()),
         base_url: "http://127.0.0.1:9".to_string(),
         imap_port: None,
+        pop3_port: None,
+        smtp_port: None,
     }
     .save(&path)
     .unwrap();

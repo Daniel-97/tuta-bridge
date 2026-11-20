@@ -284,6 +284,136 @@
   and no received time keeps re-loading per body request, the same
   accepted posture as permanently-unavailable content.
 
+## M6 IMAP writes
+
+- Write path: `MailboxWriter` (`src/ports/mailbox_writer.rs`) over the
+  SDK. Read state goes through `MailFacade::set_unread_status_for_mails`
+  (`UnreadMailStateService`), Trash through `trash_mails`
+  (`SimpleMoveMailService`, which only allows Trash/Archive targets),
+  moves to any folder through `MoveMailService` (`MoveMailData`, target =
+  the `MailSet` id), and permanent deletes through `MailService` DELETE
+  (`DeleteMailData`, folder = the Trash `MailSet` id). Requests are
+  chunked at 50 mails, the SDK's `MAX_MAIL_UPDATE_LIMIT`.
+- The store addresses a folder by its `entries` list id, while move and
+  delete want the `MailSet` element id: `TutaMailboxWriter` loads the
+  mailbox's mail sets per write (a handful of rows) and matches on
+  `entries`. No schema change.
+- Remote first, then local: the backend updates `unread` in place or
+  removes the source rows only after the remote call succeeded; a failed
+  call answers `NO` and changes nothing. The event that later echoes our
+  own change is idempotent: the header upsert keeps the UID and enriched
+  fields, and the removal of an already-removed row is a no-op. A moved
+  mail never gets a target row from the write itself — the event assigns
+  its new UID, exactly like a move made in the web client.
+- The session updates its own view with what it just changed (unread
+  pairs, removed UIDs announced as itemized `* n EXPUNGE` in descending
+  order), so the next sync point does not announce the same change twice.
+- `\Deleted` is session state: Tuta has no such flag. `STORE +FLAGS
+  \Deleted` marks UIDs in the session, `EXPUNGE` (and `CLOSE` on a
+  `SELECT`ed mailbox, silently) sends them to Trash, or deletes them for
+  good when the mailbox is Trash. Selecting another mailbox forgets the
+  marks; it is therefore not in `PERMANENTFLAGS`, which is `(\Seen)`.
+  Only Trash ever destroys mail.
+- Refused: `COPY` (Tuta has no copy; a mail lives in one folder; labels
+  would be the multi-membership mechanism), `APPEND`, folder mutations,
+  every flag but `\Seen`/`\Deleted`, and any write on an `EXAMINE`d
+  mailbox. `MOVE` is advertised; `UIDPLUS` is not (no `COPYUID`: the new
+  UID is only known when the event arrives).
+
+## M10 POP3
+
+- `src/adapters/pop3` speaks RFC 1939 (+ `CAPA`, RFC 2449) over the
+  same `ImapBackend` seam as IMAP: `login` for USER/PASS, `select("INBOX")`
+  for the maildrop (snapshot at login, numbers never change in a
+  session), `fetch(RFC822.SIZE)` for STAT/LIST (sizes cached per
+  session; the enricher persists them like IMAP does) and
+  `fetch(RFC822)` for RETR/TOP. No new store or SDK code.
+- `UIDL` = `<uidvalidity>.<uid>`: unique and stable while the mailbox's
+  UIDVALIDITY is; a `resync` changes it, so clients redownload — the
+  same contract as IMAP.
+- `DELE` is refused (spec M10: writes stay in IMAP). Leave-on-server is
+  the only mode.
+- Opt-in: `pop3_port` in the config; without it nothing listens. The
+  listener reuses the IMAP certificate and TLS acceptor, binds loopback
+  only, caps connections at 16 and lines at 512 octets, closes after 10
+  idle minutes (RFC 1939's minimum autologout) and after three failed
+  logins, with failed-login delays serialized across connections.
+
+## M7 SMTP submission
+
+- Port of `MailFacade.createDraft` + `sendDraft`
+  (`src/applications/common/api/worker/facades/lazy/MailFacade.ts` at the
+  pinned rev) in `src/adapters/tuta/mail_sender.rs`. Draft: the sender's
+  mail group (`get_group_id_for_mail_address`, which also rejects
+  foreign `From:` addresses), its current key
+  (`LoggedInSdk::get_current_sym_group_key`), a fresh AES-256 session
+  key, `_ownerEncSessionKey` = session key under the group key; POST
+  `DraftService` with `ExtraServiceParams.session_key`, which makes the
+  SDK encrypt the request tree (`entity_facade.encrypt_and_map`) and
+  lz4-compress `body.compressedText`. Deprecated top-level/`DraftData`
+  fields stay null/empty exactly like the web client sends them.
+- **Non-confidential only.** `SendDraftService` gets the raw
+  `mailSessionKey` (the web client's path for a mail with external
+  recipients and confidential off). The confidential path needs
+  `AsymmetricCryptoFacade::asym_encrypt_sym_key` and
+  `PublicKeyProvider`, which `LoggedInSdk` does not expose at this rev
+  (the `CryptoFacade` field is private); rebuilding them from
+  `crypto::{rsa,tuta_crypt}` would reimplement the protocol, which rule
+  6 forbids. Revisit when the SDK exposes them. The decision to ship the
+  non-confidential v1 (documented, warned at startup) was the owner's.
+- **Attachments reuse the mail session key.** The SDK encrypts a whole
+  service request under one key, so a `FileTransferAggregatedType`'s
+  name/MIME type are encrypted with the mail key; its
+  `_ownerEncSessionKey` therefore is the mail's, the blob is uploaded
+  with that key (`encrypt_and_upload_single_legacy`; the `_multiple`
+  variant keys a map by session key and would collapse files), and
+  `AttachmentKeyData.fileSessionKey` is the same key. The File ids come
+  from reloading the draft `Mail` (`attachments`). The upload future is
+  not `Send`; it runs on `spawn_blocking` via `Handle::block_on`.
+- Aggregate `_id`s: the SDK generates them only on the encrypted path,
+  so `SendDraftData`'s aggregates get theirs from the same 4-byte
+  base64url format (`make_random_aggregate_id`).
+- Unverified against the real server (rule 1: no contact without the
+  owner): the CBC-then-HMAC values the SDK produces where the current
+  web client may use AEAD, the shared attachment key, and Bcc delivery.
+  These are the M7 manual-acceptance checks.
+- SMTP side (`src/adapters/smtp`): implicit TLS, EHLO advertises
+  `SIZE 26214400`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `AUTH PLAIN
+  LOGIN`; no PIPELINING/STARTTLS/DSN. Envelope recipients decide
+  delivery; those absent from `To:`/`Cc:` become Bcc. Network failures
+  answer `451` (client retries), everything else `554`. Opt-in through
+  `smtp_port`.
+
+## Review of #2 (2026-11-20)
+
+The maintainer verified M6 and M7 against the live account (IMAP writes
+both ways, SMTP send with the Sent copy arriving through events and the
+disclosed missing E2E padlock); POP3 is still on the manual list. Fixes
+from the review:
+
+- POP3/SMTP writes go through the shared `adapters::stall::StallGuard`
+  (60 s) and both have IMAP's 60 s pre-auth deadline; SMTP also bounds a
+  whole DATA at 10 minutes. The three listeners share one failed-login
+  gate (`app::watch::shared_listener_limits`); connection caps stay per
+  listener.
+- POP3 re-reads the Inbox snapshot before every transaction command: a
+  changed UIDVALIDITY ends the session, vanished messages leave LIST,
+  STAT and UIDL together, and an unloadable size skips one message.
+- SMTP sender lookup: the SDK answers `NotFound` only after checking
+  every mail group, so that alone is the permanent "not your address";
+  every other failure is transient (`451`). Lookups use Tuta's canonical
+  form (`cleanMailAddress` = trim + lowercase in the web client).
+- mail-parser files a `text/html` part as an attachment when a
+  multipart/related starts with an inline image (the image becomes the
+  body); the sender now takes the first undeclared `text/html` part as
+  the body and keeps the image as an inline attachment.
+- IMAP: `APPEND` to Sent is a silent no-op so Thunderbird's "Place a
+  copy in Sent" does not report every send as failed; a row removed by
+  the event loop during a remote STORE is skipped like FETCH skips it.
+- `watch` prints per-kind counts from the store's own transaction
+  (`applied 2 new, 1 read-state, 1 moved out`); new vs. updated is one
+  extra `SELECT unread` per header.
+
 ## M1/M2 manual acceptance (2026-11-16)
 
 - Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.

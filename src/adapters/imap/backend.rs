@@ -29,6 +29,7 @@ use crate::domain::{
 use crate::ports::imap_backend::{FetchResponse, ImapBackend, MailboxView, SelectedMailbox};
 use crate::ports::local_password::LocalPasswordStore;
 use crate::ports::mail_source::MailSource;
+use crate::ports::mailbox_writer::{MailRef, MailboxWriter};
 use crate::ports::renderer::MessageRenderer;
 use crate::ports::state_store::StateStore;
 
@@ -47,6 +48,9 @@ pub struct TutaImapBackend {
     pub enricher: Arc<EnvelopeEnricher>,
     pub source: Arc<dyn MailSource>,
     pub renderer: Arc<dyn MessageRenderer>,
+    /// The write seam: every STORE/MOVE/EXPUNGE goes through it before
+    /// the local index changes.
+    pub writer: Arc<dyn MailboxWriter>,
 }
 
 /// Compare two byte strings ASCII-case-insensitively without leaking
@@ -468,6 +472,49 @@ impl TutaImapBackend {
             messages: self.store.message_uids(found.id).await?,
         })
     }
+
+    /// The stored mailbox with this id, or `None` once it is gone.
+    async fn stored_mailbox(&self, mailbox: MailboxId) -> Result<Option<StoredMailbox>> {
+        Ok(self
+            .store
+            .mailboxes(self.account_id)
+            .await?
+            .into_iter()
+            .find(|stored| stored.id == mailbox))
+    }
+
+    /// The stored rows of these UIDs, ascending and deduplicated;
+    /// UIDs without a row are skipped.
+    async fn rows(&self, mailbox: MailboxId, uids: &[u32]) -> Result<Vec<StoredMessage>> {
+        let mut wanted = uids.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut rows = Vec::with_capacity(wanted.len());
+        for uid in wanted {
+            if let Some(row) = self.store.message_by_uid(mailbox, uid).await? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Remove rows locally after a successful remote move/delete and
+    /// return their UIDs.
+    async fn remove_rows(&self, mailbox: MailboxId, rows: &[StoredMessage]) -> Result<Vec<u32>> {
+        for row in rows {
+            self.store.remove_message(mailbox, row.uid).await?;
+        }
+        Ok(rows.iter().map(|row| row.uid).collect())
+    }
+}
+
+fn mail_refs(rows: &[StoredMessage]) -> Vec<MailRef> {
+    rows.iter()
+        .map(|row| MailRef {
+            list_id: row.header.list_id.clone(),
+            element_id: row.header.element_id.clone(),
+        })
+        .collect()
 }
 
 /// A row marked complete whose sent date never landed — the shape the
@@ -680,6 +727,96 @@ impl ImapBackend for TutaImapBackend {
             })
             .map(|message| message.uid)
             .collect())
+    }
+
+    async fn store_seen(
+        &self,
+        mailbox: MailboxId,
+        uids: &[u32],
+        seen: bool,
+    ) -> Result<Vec<(u32, bool)>> {
+        let unread = !seen;
+        // Rows already in the requested state need no remote call, but
+        // still answer a FETCH line (RFC 3501 §6.4.6 reports the flags
+        // whether or not they changed).
+        let rows = self.rows(mailbox, uids).await?;
+        let changing: Vec<StoredMessage> = rows
+            .iter()
+            .filter(|row| row.header.unread != unread)
+            .cloned()
+            .collect();
+        let mut vanished = std::collections::HashSet::new();
+        if !changing.is_empty() {
+            self.writer
+                .set_unread(&mail_refs(&changing), unread)
+                .await?;
+            for row in &changing {
+                let mut header = row.header.clone();
+                header.unread = unread;
+                if let Err(error) = self
+                    .store
+                    .update_metadata(mailbox, row.uid, &header, row.rfc822_size)
+                    .await
+                {
+                    // The event loop may remove a row while the remote
+                    // write is in flight. The write already succeeded for
+                    // the whole batch, so a vanished row is skipped — the
+                    // way FETCH skips it — instead of failing the command.
+                    if self.store.message_by_uid(mailbox, row.uid).await?.is_some() {
+                        return Err(error);
+                    }
+                    vanished.insert(row.uid);
+                }
+            }
+        }
+        Ok(rows
+            .iter()
+            .filter(|row| !vanished.contains(&row.uid))
+            .map(|row| (row.uid, unread))
+            .collect())
+    }
+
+    async fn move_mails(
+        &self,
+        mailbox: MailboxId,
+        uids: &[u32],
+        target: MailboxId,
+    ) -> Result<Vec<u32>> {
+        if mailbox == target {
+            return Ok(Vec::new());
+        }
+        let Some(target) = self.stored_mailbox(target).await? else {
+            return Err(Error::Unsupported("mailbox not found".into()));
+        };
+        let rows = self.rows(mailbox, uids).await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.writer
+            .move_to_folder(&target.list_id, &mail_refs(&rows))
+            .await?;
+        self.remove_rows(mailbox, &rows).await
+    }
+
+    async fn expunge_mails(&self, mailbox: MailboxId, uids: &[u32]) -> Result<Vec<u32>> {
+        let Some(source) = self.stored_mailbox(mailbox).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self.rows(mailbox, uids).await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mails = mail_refs(&rows);
+        // Only Trash ever destroys mail: everywhere else a delete is a
+        // move, exactly like the Tuta clients do it.
+        if source.kind == FolderKind::Trash {
+            self.writer
+                .delete_permanently(&source.list_id, &mails)
+                .await?;
+        } else {
+            self.writer.move_to_trash(&mails).await?;
+        }
+        self.remove_rows(mailbox, &rows).await
     }
 }
 

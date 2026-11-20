@@ -9,8 +9,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Connection, Row, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::domain::{
-    Address, BatchOutcome, Error, Folder, FolderKind, MailboxId, MessageHeader, Result,
-    StateChange, StoredMailbox, StoredMessage,
+    Address, BatchCounts, BatchOutcome, Error, Folder, FolderKind, MailboxId, MessageHeader,
+    Result, StateChange, StoredMailbox, StoredMessage,
 };
 use crate::ports::StateStore;
 
@@ -729,6 +729,10 @@ const SELECT_UID_BY_ELEMENT_SQL: &str = "\
 SELECT uid FROM messages
 WHERE mailbox_id = ? AND tuta_list_id = ? AND tuta_element_id = ?";
 
+const SELECT_UNREAD_BY_ELEMENT_SQL: &str = "\
+SELECT unread FROM messages
+WHERE mailbox_id = ? AND tuta_list_id = ? AND tuta_element_id = ?";
+
 const SELECT_NEXT_UID_SQL: &str = "SELECT next_uid FROM mailboxes WHERE id = ?";
 
 const INSERT_MESSAGE_SQL: &str = "\
@@ -1175,6 +1179,7 @@ impl StateStore for SqliteStateStore {
         // Mailboxes whose rows this transaction changes, deduplicated
         // and in first-touch order.
         let mut touched: Vec<MailboxId> = Vec::new();
+        let mut counts = BatchCounts::default();
 
         // Folders go first so a new folder and its mail can arrive in the same
         // batch regardless of the order the events were produced in.
@@ -1190,6 +1195,7 @@ impl StateStore for SqliteStateStore {
                 // The upsert either created the row or refreshed its
                 // name and kind; both count as a change.
                 touch_mailbox(&mut touched, mailbox);
+                counts.folders_upserted += 1;
             }
         }
 
@@ -1224,6 +1230,20 @@ impl StateStore for SqliteStateStore {
                 .await
                 .map_err(storage_error)?;
             if let Some(mailbox) = mailbox {
+                let previous: Option<i64> = sqlx::query_scalar(SELECT_UNREAD_BY_ELEMENT_SQL)
+                    .bind(mailbox)
+                    .bind(&header.list_id)
+                    .bind(&header.element_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+                match previous {
+                    None => counts.new_mails += 1,
+                    Some(unread) if (unread != 0) != header.unread => {
+                        counts.read_state_changes += 1
+                    }
+                    Some(_) => counts.updated_mails += 1,
+                }
                 // A successful write always inserts or updates a row.
                 self.assign_uid_in(&mut transaction, MailboxId(mailbox), header)
                     .await?;
@@ -1239,6 +1259,7 @@ impl StateStore for SqliteStateStore {
                     let removed_from = self
                         .remove_placements_in(&mut transaction, account_id, element_id, &[])
                         .await?;
+                    counts.deleted += removed_from.len();
                     for mailbox in removed_from {
                         touch_mailbox(&mut touched, mailbox);
                     }
@@ -1255,6 +1276,7 @@ impl StateStore for SqliteStateStore {
                             keep_list_ids,
                         )
                         .await?;
+                    counts.moved_out += removed_from.len();
                     for mailbox in removed_from {
                         touch_mailbox(&mut touched, mailbox);
                     }
@@ -1272,7 +1294,7 @@ impl StateStore for SqliteStateStore {
             .map_err(storage_error)?;
 
         transaction.commit().await.map_err(storage_error)?;
-        Ok(BatchOutcome { touched })
+        Ok(BatchOutcome { touched, counts })
     }
 
     async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {
@@ -1725,6 +1747,90 @@ mod tests {
         assert_eq!(
             store.last_batch(account, "group").await.unwrap().as_deref(),
             Some("batch-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_batch_counts_what_it_did_by_kind() {
+        let store = SqliteStateStore::open_in_memory().await.unwrap();
+        let account = store.upsert_account("owner@example.invalid").await.unwrap();
+        let folder = |list: &str, name: &str| Folder {
+            list_id: list.into(),
+            name: name.into(),
+            kind: FolderKind::Custom,
+        };
+        let first = store
+            .apply_batch(
+                account,
+                "group",
+                "batch-1",
+                &[
+                    StateChange::UpsertMailbox {
+                        folder: folder("a", "A"),
+                        uidvalidity: 7,
+                    },
+                    StateChange::UpsertMailbox {
+                        folder: folder("b", "B"),
+                        uidvalidity: 8,
+                    },
+                    StateChange::UpsertHeader {
+                        mailbox_list_id: "a".into(),
+                        header: header("mail-list", "e1"),
+                    },
+                    StateChange::UpsertHeader {
+                        mailbox_list_id: "a".into(),
+                        header: header("mail-list", "e2"),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.counts,
+            BatchCounts {
+                new_mails: 2,
+                folders_upserted: 2,
+                ..BatchCounts::default()
+            }
+        );
+
+        // e1 flips its read state in place; e2 moves from A to B.
+        let mut flipped = header("mail-list", "e1");
+        flipped.unread = !flipped.unread;
+        let second = store
+            .apply_batch(
+                account,
+                "group",
+                "batch-2",
+                &[
+                    StateChange::UpsertHeader {
+                        mailbox_list_id: "a".into(),
+                        header: flipped,
+                    },
+                    StateChange::UpsertHeader {
+                        mailbox_list_id: "b".into(),
+                        header: header("mail-list", "e2"),
+                    },
+                    StateChange::RemoveOtherPlacements {
+                        element_id: "e2".into(),
+                        keep_list_ids: vec!["b".into()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.counts,
+            BatchCounts {
+                new_mails: 1,
+                read_state_changes: 1,
+                moved_out: 1,
+                ..BatchCounts::default()
+            }
+        );
+        assert_eq!(
+            second.counts.summary(),
+            "applied 1 new, 1 read-state, 1 moved out"
         );
     }
 

@@ -114,6 +114,47 @@ pub trait ImapBackend: Send + Sync {
         keys: &[SearchKey],
         view: &[u32],
     ) -> Result<Vec<u32>>;
+
+    /// Mark the messages with these UIDs read (`seen`) or unread, first
+    /// in Tuta, then in the local index. Returns the `(uid, unread)`
+    /// pairs actually applied, ascending; UIDs the mailbox no longer has
+    /// are skipped silently, like FETCH skips them. A failed remote
+    /// write changes nothing locally.
+    async fn store_seen(
+        &self,
+        mailbox: MailboxId,
+        uids: &[u32],
+        seen: bool,
+    ) -> Result<Vec<(u32, bool)>> {
+        let _ = (mailbox, uids, seen);
+        Err(read_only())
+    }
+
+    /// Move the messages with these UIDs into `target`. Returns the
+    /// UIDs removed from `mailbox`, ascending. The target gets its rows
+    /// (with fresh UIDs) from the event that echoes the move, never
+    /// from this call. Moving into the same mailbox is a no-op.
+    async fn move_mails(
+        &self,
+        mailbox: MailboxId,
+        uids: &[u32],
+        target: MailboxId,
+    ) -> Result<Vec<u32>> {
+        let _ = (mailbox, uids, target);
+        Err(read_only())
+    }
+
+    /// Delete the messages with these UIDs: outside Trash they move to
+    /// Trash; inside Trash they are deleted for good. Returns the UIDs
+    /// removed from `mailbox`, ascending.
+    async fn expunge_mails(&self, mailbox: MailboxId, uids: &[u32]) -> Result<Vec<u32>> {
+        let _ = (mailbox, uids);
+        Err(read_only())
+    }
+}
+
+fn read_only() -> crate::domain::Error {
+    crate::domain::Error::Unsupported("read-only backend".into())
 }
 
 #[cfg(test)]

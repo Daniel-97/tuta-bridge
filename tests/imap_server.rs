@@ -29,8 +29,8 @@ use tuta_bridge::ports::mailbox_events::MailboxChanged;
 
 use support::{FakeFetched, FakeImapBackend, FakeSelected};
 
-const GREETING: &str = "* OK [CAPABILITY IMAP4rev1 IDLE ID] tuta-bridge ready";
-const LOGIN_OK: &str = "a1 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed";
+const GREETING: &str = "* OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] tuta-bridge ready";
+const LOGIN_OK: &str = "a1 OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] LOGIN completed";
 const USER: &str = "user@example.invalid";
 const PASSWORD: &str = "hunter2";
 
@@ -203,14 +203,19 @@ async fn expect_select_block<R, W>(
     } else {
         ("READ-WRITE", "SELECT")
     };
-    wire.expect("* FLAGS (\\Seen)").await;
+    wire.expect("* FLAGS (\\Seen \\Deleted)").await;
     wire.expect(&format!("* {exists} EXISTS")).await;
     wire.expect("* 0 RECENT").await;
     if let Some(unseen) = unseen {
         wire.expect(&format!("* OK [UNSEEN {unseen}]")).await;
     }
-    wire.expect("* OK [PERMANENTFLAGS ()] Read-only mailbox")
-        .await;
+    if examine {
+        wire.expect("* OK [PERMANENTFLAGS ()] Read-only mailbox")
+            .await;
+    } else {
+        wire.expect("* OK [PERMANENTFLAGS (\\Seen)] Flags permitted")
+            .await;
+    }
     wire.expect(&format!("* OK [UIDVALIDITY {uidvalidity}]"))
         .await;
     wire.expect(&format!("* OK [UIDNEXT {uidnext}]")).await;
@@ -254,7 +259,7 @@ async fn failed_logins_are_delayed_serialized_and_bounded() {
     second.send("b2 LOGIN user@example.invalid wrong").await;
     first.send("a2 LOGIN user@example.invalid hunter2").await;
     first
-        .expect("a2 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed")
+        .expect("a2 OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] LOGIN completed")
         .await;
     assert_eq!(started.elapsed(), Duration::ZERO);
     second.expect("b2 NO authentication failed").await;
@@ -372,7 +377,7 @@ async fn login_accepts_client_literals() {
     wire.send_raw(b"user@example.invalid {7}\r\n").await;
     wire.expect("+ ").await;
     wire.send_raw(b"hunter2\r\n").await;
-    wire.expect("b1 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed")
+    wire.expect("b1 OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] LOGIN completed")
         .await;
 
     // An oversized announcement is refused without a continuation and
@@ -800,27 +805,38 @@ async fn logout_sends_bye() {
 }
 
 #[tokio::test]
-async fn writes_are_refused() {
+async fn unsupported_writes_are_refused() {
     let (mut wire, session, _) = spawn_session(backend(), 16).await;
     login(&mut wire).await;
     select_inbox(&mut wire).await;
 
-    for (tag, command) in [
-        ("w1", "STORE 1 +FLAGS (\\Seen)"),
-        ("w2", "EXPUNGE"),
-        ("w3", "COPY 1 Inbox"),
-        ("w4", "MOVE 1 Inbox"),
-        ("w5", "CREATE Foo"),
-        ("w6", "DELETE Foo"),
-        ("w7", "RENAME Foo Bar"),
-        ("w8", "SUBSCRIBE Foo"),
-        ("w9", "UNSUBSCRIBE Foo"),
-        ("wi", "UID STORE 1 +FLAGS (\\Seen)"),
-        ("wj", "UID COPY 1 Inbox"),
+    for (tag, command, answer) in [
+        (
+            "w3",
+            "COPY 1 Archive",
+            "NO COPY is not supported by Tuta; use MOVE",
+        ),
+        (
+            "wj",
+            "UID COPY 1 Archive",
+            "NO COPY is not supported by Tuta; use MOVE",
+        ),
+        ("w5", "CREATE Foo", "NO not supported by this bridge"),
+        ("w6", "DELETE Foo", "NO not supported by this bridge"),
+        ("w7", "RENAME Foo Bar", "NO not supported by this bridge"),
+        ("w8", "SUBSCRIBE Foo", "NO not supported by this bridge"),
+        ("w9", "UNSUBSCRIBE Foo", "NO not supported by this bridge"),
+        (
+            "wf",
+            "STORE 1 +FLAGS (\\Flagged)",
+            "NO only \\Seen and \\Deleted are supported",
+        ),
+        ("wb", "STORE 1 +LABELS (x)", "BAD invalid STORE"),
+        ("wm", "MOVE 1 Nowhere", "NO [TRYCREATE] no such mailbox"),
+        ("wc", "COPY 1 Nowhere", "NO [TRYCREATE] no such mailbox"),
     ] {
         wire.send(&format!("{tag} {command}")).await;
-        wire.expect(&format!("{tag} NO not supported by this read-only bridge"))
-            .await;
+        wire.expect(&format!("{tag} {answer}")).await;
     }
 
     // APPEND announces its literal first; the session consumes it before
@@ -828,12 +844,160 @@ async fn writes_are_refused() {
     wire.send("wa APPEND Inbox {5}").await;
     wire.expect("+ ").await;
     wire.send_raw(b"hello\r\n").await;
-    wire.expect("wa NO not supported by this read-only bridge")
-        .await;
+    wire.expect("wa NO not supported by this bridge").await;
 
     // Unknown commands answer BAD.
     wire.send("wz FROBNICATE now").await;
     wire.expect("wz BAD unknown command").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn store_seen_answers_fetch_flags() {
+    let fake = backend();
+    let (mut wire, session, _) = spawn_session(Arc::clone(&fake), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // Inbox holds uid 1 (read) and uid 3 (unread).
+    wire.send("s1 UID STORE 3 +FLAGS (\\Seen)").await;
+    wire.expect("* 2 FETCH (FLAGS (\\Seen) UID 3)").await;
+    wire.expect("s1 OK UID STORE completed").await;
+
+    wire.send("s2 STORE 2 -FLAGS.SILENT (\\Seen)").await;
+    wire.expect("s2 OK STORE completed").await;
+
+    wire.send("s3 STORE 1:2 FLAGS \\Seen").await;
+    wire.expect("* 1 FETCH (FLAGS (\\Seen))").await;
+    wire.expect("* 2 FETCH (FLAGS (\\Seen))").await;
+    wire.expect("s3 OK STORE completed").await;
+
+    // Our own change is already in the view: NOOP announces nothing.
+    wire.send("s4 NOOP").await;
+    wire.expect("s4 OK NOOP completed").await;
+
+    assert_eq!(
+        fake.writes(),
+        vec![
+            "seen Inbox [3] true".to_string(),
+            "seen Inbox [3] false".to_string(),
+            "seen Inbox [1, 3] true".to_string(),
+        ]
+    );
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn deleted_then_expunge_answers_itemized_expunges() {
+    let fake = backend();
+    let (mut wire, session, _) = spawn_session(Arc::clone(&fake), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // \Deleted stays in the session: no remote write yet.
+    wire.send("d1 STORE 1:2 +FLAGS (\\Deleted)").await;
+    wire.expect("* 1 FETCH (FLAGS (\\Seen \\Deleted))").await;
+    wire.expect("* 2 FETCH (FLAGS (\\Deleted))").await;
+    wire.expect("d1 OK STORE completed").await;
+    assert!(fake.writes().is_empty());
+
+    wire.send("d2 UID STORE 3 -FLAGS.SILENT (\\Deleted)").await;
+    wire.expect("d2 OK UID STORE completed").await;
+
+    wire.send("d3 EXPUNGE").await;
+    wire.expect("* 1 EXPUNGE").await;
+    wire.expect("d3 OK EXPUNGE completed").await;
+    assert_eq!(fake.writes(), vec!["expunge Inbox [1]".to_string()]);
+
+    // Nothing left marked: a second EXPUNGE writes nothing.
+    wire.send("d4 EXPUNGE").await;
+    wire.expect("d4 OK EXPUNGE completed").await;
+    assert_eq!(fake.writes().len(), 1);
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn move_answers_expunges_in_descending_order() {
+    let fake = backend();
+    let (mut wire, session, _) = spawn_session(Arc::clone(&fake), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    wire.send("m1 UID MOVE 1:* Archive").await;
+    wire.expect("* 2 EXPUNGE").await;
+    wire.expect("* 1 EXPUNGE").await;
+    wire.expect("m1 OK UID MOVE completed").await;
+    assert_eq!(fake.writes(), vec!["move Inbox [1, 3] Archive".to_string()]);
+
+    // The view is already empty: NOOP announces nothing more.
+    wire.send("m2 NOOP").await;
+    wire.expect("m2 OK NOOP completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_write_answers_no_and_keeps_the_view() {
+    let fake = backend();
+    *fake.writes_failing.lock().unwrap() = true;
+    let (mut wire, session, _) = spawn_session(Arc::clone(&fake), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    wire.send("f1 MOVE 1 Archive").await;
+    wire.expect("f1 NO network error: mailbox write failed")
+        .await;
+    wire.send("f2 UID STORE 3 +FLAGS (\\Seen)").await;
+    wire.expect("f2 NO network error: mailbox write failed")
+        .await;
+
+    wire.send("f3 NOOP").await;
+    wire.expect("f3 OK NOOP completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn examine_refuses_writes() {
+    let fake = backend();
+    let (mut wire, session, _) = spawn_session(Arc::clone(&fake), 16).await;
+    login(&mut wire).await;
+    wire.send("e1 EXAMINE Inbox").await;
+    expect_select_block(&mut wire, "e1", 2, Some(2), 7, 4, true).await;
+
+    for (tag, command) in [
+        ("e2", "STORE 1 +FLAGS (\\Seen)"),
+        ("e3", "UID MOVE 1 Archive"),
+        ("e4", "EXPUNGE"),
+    ] {
+        wire.send(&format!("{tag} {command}")).await;
+        wire.expect(&format!("{tag} NO mailbox is read-only")).await;
+    }
+    assert!(fake.writes().is_empty());
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn close_expunges_deleted_mail_silently() {
+    let fake = backend();
+    let (mut wire, session, _) = spawn_session(Arc::clone(&fake), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    wire.send("c1 UID STORE 3 +FLAGS.SILENT (\\Deleted)").await;
+    wire.expect("c1 OK UID STORE completed").await;
+    wire.send("c2 CLOSE").await;
+    wire.expect("c2 OK CLOSE completed").await;
+    assert_eq!(fake.writes(), vec!["expunge Inbox [3]".to_string()]);
 
     drop(wire);
     session.await.unwrap().unwrap();
@@ -1200,7 +1364,7 @@ async fn id_command_answers_and_noop_flushes_notifications() {
     wire.expect("a1 OK ID completed").await;
 
     wire.send("a2 LOGIN user@example.invalid hunter2").await;
-    wire.expect("a2 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed")
+    wire.expect("a2 OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] LOGIN completed")
         .await;
     wire.send("a3 SELECT Inbox").await;
     expect_select_block(&mut wire, "a3", 2, Some(2), 7, 4, false).await;
@@ -1259,14 +1423,14 @@ async fn capability_advertises_the_subset() {
     wire.expect(GREETING).await;
 
     wire.send("a0 CAPABILITY").await;
-    wire.expect("* CAPABILITY IMAP4rev1 IDLE ID").await;
+    wire.expect("* CAPABILITY IMAP4rev1 IDLE ID MOVE").await;
     wire.expect("a0 OK CAPABILITY completed").await;
 
     wire.send("a1 LOGIN user@example.invalid hunter2").await;
     wire.expect(LOGIN_OK).await;
 
     wire.send("a2 CAPABILITY").await;
-    wire.expect("* CAPABILITY IMAP4rev1 IDLE ID").await;
+    wire.expect("* CAPABILITY IMAP4rev1 IDLE ID MOVE").await;
     wire.expect("a2 OK CAPABILITY completed").await;
 
     drop(wire);
@@ -1352,7 +1516,7 @@ async fn state_inappropriate_commands_answer_bad() {
     }
 
     wire.send("a8 LOGIN user@example.invalid hunter2").await;
-    wire.expect("a8 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed")
+    wire.expect("a8 OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] LOGIN completed")
         .await;
 
     // LOGIN again, or read the selected state without one.
@@ -1753,4 +1917,41 @@ async fn serves_a_full_client_round_over_tls() {
     wire.expect("* BYE tuta-bridge signing off").await;
     wire.expect("a5 OK LOGOUT completed").await;
     wire.expect_eof().await;
+}
+
+#[tokio::test]
+async fn append_to_sent_is_accepted_and_discarded() {
+    let fake = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_mailbox(
+                MailboxId(4),
+                "Sent",
+                "\\Sent",
+                FakeSelected::new(13, 1, 0, vec![]),
+            ),
+    );
+    let (mut wire, session, _) = spawn_session(Arc::clone(&fake), 16).await;
+    login(&mut wire).await;
+
+    // Thunderbird files its own copy after a send: Tuta already did.
+    wire.send("p1 APPEND Sent (\\Seen) {5}").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"hello\r\n").await;
+    wire.expect("p1 OK APPEND completed").await;
+
+    // Everywhere else APPEND is still refused.
+    wire.send("p2 APPEND Inbox {5}").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"hello\r\n").await;
+    wire.expect("p2 NO not supported by this bridge").await;
+
+    assert!(fake.writes().is_empty());
+    drop(wire);
+    session.await.unwrap().unwrap();
 }

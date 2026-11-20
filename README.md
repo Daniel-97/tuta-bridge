@@ -2,7 +2,7 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M5 complete for a single account (login, status/logout, dump, minimal state, sync, live event watching, and a read-only IMAP server). IMAP is read-only; writes (M6) and SMTP (M7) are not implemented yet.
+Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, an IMAP server with read/unread, move and delete, an optional read-only POP3 server, and optional SMTP submission). Sending is **not end-to-end encrypted** — see "SMTP submission" below.
 
 ## Credentials
 
@@ -97,7 +97,7 @@ Limits:
 - `watch` never fetches or stores message bodies, attachments, or `.eml`
   files; event lookups reload header metadata only.
 
-## IMAP server (read-only)
+## IMAP server
 
 `tuta-bridge serve` runs one process with two loops: the `watch` event
 loop keeping the index current, and a TLS-only IMAP listener that
@@ -107,7 +107,7 @@ answers from it. Ctrl-C stops the process.
 # Set the password IMAP clients must use (prompted twice, hidden input)
 tuta-bridge passwd
 
-# Serve read-only IMAP while watching Tuta events (Ctrl-C to stop)
+# Serve IMAP while watching Tuta events (Ctrl-C to stop)
 tuta-bridge serve
 ```
 
@@ -153,12 +153,19 @@ Use manual account configuration (not the automatic account dialog):
   bridge password set by `passwd`.
 - Accept the certificate exception on first connect — the certificate
   is self-signed.
-- Outgoing (SMTP) fields are placeholders: SMTP is not implemented, so
-  sending always fails.
+- Outgoing (SMTP), once `smtp_port` is set (see below): hostname
+  `127.0.0.1`, the configured port, connection security SSL/TLS,
+  authentication "Normal password", same username and password.
 
-Deleting or moving a mail, or changing a read/unread flag, is refused
-by the server with `NO` — the bridge is read-only, and the change stays
-local to the client until it refreshes.
+Marking mail read/unread, moving it between folders (drag and drop)
+and deleting it (Thunderbird's default "move to Trash") are applied to
+Tuta. Starring a mail (`\Flagged`) and copying a mail are refused with
+`NO`: Tuta has neither.
+
+After a send, Thunderbird uploads its own copy to Sent ("Place a copy
+in Sent"). The bridge accepts that upload and discards it, because Tuta
+already filed the sent copy itself (it appears through the event
+stream); turning the option off saves the upload.
 
 ### mbsync
 
@@ -186,23 +193,34 @@ Near :tuta-bridge-local:
 Patterns *
 Create Near
 Expunge None
-Sync PullNew PullFlags
+Sync PullNew PullFlags PushFlags
 SyncState *
 ```
 
 `CertificateFile` points at the bridge certificate
 (`$XDG_DATA_HOME/tuta-bridge/imap-cert.pem`), so mbsync verifies TLS
-without a per-host exception. `Sync PullNew PullFlags` pulls new mail
-and flag changes only: the server refuses every write, so pushing
-would only produce errors. The `Far`/`Near` names require mbsync ≥ 1.3
+without a per-host exception. `Sync PullNew PullFlags PushFlags` pulls new mail
+and flag changes and pushes read/unread changes back; only `\Seen` is
+kept by Tuta, so other pushed flags are refused. The `Far`/`Near` names require mbsync ≥ 1.3
 (older releases spell them `Master`/`Slave`).
 
 ### Limits of v1
 
-- **Read-only.** `STORE`, `APPEND`, `COPY`, `MOVE`, `EXPUNGE`, and
-  folder mutations (`CREATE`, `DELETE`, `RENAME`, `SUBSCRIBE`,
-  `UNSUBSCRIBE`) answer `NO`; write support is planned for a later
-  milestone.
+- **Writes.** `STORE` accepts `\Seen` (applied to Tuta) and
+  `\Deleted` (kept by the session until `EXPUNGE`/`CLOSE`); every other
+  flag answers `NO`, and `PERMANENTFLAGS` is `(\Seen)`. `MOVE`/`UID MOVE`
+  (RFC 6851) move mail to another folder; the moved mail gets a new UID
+  in the target when the Tuta event arrives. `EXPUNGE` moves `\Deleted`
+  mail to Trash, and deletes it for good only when it already is in
+  Trash. `COPY` answers `NO` (Tuta has no copy; `[TRYCREATE]` when the
+  target does not exist). `APPEND` to Sent is accepted and discarded
+  (see Thunderbird above); any other `APPEND` answers `NO`, as do folder
+  mutations (`CREATE`, `DELETE`, `RENAME`, `SUBSCRIBE`,
+  `UNSUBSCRIBE`). `SEARCH DELETED` stays unsupported even though
+  `\Deleted` is kept per session. `EXAMINE`d mailboxes refuse every write. `UIDPLUS` is
+  not advertised, so `UID EXPUNGE` is unknown.
+- IDLE pushes new mail (`EXISTS`) and removals; read-state changes made
+  elsewhere reach the client at its next `NOOP`/poll or during IDLE.
 - `SEARCH BODY` and `SEARCH TEXT` are unsupported — bodies are never
   stored. `NEW`/`OLD` are unsupported too (`RECENT` is always zero), as
   are `ANSWERED`, `DELETED`, `DRAFT`, `FLAGGED`, and keyword keys: the
@@ -224,6 +242,80 @@ would only produce errors. The `Far`/`Near` names require mbsync ≥ 1.3
   (U+2215), and folders that share a name are listed as `Name`,
   `Name (2)`, … so each stays reachable.
 - One account at a time.
+
+## POP3 server (optional)
+
+`serve` can also answer POP3 over implicit TLS (POP3S) for clients that
+only download the Inbox. It is off unless the config file names a port:
+
+```toml
+pop3_port = 9950
+```
+
+- Same listener rules as IMAP: `127.0.0.1` only, the same self-signed
+  certificate, the same bridge password, the same failed-login delay.
+- The maildrop is the Inbox as it was at login. `UIDL` answers
+  `<uidvalidity>.<uid>`, stable across sessions, so a client that keeps
+  mail on the server never downloads a message twice. Mail that leaves
+  the Inbox during a session disappears from `LIST`, `STAT` and `UIDL`
+  alike; a `resync` during a session ends it (`-ERR [SYS/TEMP]`) rather
+  than renumbering. `CAPA` advertises `EXPIRE NEVER`.
+- Connections are bounded like IMAP's: 60 seconds to log in, 10 minutes
+  of inactivity, 60 seconds for a stalled write, at most 16 at once.
+- Supported: `CAPA`, `USER`/`PASS`, `STAT`, `LIST`, `UIDL`, `RETR`,
+  `TOP`, `NOOP`, `RSET`, `QUIT`. Messages render on demand like IMAP
+  `BODY[]`.
+- `DELE` answers `-ERR`: mail always stays on the server. Configure the
+  client to leave messages on the server (Thunderbird's default;
+  `fetchmail --keep`). POP3 has no folders, flags, push, or server-side
+  search; use IMAP for those.
+
+## SMTP submission (optional)
+
+`serve` can accept mail to send over SMTP submission with implicit TLS.
+It is off unless the config file names a port:
+
+```toml
+smtp_port = 9925
+```
+
+> **Not end-to-end encrypted.** The bridge sends every mail the way the
+> Tuta web client sends a *non-confidential* mail: the mail's key is
+> handed to the Tuta server, which delivers it — in plain text to
+> external recipients, and readable by Tuta's servers in transit even
+> for Tuta recipients. The web client encrypts Tuta-to-Tuta mail end to
+> end; the bridge cannot yet, because the Tuta SDK pinned here does not
+> expose the public-key operations that needs, and the bridge never
+> reimplements cryptography. Use the web or desktop client for mail that
+> must stay end-to-end encrypted. Password-protected mail to external
+> recipients is not available either.
+
+- Same listener rules as IMAP: `127.0.0.1` only, the same self-signed
+  certificate, `AUTH PLAIN`/`AUTH LOGIN` with the account address and
+  the bridge password, the same failed-login delay. Mail is accepted
+  only after authentication.
+- The sender must be one of the account's enabled addresses or aliases
+  (compared case-insensitively). `MAIL FROM` is checked right away and
+  refused with `553`; if the check cannot reach Tuta the answer is a
+  temporary `451`. Envelope and header addresses must be plain
+  `local@domain`.
+- Connections are bounded: 60 seconds to log in, 5 minutes of
+  inactivity, 10 minutes for one whole `DATA`, 60 seconds for a stalled
+  write, at most 16 at once. IMAP, POP3 and SMTP share one
+  failed-login delay queue.
+- Recipients come from the SMTP envelope: envelope recipients that are
+  not in `To:`/`Cc:` are sent as Bcc. Attachments and inline parts are
+  uploaded. HTML bodies are sent as they are; plain-text bodies are
+  escaped into HTML. Messages are limited to 25 MiB and bodies to 1 MiB
+  (Tuta's limit).
+- Tuta files the sent copy in Sent itself; it reaches IMAP clients
+  through the event stream like any other new mail.
+- A `250` reply means Tuta accepted the mail. If Tuta cannot be reached
+  the reply is a temporary `451`, so the client keeps the mail and
+  retries.
+- Not carried over from the submitted message: custom headers,
+  `In-Reply-To`/`References` (Tuta builds its own threading headers),
+  and the `Date:` (Tuta stamps the send time).
 
 ## Dump
 

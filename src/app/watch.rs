@@ -37,6 +37,8 @@ use tokio::sync::{broadcast, oneshot};
 use crate::adapters::imap::backend::TutaImapBackend;
 use crate::adapters::imap::server::{self, ensure_certificate, tls_acceptor, ServeLimits};
 use crate::adapters::mime::MimeRenderer;
+use crate::adapters::pop3::server::{serve_pop3, Pop3ServeLimits};
+use crate::adapters::smtp::server::{serve_smtp, SmtpServeLimits};
 use crate::adapters::sqlite_state::STATE_BUSY_MESSAGE;
 use crate::adapters::tuta::event_wire::is_invalid_event;
 use crate::adapters::tuta::generated_id::{
@@ -296,8 +298,9 @@ impl WatchUseCase {
                                 break;
                             };
                             batches.insert(batch.owner_group_id.clone(), batch.batch_id.clone());
-                            if report.changes > 0 {
-                                println!("applied {} changes", report.changes);
+                            // Counts by kind only: no subject, address or id.
+                            if !report.counts.is_empty() {
+                                println!("{}", report.counts.summary());
                             }
                             // Idling sessions learn which mailboxes the
                             // batch changed; a closed channel only means
@@ -681,7 +684,9 @@ impl ServeUseCase {
             }),
             source: session.shared_mail(),
             renderer,
+            writer: session.shared_writer(),
         });
+        let mail_sender = session.shared_sender();
         let _session = session;
 
         // 5. The watch task feeds the same store and broadcasts every
@@ -720,6 +725,35 @@ impl ServeUseCase {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|_| Error::Network("imap listener bind failed".into()))?;
+        // POP3 is opt-in: it listens only when the config names a port.
+        let pop3_listener = match config.pop3_port {
+            Some(pop3_port) => {
+                validate_imap_port(pop3_port)
+                    .map_err(|_| Error::Config("pop3_port must be between 1 and 65535".into()))?;
+                let pop3_listener = TcpListener::bind(("127.0.0.1", pop3_port))
+                    .await
+                    .map_err(|_| Error::Network("pop3 listener bind failed".into()))?;
+                println!("serving POP3 on 127.0.0.1:{pop3_port}");
+                Some(pop3_listener)
+            }
+            None => None,
+        };
+        // SMTP is opt-in as well: sending is non-confidential (see the
+        // README), so it listens only when the config names a port.
+        let smtp_listener = match config.smtp_port {
+            Some(smtp_port) => {
+                validate_imap_port(smtp_port)
+                    .map_err(|_| Error::Config("smtp_port must be between 1 and 65535".into()))?;
+                let smtp_listener = TcpListener::bind(("127.0.0.1", smtp_port))
+                    .await
+                    .map_err(|_| Error::Network("smtp listener bind failed".into()))?;
+                println!(
+                    "serving SMTP submission on 127.0.0.1:{smtp_port} (not end-to-end encrypted)"
+                );
+                Some(smtp_listener)
+            }
+            None => None,
+        };
         println!("serving IMAP on 127.0.0.1:{port}; press Ctrl-C to stop");
 
         // 7. Accept until the stop future resolves, then end the
@@ -728,13 +762,28 @@ impl ServeUseCase {
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
         let mut stop = pin!(stop);
-        let mut accepting = pin!(server::serve(
-            listener,
-            tls,
-            backend,
-            sender,
-            ServeLimits::default()
-        ));
+        let (imap_limits, pop3_limits, smtp_limits) = shared_listener_limits();
+        let smtp_auth = Arc::clone(&backend);
+        let smtp_tls = tls.clone();
+        let mut smtp_accepting = pin!(async move {
+            match smtp_listener {
+                Some(smtp_listener) => {
+                    serve_smtp(smtp_listener, smtp_tls, smtp_auth, mail_sender, smtp_limits).await
+                }
+                None => std::future::pending().await,
+            }
+        });
+        let pop3_backend = Arc::clone(&backend);
+        let pop3_tls = tls.clone();
+        let mut pop3_accepting = pin!(async move {
+            match pop3_listener {
+                Some(pop3_listener) => {
+                    serve_pop3(pop3_listener, pop3_tls, pop3_backend, pop3_limits).await
+                }
+                None => std::future::pending().await,
+            }
+        });
+        let mut accepting = pin!(server::serve(listener, tls, backend, sender, imap_limits));
         tokio::select! {
             biased;
             _ = &mut stop => {}
@@ -745,6 +794,8 @@ impl ServeUseCase {
                 };
             }
             () = &mut accepting => {}
+            () = &mut pop3_accepting => {}
+            () = &mut smtp_accepting => {}
         }
         let _ = stop_watch.send(());
         match watch_task.await {
@@ -754,9 +805,37 @@ impl ServeUseCase {
     }
 }
 
+/// The limits of the three listeners, sharing one failed-login gate:
+/// IMAP, POP3 and SMTP check the same bridge password, so their
+/// failed-login delays must queue behind each other, or a local process
+/// would get one guessing channel per protocol.
+pub fn shared_listener_limits() -> (ServeLimits, Pop3ServeLimits, SmtpServeLimits) {
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let mut imap = ServeLimits::default();
+    imap.session.login_gate = Arc::clone(&gate);
+    let mut pop3 = Pop3ServeLimits::default();
+    pop3.session.login_gate = Arc::clone(&gate);
+    let mut smtp = SmtpServeLimits::default();
+    smtp.session.login_gate = gate;
+    (imap, pop3, smtp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_listener_shares_one_login_gate() {
+        let (imap, pop3, smtp) = shared_listener_limits();
+        assert!(Arc::ptr_eq(
+            &imap.session.login_gate,
+            &pop3.session.login_gate
+        ));
+        assert!(Arc::ptr_eq(
+            &imap.session.login_gate,
+            &smtp.session.login_gate
+        ));
+    }
 
     #[test]
     fn backoff_grows_and_caps() {
