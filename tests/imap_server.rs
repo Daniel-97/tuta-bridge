@@ -1043,6 +1043,75 @@ fn bare_fetch() -> FakeFetched {
     }
 }
 
+/// A backend whose Inbox (uids 1 and 3) reports `pending` messages to
+/// load for every FETCH.
+fn loading_backend(pending: usize) -> Arc<FakeImapBackend> {
+    Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_fetch(1, bare_fetch())
+            .with_fetch(3, bare_fetch())
+            .with_pending_loads(pending),
+    )
+}
+
+fn alert_limits(threshold: usize) -> SessionLimits {
+    SessionLimits {
+        alert_threshold: threshold,
+        ..SessionLimits::default()
+    }
+}
+
+#[tokio::test]
+async fn a_slow_fetch_is_announced_with_one_alert_per_mailbox() {
+    let scripted = loading_backend(2);
+    let (mut wire, _session, _) =
+        spawn_session_with(Arc::clone(&scripted), 16, alert_limits(2)).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // The ALERT comes before the first FETCH line, with the count only.
+    wire.send("a4 FETCH 1:* (FLAGS)").await;
+    wire.expect("* OK [ALERT] loading 2 messages from Tuta; this may take a while")
+        .await;
+    wire.expect("* 1 FETCH (FLAGS (\\Seen))").await;
+    wire.expect("* 2 FETCH (FLAGS (\\Seen))").await;
+    wire.expect("a4 OK FETCH completed").await;
+    // The backend was asked about exactly the requested uids.
+    assert_eq!(scripted.pending_calls.lock().unwrap()[0], vec![1, 3]);
+
+    // A second slow FETCH of the same mailbox stays silent.
+    wire.send("a5 UID FETCH 3 (FLAGS)").await;
+    wire.expect("* 2 FETCH (FLAGS (\\Seen) UID 3)").await;
+    wire.expect("a5 OK UID FETCH completed").await;
+}
+
+#[tokio::test]
+async fn a_cheap_fetch_sends_no_alert() {
+    // One load is below the threshold of two: no ALERT at all.
+    let scripted = loading_backend(1);
+    let (mut wire, _session, _) =
+        spawn_session_with(Arc::clone(&scripted), 16, alert_limits(2)).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    wire.send("a4 FETCH 1:* (FLAGS)").await;
+    wire.expect("* 1 FETCH (FLAGS (\\Seen))").await;
+    wire.expect("* 2 FETCH (FLAGS (\\Seen))").await;
+    wire.expect("a4 OK FETCH completed").await;
+
+    // A request smaller than the threshold is not even counted.
+    wire.send("a5 FETCH 1 (FLAGS)").await;
+    wire.expect("* 1 FETCH (FLAGS (\\Seen))").await;
+    wire.expect("a5 OK FETCH completed").await;
+    assert_eq!(scripted.pending_calls.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn message_numbers_hold_until_an_expunge_is_announced() {
     let scripted = Arc::new(

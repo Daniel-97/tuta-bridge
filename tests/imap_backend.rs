@@ -1264,6 +1264,83 @@ async fn one_fetch_returns_every_body_item_from_a_single_content_load() {
     assert_eq!(&response.bodies[2], header);
 }
 
+#[tokio::test]
+async fn pending_loads_counts_only_what_a_fetch_would_download() {
+    let world = world().await;
+    let mut uids = Vec::new();
+    for element in ["e1", "e2", "e3"] {
+        uids.push(
+            world
+                .store
+                .assign_uid(
+                    world.inbox,
+                    &partial_header(element, "s", 1_700_000_000_000, true),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let metadata = parse_fetch_items("(UID RFC822.SIZE BODYSTRUCTURE FLAGS)").unwrap();
+    let flags = parse_fetch_items("(UID FLAGS ENVELOPE)").unwrap();
+    let headers = parse_fetch_items("(UID BODY.PEEK[HEADER])").unwrap();
+
+    // A never-enriched folder: every size or structure is a load,
+    // stored flags and envelopes never are.
+    assert_eq!(
+        world
+            .backend
+            .pending_loads(world.inbox, &uids, &metadata)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        world
+            .backend
+            .pending_loads(world.inbox, &uids, &flags)
+            .await
+            .unwrap(),
+        0
+    );
+    // Only the requested uids count.
+    assert_eq!(
+        world
+            .backend
+            .pending_loads(world.inbox, &uids[..1], &metadata)
+            .await
+            .unwrap(),
+        1
+    );
+
+    // Once enriched, the same metadata FETCH is free: no false alarm.
+    for uid in &uids {
+        world
+            .backend
+            .fetch(world.inbox, *uid, &metadata)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        world
+            .backend
+            .pending_loads(world.inbox, &uids, &metadata)
+            .await
+            .unwrap(),
+        0
+    );
+    // A body is never stored, so it always loads.
+    assert_eq!(
+        world
+            .backend
+            .pending_loads(world.inbox, &uids, &headers)
+            .await
+            .unwrap(),
+        3
+    );
+    // Counting never touched the network.
+    assert_eq!(world.source.content_calls(), 3);
+}
+
 // ---------------------------------------------------------------------------
 // Writes (M6)
 // ---------------------------------------------------------------------------

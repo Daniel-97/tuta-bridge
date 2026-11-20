@@ -1405,6 +1405,10 @@ pub struct FakeImapBackend {
     pub writes: Mutex<Vec<String>>,
     /// While set, every write fails like a refused remote call.
     pub writes_failing: Mutex<bool>,
+    /// What `pending_loads` answers, whatever the request.
+    pub pending_loads: Mutex<usize>,
+    /// The uid lists `pending_loads` was asked about, in call order.
+    pub pending_calls: Mutex<Vec<Vec<u32>>>,
 }
 
 impl FakeImapBackend {
@@ -1422,7 +1426,15 @@ impl FakeImapBackend {
             body_fetches: AtomicUsize::new(0),
             writes: Mutex::new(Vec::new()),
             writes_failing: Mutex::new(false),
+            pending_loads: Mutex::new(0),
+            pending_calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Make `pending_loads` answer `count` for every request.
+    pub fn with_pending_loads(self, count: usize) -> Self {
+        *self.pending_loads.lock().unwrap() = count;
+        self
     }
 
     /// Register one mailbox: its LIST view plus its `SELECT` snapshot.
@@ -1669,6 +1681,16 @@ impl ImapBackend for FakeImapBackend {
             .iter()
             .find(|view| view.id == mailbox)
             .and_then(|view| self.opened(view)))
+    }
+
+    async fn pending_loads(
+        &self,
+        _mailbox: MailboxId,
+        uids: &[u32],
+        _items: &[FetchItem],
+    ) -> Result<usize> {
+        self.pending_calls.lock().unwrap().push(uids.to_vec());
+        Ok(*self.pending_loads.lock().unwrap())
     }
 
     async fn fetch(

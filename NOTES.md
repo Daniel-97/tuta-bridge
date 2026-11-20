@@ -439,3 +439,9 @@ from the review:
 - The state database is still metadata-only (17 columns); `rfc822_size` and `mime_structure` are populated only for fetched mails; `serve` logs carry only fixed strings and counts.
 - A `resync` run during acceptance changed UIDVALIDITY as designed and Thunderbird rebuilt its cache without errors (the session-reset path exercised in production).
 
+## M9 loading ALERT
+
+- `ImapBackend::pending_loads` counts the requested uids whose FETCH would load content from Tuta: every body item, and a size or structure only when the row lacks it (or is stale). It shares the `Wants::needs_enrichment` predicate with `fetch`, so the count and the actual loads cannot drift apart. It reads the store only, never the network.
+- The session asks for the count only when the request selects at least `SessionLimits::alert_threshold` (default 25) messages and the mailbox has not been alerted on this connection yet; at or above the threshold it writes `* OK [ALERT] loading N messages from Tuta; this may take a while` and flushes before the first FETCH line. A failed count skips the ALERT.
+- Thunderbird presents ALERT text as a notification, hence once per mailbox and connection. `NOTIFY` (RFC 5435) is for events, not progress, and is not used. POP3 has no equivalent and stays silent.
+

@@ -139,6 +139,10 @@ pub struct SessionLimits {
     /// connections run one after the other: opening more connections
     /// does not buy more password guesses per second.
     pub login_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Messages a FETCH must load from Tuta before the session warns
+    /// the client with an untagged `* OK [ALERT]` first. Below it a
+    /// FETCH is quick enough to stay silent.
+    pub alert_threshold: usize,
 }
 
 impl Default for SessionLimits {
@@ -152,8 +156,20 @@ impl Default for SessionLimits {
             login_failure_delay: Duration::from_secs(3),
             max_login_attempts: 3,
             login_gate: Arc::new(tokio::sync::Mutex::new(())),
+            alert_threshold: ALERT_THRESHOLD,
         }
     }
+}
+
+/// Default [`SessionLimits::alert_threshold`]: a few dozen loads already
+/// take long enough to look like a hang in a client.
+pub const ALERT_THRESHOLD: usize = 25;
+
+/// The ALERT sent before a FETCH that loads `pending` messages from
+/// Tuta. RFC 3501 §7.1: ALERT is the one response code a client must
+/// show its user. Fixed text and a counter only.
+pub fn loading_alert(pending: usize) -> String {
+    format!("* OK [ALERT] loading {pending} messages from Tuta; this may take a while")
 }
 
 /// The most rendered bytes a session keeps between the chunks of a
@@ -238,6 +254,10 @@ struct Session {
     /// PERMANENTFLAGS) until EXPUNGE or CLOSE acts on it; selecting
     /// another mailbox forgets it.
     deleted: HashSet<u32>,
+    /// Mailboxes this session already sent a loading ALERT for. Clients
+    /// show ALERT text as a notification, so it is sent once per
+    /// mailbox and connection, not before every slow FETCH.
+    alerted: HashSet<MailboxId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +288,7 @@ where
         failed_logins: 0,
         partial_cache: None,
         deleted: HashSet::new(),
+        alerted: HashSet::new(),
     };
 
     write_line(&mut writer, &greeting()).await?;
@@ -1269,17 +1290,43 @@ impl Session {
             return Ok(());
         };
         let max_uid = uids.last().copied().unwrap_or(0);
+        let count = u32::try_from(uids.len()).unwrap_or(u32::MAX);
+        let selected: Vec<(u32, u32)> = uids
+            .iter()
+            .enumerate()
+            .map(|(index, uid)| (u32::try_from(index + 1).unwrap_or(u32::MAX), *uid))
+            .filter(|(msn, uid)| {
+                if uid_command {
+                    set.contains(*uid, max_uid)
+                } else {
+                    set.contains(*msn, count)
+                }
+            })
+            .collect();
 
-        for (index, uid) in uids.iter().enumerate() {
-            let msn = u32::try_from(index + 1).unwrap_or(u32::MAX);
-            let selected = if uid_command {
-                set.contains(*uid, max_uid)
-            } else {
-                set.contains(msn, u32::try_from(uids.len()).unwrap_or(u32::MAX))
-            };
-            if !selected {
-                continue;
+        // A FETCH that must load many messages from Tuta is slow and
+        // otherwise silent: tell the client before starting, once per
+        // mailbox. The count is best effort — a failure to compute it
+        // only skips the warning.
+        // A request smaller than the threshold can never reach it, so
+        // single-message fetches skip the count — and its store read.
+        let threshold = self.limits.alert_threshold.max(1);
+        if selected.len() >= threshold && !self.alerted.contains(&mailbox) {
+            let wanted: Vec<u32> = selected.iter().map(|(_, uid)| *uid).collect();
+            let pending = self
+                .backend
+                .pending_loads(mailbox, &wanted, &items)
+                .await
+                .unwrap_or(0);
+            if pending >= threshold {
+                write_line(writer, &loading_alert(pending)).await?;
+                writer.flush().await.map_err(io_failed)?;
+                self.alerted.insert(mailbox);
             }
+        }
+
+        for (msn, uid) in selected.iter() {
+            let (msn, uid) = (*msn, uid);
             // A uid the store no longer has answers nothing — its
             // EXPUNGE waits for the next sync point, since none may be
             // sent during a FETCH — and so does a uid whose

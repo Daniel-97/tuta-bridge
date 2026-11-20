@@ -132,6 +132,17 @@ tuta-bridge serve
   one `IDLE`) once logged in. A client that stops reading is dropped
   after 60 seconds. A client cut off this way gets `* BYE` and simply
   reconnects.
+- A FETCH that has to download at least 25 messages from Tuta — the
+  first mass FETCH of a folder whose sizes and structures were never
+  loaded, or any FETCH of that many bodies — is announced first with an
+  untagged `* OK [ALERT] loading N messages from Tuta; this may take a
+  while`, so the client can show why it is waiting instead of a mute
+  indicator. RFC 3501 §7.1 requires clients to show ALERT text to the
+  user. It is sent at most once per mailbox and connection, never for a
+  FETCH the index can answer by itself (flags, envelopes, sizes and
+  structures already loaded), and carries only that fixed text and the
+  count. The progress bar a client draws is its own estimate from the
+  `EXISTS`/`STATUS` totals; IMAP has no progress channel.
 - A wrong password is answered after 3 seconds, logged as a warning
   (without the user name), and the connection is closed after the
   third failure. Failed attempts wait in a single queue, so opening
