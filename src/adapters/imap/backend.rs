@@ -745,6 +745,7 @@ impl ImapBackend for TutaImapBackend {
             .filter(|row| row.header.unread != unread)
             .cloned()
             .collect();
+        let mut vanished = std::collections::HashSet::new();
         if !changing.is_empty() {
             self.writer
                 .set_unread(&mail_refs(&changing), unread)
@@ -752,12 +753,27 @@ impl ImapBackend for TutaImapBackend {
             for row in &changing {
                 let mut header = row.header.clone();
                 header.unread = unread;
-                self.store
+                if let Err(error) = self
+                    .store
                     .update_metadata(mailbox, row.uid, &header, row.rfc822_size)
-                    .await?;
+                    .await
+                {
+                    // The event loop may remove a row while the remote
+                    // write is in flight. The write already succeeded for
+                    // the whole batch, so a vanished row is skipped — the
+                    // way FETCH skips it — instead of failing the command.
+                    if self.store.message_by_uid(mailbox, row.uid).await?.is_some() {
+                        return Err(error);
+                    }
+                    vanished.insert(row.uid);
+                }
             }
         }
-        Ok(rows.iter().map(|row| (row.uid, unread)).collect())
+        Ok(rows
+            .iter()
+            .filter(|row| !vanished.contains(&row.uid))
+            .map(|row| (row.uid, unread))
+            .collect())
     }
 
     async fn move_mails(

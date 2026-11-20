@@ -833,6 +833,7 @@ async fn unsupported_writes_are_refused() {
         ),
         ("wb", "STORE 1 +LABELS (x)", "BAD invalid STORE"),
         ("wm", "MOVE 1 Nowhere", "NO [TRYCREATE] no such mailbox"),
+        ("wc", "COPY 1 Nowhere", "NO [TRYCREATE] no such mailbox"),
     ] {
         wire.send(&format!("{tag} {command}")).await;
         wire.expect(&format!("{tag} {answer}")).await;
@@ -1916,4 +1917,41 @@ async fn serves_a_full_client_round_over_tls() {
     wire.expect("* BYE tuta-bridge signing off").await;
     wire.expect("a5 OK LOGOUT completed").await;
     wire.expect_eof().await;
+}
+
+#[tokio::test]
+async fn append_to_sent_is_accepted_and_discarded() {
+    let fake = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_mailbox(
+                MailboxId(4),
+                "Sent",
+                "\\Sent",
+                FakeSelected::new(13, 1, 0, vec![]),
+            ),
+    );
+    let (mut wire, session, _) = spawn_session(Arc::clone(&fake), 16).await;
+    login(&mut wire).await;
+
+    // Thunderbird files its own copy after a send: Tuta already did.
+    wire.send("p1 APPEND Sent (\\Seen) {5}").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"hello\r\n").await;
+    wire.expect("p1 OK APPEND completed").await;
+
+    // Everywhere else APPEND is still refused.
+    wire.send("p2 APPEND Inbox {5}").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"hello\r\n").await;
+    wire.expect("p2 NO not supported by this bridge").await;
+
+    assert!(fake.writes().is_empty());
+    drop(wire);
+    session.await.unwrap().unwrap();
 }

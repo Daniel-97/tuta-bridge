@@ -1468,3 +1468,63 @@ async fn the_echo_event_after_our_own_write_is_idempotent() {
     assert_eq!(rows[0].uid, uid);
     assert!(!rows[0].header.unread);
 }
+
+/// A writer that removes one row from the store while its remote call
+/// is in flight — the event loop racing the write.
+struct RacingWriter {
+    store: Arc<support::FakeStateStore>,
+    mailbox: MailboxId,
+    uid: u32,
+}
+
+#[async_trait::async_trait]
+impl tuta_bridge::ports::mailbox_writer::MailboxWriter for RacingWriter {
+    async fn set_unread(
+        &self,
+        _mails: &[tuta_bridge::ports::mailbox_writer::MailRef],
+        _unread: bool,
+    ) -> Result<()> {
+        self.store.remove_message(self.mailbox, self.uid).await
+    }
+    async fn move_to_folder(
+        &self,
+        _target: &str,
+        _mails: &[tuta_bridge::ports::mailbox_writer::MailRef],
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn move_to_trash(&self, _mails: &[tuta_bridge::ports::mailbox_writer::MailRef]) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_permanently(
+        &self,
+        _folder: &str,
+        _mails: &[tuta_bridge::ports::mailbox_writer::MailRef],
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_row_vanishing_during_the_remote_write_is_skipped() {
+    let w = world().await;
+    let kept = seed(&w, w.inbox, "e1", true).await;
+    let racing = seed(&w, w.inbox, "e2", true).await;
+    let backend = TutaImapBackend {
+        writer: Arc::new(RacingWriter {
+            store: Arc::clone(&w.store),
+            mailbox: w.inbox,
+            uid: racing,
+        }),
+        ..w.backend
+    };
+
+    let applied = backend
+        .store_seen(w.inbox, &[kept, racing], true)
+        .await
+        .unwrap();
+
+    assert_eq!(applied, vec![(kept, false)]);
+    let row = w.store.message_by_uid(w.inbox, kept).await.unwrap().unwrap();
+    assert!(!row.header.unread);
+}

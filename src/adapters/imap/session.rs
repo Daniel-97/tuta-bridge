@@ -937,11 +937,18 @@ impl Session {
             "COPY" | "UID COPY" => {
                 if self.state.authenticated() {
                     // Tuta has no copy: a mail lives in exactly one folder.
-                    write_line(
-                        writer,
-                        &format!("{tag} NO COPY is not supported by Tuta; use MOVE"),
-                    )
-                    .await?;
+                    // A missing target still gets TRYCREATE, like MOVE.
+                    let target = args.last().map(mailbox_name);
+                    let exists = match &target {
+                        Some(name) => self.backend.select(name).await?.is_some(),
+                        None => false,
+                    };
+                    let answer = if exists {
+                        "NO COPY is not supported by Tuta; use MOVE"
+                    } else {
+                        "NO [TRYCREATE] no such mailbox"
+                    };
+                    write_line(writer, &format!("{tag} {answer}")).await?;
                 } else {
                     write_line(
                         writer,
@@ -949,6 +956,15 @@ impl Session {
                     )
                     .await?;
                 }
+            }
+            "APPEND" if self.state.authenticated() && self.appends_to_sent(args).await? => {
+                // A client filing its own copy of a mail it just sent
+                // through the bridge: Tuta already filed one in Sent
+                // (it arrives through the event stream), so the upload
+                // is accepted and discarded rather than refused — a NO
+                // here makes Thunderbird report a failed send.
+                tracing::debug!("append to sent discarded; tuta files the sent copy");
+                write_line(writer, &format!("{tag} OK APPEND completed")).await?;
             }
             "APPEND" | "CREATE" | "DELETE" | "RENAME" | "SUBSCRIBE" | "UNSUBSCRIBE" => {
                 // Understood, always refused: folder management and
@@ -1748,6 +1764,18 @@ fn store_effect(mode: StoreMode, named: bool) -> Option<bool> {
 }
 
 impl Session {
+    /// Whether an APPEND targets the Sent mailbox with a message literal.
+    async fn appends_to_sent(&self, args: &[ImapArg]) -> Result<bool> {
+        let (Some(target), Some(ImapArg::Literal(_))) = (args.first(), args.last()) else {
+            return Ok(false);
+        };
+        Ok(self
+            .backend
+            .select(&mailbox_name(target))
+            .await?
+            .is_some_and(|mailbox| mailbox.view.special_use == "\\Sent"))
+    }
+
     /// The `(msn, uid)` pairs of the session view a sequence set names,
     /// ascending.
     fn targets(&self, set: &codec::SeqSet, uid_command: bool) -> Vec<(u32, u32)> {
@@ -1788,6 +1816,7 @@ impl Session {
         let State::Selected { messages, .. } = &mut self.state else {
             return Ok(());
         };
+        let removed: HashSet<u32> = removed.iter().copied().collect();
         let mut lines = Vec::new();
         for index in (0..messages.len()).rev() {
             if removed.contains(&messages[index].0) {
@@ -1841,7 +1870,7 @@ impl Session {
         // The read state goes to Tuta first; rows the store no longer
         // has answer nothing, like FETCH. Without a read-state change
         // every targeted row stays as the view knows it.
-        let present: Vec<u32> = match store_effect(request.mode, request.seen) {
+        let present: HashSet<u32> = match store_effect(request.mode, request.seen) {
             Some(seen) if !uids.is_empty() => {
                 let applied = self.backend.store_seen(mailbox, &uids, seen).await?;
                 if let State::Selected { messages, .. } = &mut self.state {
@@ -1853,7 +1882,7 @@ impl Session {
                 }
                 applied.iter().map(|(uid, _)| *uid).collect()
             }
-            _ => uids.clone(),
+            _ => uids.iter().copied().collect(),
         };
 
         if let Some(deleted) = store_effect(request.mode, request.deleted) {
