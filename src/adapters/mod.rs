@@ -6,5 +6,6 @@ pub mod password_store;
 pub mod pop3;
 pub mod smtp;
 pub mod sqlite_state;
+pub mod stall;
 pub mod terminal_prompt;
 pub mod tuta;

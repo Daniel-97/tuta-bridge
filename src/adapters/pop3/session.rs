@@ -15,20 +15,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::SecretString;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout_at, Instant};
 
 use crate::adapters::imap::codec::FetchItem;
+use crate::adapters::stall::StallGuard;
 use crate::domain::{Error, MailboxId, Result};
 use crate::ports::imap_backend::ImapBackend;
 
 /// The bounds of one POP3 session.
 #[derive(Clone)]
 pub struct Pop3Limits {
-    /// Inactivity before the session is closed. RFC 1939 §3 asks for
-    /// at least 10 minutes.
+    /// How long a connection may stay unauthenticated, measured from the
+    /// greeting — the whole phase, like IMAP.
+    pub pre_auth_timeout: Duration,
+    /// Inactivity before an authenticated session is closed. RFC 1939
+    /// §3 asks for at least 10 minutes.
     pub idle_timeout: Duration,
+    /// How long one write may make no progress before the session ends:
+    /// a client that stops reading does not pin its connection slot.
+    pub write_timeout: Duration,
     /// The delay every failed PASS waits out, one at a time across the
     /// whole listener (see `login_gate`).
     pub login_failure_delay: Duration,
@@ -42,7 +49,9 @@ pub struct Pop3Limits {
 impl Default for Pop3Limits {
     fn default() -> Self {
         Self {
+            pre_auth_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(10 * 60),
+            write_timeout: Duration::from_secs(60),
             login_failure_delay: Duration::from_secs(3),
             max_login_attempts: 3,
             login_gate: Arc::new(Mutex::new(())),
@@ -86,6 +95,10 @@ struct Maildrop {
     uids: Vec<u32>,
     /// Sizes, filled on first need.
     sizes: Vec<Option<u64>>,
+    /// Messages that left the store (or whose size cannot be loaded)
+    /// since login: LIST, STAT and UIDL all omit them, so the three
+    /// listings always agree.
+    gone: Vec<bool>,
 }
 
 enum State {
@@ -118,8 +131,10 @@ pub async fn run_pop3_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (reader, mut writer) = tokio::io::split(stream);
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(StallGuard::new(writer, limits.write_timeout));
+    let pre_auth_deadline = Instant::now() + limits.pre_auth_timeout;
     let mut session = Session {
         backend,
         limits,
@@ -128,7 +143,11 @@ where
     };
     write_line(&mut writer, GREETING).await?;
     loop {
-        let line = match timeout(session.limits.idle_timeout, read_line(&mut reader)).await {
+        let deadline = match session.state {
+            State::Transaction(_) => Instant::now() + session.limits.idle_timeout,
+            State::Authorization { .. } => pre_auth_deadline,
+        };
+        let line = match timeout_at(deadline, read_line(&mut reader)).await {
             Err(_) => {
                 write_line(&mut writer, "-ERR autologout; idle for too long").await?;
                 break;
@@ -213,20 +232,20 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, text: &str) -> Result
     writer.flush().await.map_err(io_failed)
 }
 
-/// Write a message body as a multi-line response: every line starting
-/// with `.` is byte-stuffed, bare LFs become CRLF, and the response
-/// ends with the `.` terminator (RFC 1939 §3).
-async fn write_multiline<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Result<()> {
-    let mut out = Vec::with_capacity(body.len() + body.len() / 64 + 8);
-    for line in split_lines(body) {
+/// Write the first `count` lines of a message as a multi-line response,
+/// line by line through the (buffered) writer: every line starting with
+/// `.` is byte-stuffed, bare LFs become CRLF, and the response ends with
+/// the `.` terminator (RFC 1939 §3). No byte-stuffed copy of the message
+/// is ever built.
+async fn write_multiline<W: AsyncWrite + Unpin>(writer: &mut W, lines: &[&[u8]]) -> Result<()> {
+    for line in lines {
         if line.first() == Some(&b'.') {
-            out.push(b'.');
+            writer.write_all(b".").await.map_err(io_failed)?;
         }
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
+        writer.write_all(line).await.map_err(io_failed)?;
+        writer.write_all(b"\r\n").await.map_err(io_failed)?;
     }
-    out.extend_from_slice(b".\r\n");
-    writer.write_all(&out).await.map_err(io_failed)?;
+    writer.write_all(b".\r\n").await.map_err(io_failed)?;
     writer.flush().await.map_err(io_failed)
 }
 
@@ -251,21 +270,14 @@ fn split_lines(body: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
-/// The header plus the first `count` body lines of a message — the TOP
-/// answer. A message without a blank separator is all header.
-fn top_of(body: &[u8], count: usize) -> Vec<u8> {
-    let lines = split_lines(body);
-    let separator = lines.iter().position(|line| line.is_empty());
-    let keep = match separator {
+/// How many lines the TOP answer keeps: the header, the blank
+/// separator, and `count` body lines. A message without a blank
+/// separator is all header.
+fn top_line_count(lines: &[&[u8]], count: usize) -> usize {
+    match lines.iter().position(|line| line.is_empty()) {
         Some(at) => (at + 1 + count).min(lines.len()),
         None => lines.len(),
-    };
-    let mut out = Vec::new();
-    for line in &lines[..keep] {
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
     }
-    out
 }
 
 /// The unique-id listing of one message: stable as long as the UID and
@@ -291,6 +303,21 @@ impl Session {
         let rest = parts.next().unwrap_or("");
         tracing::debug!(command = log_command(&verb), "pop3 command");
 
+        // Every transaction command first checks the maildrop against the
+        // store: a resync (new UIDVALIDITY, UIDs restarting at 1) would
+        // otherwise hand out a different message under the same number
+        // and unique id.
+        if matches!(self.state, State::Transaction(_))
+            && matches!(
+                verb.as_str(),
+                "STAT" | "LIST" | "UIDL" | "RETR" | "TOP" | "NOOP"
+            )
+            && !self.revalidate().await?
+        {
+            write_line(writer, "-ERR [SYS/TEMP] mailbox was resynced; reconnect").await?;
+            return Ok(Flow::Close);
+        }
+
         match (&self.state, verb.as_str()) {
             (_, "CAPA") => {
                 write_line(writer, "+OK capability list follows").await?;
@@ -299,6 +326,7 @@ impl Session {
                     "UIDL",
                     "TOP",
                     "RESP-CODES",
+                    "EXPIRE NEVER",
                     "IMPLEMENTATION tuta-bridge",
                 ] {
                     write_line(writer, capability).await?;
@@ -388,6 +416,7 @@ impl Session {
                 mailbox: inbox.view.id,
                 uidvalidity: inbox.uidvalidity,
                 sizes: vec![None; count],
+                gone: vec![false; count],
                 uids,
             });
             write_line(writer, &format!("+OK maildrop has {count} messages")).await?;
@@ -408,6 +437,32 @@ impl Session {
         Ok(Flow::Continue)
     }
 
+    /// Compare the maildrop with the store: `false` when the Inbox is
+    /// gone or its UIDVALIDITY changed; otherwise every message the
+    /// store no longer has is marked gone.
+    async fn revalidate(&mut self) -> Result<bool> {
+        let Some(mailbox) = self.maildrop().map(|drop| drop.mailbox) else {
+            return Ok(true);
+        };
+        let Some(current) = self.backend.snapshot(mailbox).await? else {
+            return Ok(false);
+        };
+        let State::Transaction(drop) = &mut self.state else {
+            return Ok(true);
+        };
+        if current.uidvalidity != drop.uidvalidity {
+            return Ok(false);
+        }
+        let present: std::collections::HashSet<u32> =
+            current.messages.iter().map(|(uid, _)| *uid).collect();
+        for (index, uid) in drop.uids.iter().enumerate() {
+            if !present.contains(uid) {
+                drop.gone[index] = true;
+            }
+        }
+        Ok(true)
+    }
+
     fn maildrop(&self) -> Option<&Maildrop> {
         match &self.state {
             State::Transaction(maildrop) => Some(maildrop),
@@ -416,10 +471,14 @@ impl Session {
     }
 
     /// The size of message `number` (1-based), loaded once. `None` when
-    /// the message is gone from the store since login.
+    /// the message is gone from the store since login, or its size
+    /// cannot be loaded: one such message is then left out of every
+    /// listing (and marked gone), never failing the whole command. A
+    /// refusal of the request itself (`Unsupported`) stays an error.
     async fn size_of(&mut self, number: usize) -> Result<Option<u64>> {
         let (mailbox, uid, cached) = match &self.state {
             State::Transaction(drop) => match drop.uids.get(number - 1) {
+                Some(_) if drop.gone[number - 1] => return Ok(None),
                 Some(uid) => (drop.mailbox, *uid, drop.sizes[number - 1]),
                 None => return Ok(None),
             },
@@ -428,13 +487,20 @@ impl Session {
         if cached.is_some() {
             return Ok(cached);
         }
-        let size = self
+        let size = match self
             .backend
             .fetch(mailbox, uid, &[FetchItem::Rfc822Size])
-            .await?
-            .and_then(|response| response.rfc822_size);
+            .await
+        {
+            Ok(response) => response.and_then(|response| response.rfc822_size),
+            Err(error @ Error::Unsupported(_)) => return Err(error),
+            Err(_) => None,
+        };
         if let State::Transaction(drop) = &mut self.state {
             drop.sizes[number - 1] = size;
+            if size.is_none() {
+                drop.gone[number - 1] = true;
+            }
         }
         Ok(size)
     }
@@ -490,14 +556,18 @@ impl Session {
         let Some(drop) = self.maildrop() else {
             return Ok(());
         };
+        // Same membership as LIST/STAT: messages gone since login are
+        // left out.
         let listing: Vec<(usize, String)> = drop
             .uids
             .iter()
             .enumerate()
+            .filter(|(index, _)| !drop.gone[*index])
             .map(|(index, uid)| (index + 1, unique_id(drop.uidvalidity, *uid)))
             .collect();
         if !rest.trim().is_empty() {
-            match message_number(Some(rest.trim())).and_then(|n| listing.get(n - 1)) {
+            let wanted = message_number(Some(rest.trim()));
+            match listing.iter().find(|(number, _)| Some(*number) == wanted) {
                 Some((number, id)) => write_line(writer, &format!("+OK {number} {id}")).await?,
                 None => write_line(writer, "-ERR no such message").await?,
             }
@@ -533,18 +603,22 @@ impl Session {
             return Ok(());
         };
         let body = response.bodies.pop().unwrap_or_default();
-        let (body, label) = match top {
-            Some(lines) => (top_of(&body, lines), "top of message follows".to_string()),
+        let lines = split_lines(&body);
+        let (keep, label) = match top {
+            Some(count) => (
+                top_line_count(&lines, count),
+                "top of message follows".to_string(),
+            ),
             None => {
                 let size = body.len();
                 if let State::Transaction(drop) = &mut self.state {
                     drop.sizes[number - 1].get_or_insert(size as u64);
                 }
-                (body, format!("{size} octets"))
+                (lines.len(), format!("{size} octets"))
             }
         };
         write_line(writer, &format!("+OK {label}")).await?;
-        write_multiline(writer, &body).await
+        write_multiline(writer, &lines[..keep]).await
     }
 }
 
@@ -565,15 +639,12 @@ mod tests {
     #[test]
     fn top_keeps_the_header_the_separator_and_n_body_lines() {
         let message = b"Subject: x\r\nFrom: y\r\n\r\none\r\ntwo\r\nthree\r\n";
-        assert_eq!(
-            top_of(message, 0),
-            b"Subject: x\r\nFrom: y\r\n\r\n".to_vec()
-        );
-        assert_eq!(
-            top_of(message, 2),
-            b"Subject: x\r\nFrom: y\r\n\r\none\r\ntwo\r\n".to_vec()
-        );
-        assert_eq!(top_of(message, 99), message.to_vec());
+        let lines = split_lines(message);
+        assert_eq!(top_line_count(&lines, 0), 3);
+        assert_eq!(top_line_count(&lines, 2), 5);
+        assert_eq!(top_line_count(&lines, 99), 6);
+        let headers_only = split_lines(b"Subject: x\r\nFrom: y\r\n");
+        assert_eq!(top_line_count(&headers_only, 5), 2);
     }
 
     #[test]

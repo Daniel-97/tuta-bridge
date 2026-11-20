@@ -123,6 +123,7 @@ async fn capa_lists_the_supported_extensions() {
         "UIDL",
         "TOP",
         "RESP-CODES",
+        "EXPIRE NEVER",
         "IMPLEMENTATION tuta-bridge",
         ".",
     ] {
@@ -249,6 +250,97 @@ async fn failed_logins_are_bounded() {
         wire.send("PASS wrong").await;
         wire.expect("-ERR [AUTH] authentication failed").await;
     }
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_resync_mid_session_ends_it_instead_of_renumbering() {
+    let fake = backend();
+    let (mut wire, session) = spawn(Arc::clone(&fake)).await;
+    login(&mut wire).await;
+    fake.resync("Inbox", 8);
+    wire.send("RETR 1").await;
+    wire.expect("-ERR [SYS/TEMP] mailbox was resynced; reconnect")
+        .await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_vanished_message_leaves_list_stat_and_uidl_alike() {
+    let fake = backend();
+    let (mut wire, session) = spawn(Arc::clone(&fake)).await;
+    login(&mut wire).await;
+    fake.remove_message("Inbox", 1);
+    let second = message("second").len();
+
+    wire.send("STAT").await;
+    wire.expect(&format!("+OK 1 {second}")).await;
+    wire.send("LIST").await;
+    wire.expect("+OK 1 messages").await;
+    wire.expect(&format!("2 {second}")).await;
+    wire.expect(".").await;
+    wire.send("UIDL").await;
+    wire.expect("+OK unique-id listing follows").await;
+    wire.expect("2 7.3").await;
+    wire.expect(".").await;
+    wire.send("UIDL 1").await;
+    wire.expect("-ERR no such message").await;
+
+    wire.send("QUIT").await;
+    wire.expect("+OK tuta-bridge signing off").await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn one_unloadable_size_does_not_fail_the_listing() {
+    let fake = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_fetch(3, fetched(message("second")))
+            .with_failing_fetch(1),
+    );
+    let (mut wire, session) = spawn(fake).await;
+    login(&mut wire).await;
+    wire.send("LIST").await;
+    wire.expect("+OK 1 messages").await;
+    wire.expect(&format!("2 {}", message("second").len())).await;
+    wire.expect(".").await;
+    wire.send("QUIT").await;
+    wire.expect("+OK tuta-bridge signing off").await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn an_unauthenticated_connection_is_closed_at_its_deadline() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let limits = Pop3Limits {
+        pre_auth_timeout: Duration::from_millis(50),
+        ..fast_limits()
+    };
+    let session = tokio::spawn(run_pop3_session(
+        server,
+        backend() as Arc<dyn ImapBackend>,
+        limits,
+    ));
+    let (reader, writer) = split(client);
+    let mut wire = Wire {
+        reader: BufReader::new(reader),
+        writer,
+    };
+    wire.expect("+OK tuta-bridge POP3 ready").await;
+    // Trickling commands does not extend the pre-auth phase.
+    wire.send("CAPA").await;
+    for _ in 0..8 {
+        wire.line().await;
+    }
+    wire.expect("-ERR autologout; idle for too long").await;
     wire.expect_eof().await;
     session.await.unwrap().unwrap();
 }
