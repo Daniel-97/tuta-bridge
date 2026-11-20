@@ -397,9 +397,10 @@ async fn literals_are_capped_per_command_and_tightly_before_login() {
 
     // The cap is on the command, not on each literal: chaining small
     // ones stops at the same total, before the continuation that
-    // would cross it.
+    // would cross it. Each announcing line is charged with its own
+    // length too: 13 + 20 fits in 40, adding 4 + 7 does not.
     let limits = SessionLimits {
-        pre_auth_literal_bytes: 24,
+        pre_auth_literal_bytes: 40,
         command_literal_bytes: 12,
         ..SessionLimits::default()
     };
@@ -412,9 +413,11 @@ async fn literals_are_capped_per_command_and_tightly_before_login() {
     wire.expect_eof().await;
     session.await.unwrap().unwrap();
 
-    // Logged in, the larger budget applies — and is one total too.
+    // Logged in, the larger budget applies — and is one total too:
+    // 21 + 6, then 12 + 6 (the line after a literal starts after its
+    // bytes), fit in 50; a further 12 + 1 does not.
     let limits = SessionLimits {
-        command_literal_bytes: 12,
+        command_literal_bytes: 50,
         ..SessionLimits::default()
     };
     let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
@@ -426,6 +429,39 @@ async fn literals_are_capped_per_command_and_tightly_before_login() {
     wire.expect("+ ").await;
     wire.send_raw(b"ghijkl SUBJECT {1}\r\n").await;
     wire.expect("a4 NO literal too large").await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn chained_empty_literals_are_charged_before_login() {
+    // An empty literal announces no bytes, yet every announcing line
+    // is kept until the command ends. A chain of `{0}` literals must
+    // therefore run out of budget like any other, before login, with
+    // the default limits.
+    let (mut wire, session, _) = spawn_session(backend(), 16).await;
+    wire.expect(GREETING).await;
+    wire.send("a1 LOGIN {0}").await;
+    wire.expect("+ ").await;
+
+    let budget = SessionLimits::default().pre_auth_literal_bytes;
+    let mut continuations = 0usize;
+    loop {
+        wire.send_raw(b" {0}\r\n").await;
+        let reply = wire.line().await;
+        if reply == "+ " {
+            continuations += 1;
+            assert!(
+                continuations <= budget,
+                "empty literals must consume the pre-auth budget"
+            );
+            continue;
+        }
+        assert_eq!(reply, "a1 NO literal too large");
+        break;
+    }
+    // Each ` {0}` line is charged 4 + 1 bytes.
+    assert!(continuations <= budget / 5);
     wire.expect_eof().await;
     session.await.unwrap().unwrap();
 }

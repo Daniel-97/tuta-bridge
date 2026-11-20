@@ -427,10 +427,13 @@ enum Incoming {
 /// that can never be part of a valid command answers BAD before any
 /// continuation is sent, with the command's own tag.
 ///
-/// `literal_budget` bounds the literal bytes of the whole command, not
-/// of each literal: an announcement that would exceed what is left is
-/// refused before its continuation, so chaining literals cannot make
-/// the session hold more than the budget.
+/// `literal_budget` bounds the memory a multi-line command may claim,
+/// not each literal: every line that announces a literal is charged
+/// with its own length plus the announced byte count — at least one
+/// byte, so a chain of `{0}` literals is charged too. An announcement
+/// that would exceed what is left is refused before its continuation,
+/// so the command held in memory never exceeds the budget plus its one
+/// final line, which [`MAX_LINE_BYTES`] bounds.
 async fn read_request<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -452,6 +455,7 @@ where
             None => return Ok(Incoming::Eof),
         };
         let pending = codec::pending_literal(&line);
+        let line_bytes = line.len();
         lines.push(line);
         let count = match pending {
             Ok(Some(count)) => count,
@@ -461,8 +465,11 @@ where
 
         // A client literal: answer the continuation and read the
         // announced bytes exactly; the rest of the command follows on
-        // the next line, which may announce another literal.
-        literal_budget = match literal_budget.checked_sub(count) {
+        // the next line, which may announce another literal. The line
+        // just kept and the literal are both held until the command
+        // ends, so both are charged — an empty literal included.
+        let charge = line_bytes.saturating_add(count.max(1));
+        literal_budget = match literal_budget.checked_sub(charge) {
             Some(left) => left,
             None => return Ok(Incoming::LiteralTooLarge(command_tag(&lines))),
         };
