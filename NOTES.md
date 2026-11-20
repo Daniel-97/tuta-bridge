@@ -320,6 +320,25 @@
   mailbox. `MOVE` is advertised; `UIDPLUS` is not (no `COPYUID`: the new
   UID is only known when the event arrives).
 
+## M10 POP3
+
+- `src/adapters/pop3` speaks RFC 1939 (+ `CAPA`, RFC 2449) over the
+  same `ImapBackend` seam as IMAP: `login` for USER/PASS, `select("INBOX")`
+  for the maildrop (snapshot at login, numbers never change in a
+  session), `fetch(RFC822.SIZE)` for STAT/LIST (sizes cached per
+  session; the enricher persists them like IMAP does) and
+  `fetch(RFC822)` for RETR/TOP. No new store or SDK code.
+- `UIDL` = `<uidvalidity>.<uid>`: unique and stable while the mailbox's
+  UIDVALIDITY is; a `resync` changes it, so clients redownload — the
+  same contract as IMAP.
+- `DELE` is refused (spec M10: writes stay in IMAP). Leave-on-server is
+  the only mode.
+- Opt-in: `pop3_port` in the config; without it nothing listens. The
+  listener reuses the IMAP certificate and TLS acceptor, binds loopback
+  only, caps connections at 16 and lines at 512 octets, closes after 10
+  idle minutes (RFC 1939's minimum autologout) and after three failed
+  logins, with failed-login delays serialized across connections.
+
 ## M1/M2 manual acceptance (2026-11-16)
 
 - Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.

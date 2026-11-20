@@ -37,6 +37,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::adapters::imap::backend::TutaImapBackend;
 use crate::adapters::imap::server::{self, ensure_certificate, tls_acceptor, ServeLimits};
 use crate::adapters::mime::MimeRenderer;
+use crate::adapters::pop3::server::{serve_pop3, Pop3ServeLimits};
 use crate::adapters::sqlite_state::STATE_BUSY_MESSAGE;
 use crate::adapters::tuta::event_wire::is_invalid_event;
 use crate::adapters::tuta::generated_id::{
@@ -721,6 +722,19 @@ impl ServeUseCase {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|_| Error::Network("imap listener bind failed".into()))?;
+        // POP3 is opt-in: it listens only when the config names a port.
+        let pop3_listener = match config.pop3_port {
+            Some(pop3_port) => {
+                validate_imap_port(pop3_port)
+                    .map_err(|_| Error::Config("pop3_port must be between 1 and 65535".into()))?;
+                let pop3_listener = TcpListener::bind(("127.0.0.1", pop3_port))
+                    .await
+                    .map_err(|_| Error::Network("pop3 listener bind failed".into()))?;
+                println!("serving POP3 on 127.0.0.1:{pop3_port}");
+                Some(pop3_listener)
+            }
+            None => None,
+        };
         println!("serving IMAP on 127.0.0.1:{port}; press Ctrl-C to stop");
 
         // 7. Accept until the stop future resolves, then end the
@@ -729,6 +743,22 @@ impl ServeUseCase {
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
         let mut stop = pin!(stop);
+        let pop3_backend = Arc::clone(&backend);
+        let pop3_tls = tls.clone();
+        let mut pop3_accepting = pin!(async move {
+            match pop3_listener {
+                Some(pop3_listener) => {
+                    serve_pop3(
+                        pop3_listener,
+                        pop3_tls,
+                        pop3_backend,
+                        Pop3ServeLimits::default(),
+                    )
+                    .await
+                }
+                None => std::future::pending().await,
+            }
+        });
         let mut accepting = pin!(server::serve(
             listener,
             tls,
@@ -746,6 +776,7 @@ impl ServeUseCase {
                 };
             }
             () = &mut accepting => {}
+            () = &mut pop3_accepting => {}
         }
         let _ = stop_watch.send(());
         match watch_task.await {

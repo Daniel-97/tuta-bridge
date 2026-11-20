@@ -2,7 +2,7 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, and an IMAP server with read/unread, move and delete). SMTP (M7) is not implemented yet.
+Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, an IMAP server with read/unread, move and delete, and an optional read-only POP3 server). SMTP (M7) is not implemented yet.
 
 ## Credentials
 
@@ -233,6 +233,28 @@ kept by Tuta, so other pushed flags are refused. The `Far`/`Near` names require 
   (U+2215), and folders that share a name are listed as `Name`,
   `Name (2)`, … so each stays reachable.
 - One account at a time.
+
+## POP3 server (optional)
+
+`serve` can also answer POP3 over implicit TLS (POP3S) for clients that
+only download the Inbox. It is off unless the config file names a port:
+
+```toml
+pop3_port = 9950
+```
+
+- Same listener rules as IMAP: `127.0.0.1` only, the same self-signed
+  certificate, the same bridge password, the same failed-login delay.
+- The maildrop is the Inbox as it was at login. `UIDL` answers
+  `<uidvalidity>.<uid>`, stable across sessions, so a client that keeps
+  mail on the server never downloads a message twice.
+- Supported: `CAPA`, `USER`/`PASS`, `STAT`, `LIST`, `UIDL`, `RETR`,
+  `TOP`, `NOOP`, `RSET`, `QUIT`. Messages render on demand like IMAP
+  `BODY[]`.
+- `DELE` answers `-ERR`: mail always stays on the server. Configure the
+  client to leave messages on the server (Thunderbird's default;
+  `fetchmail --keep`). POP3 has no folders, flags, push, or server-side
+  search; use IMAP for those.
 
 ## Dump
 

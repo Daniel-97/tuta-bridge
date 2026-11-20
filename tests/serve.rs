@@ -216,6 +216,7 @@ fn temp_config(port: u16) -> (tempfile::TempDir, PathBuf) {
         active_account: Some(LOGIN.to_string()),
         base_url: "http://127.0.0.1:9".to_string(),
         imap_port: Some(port),
+        pop3_port: None,
     }
     .save(&path)
     .unwrap();
