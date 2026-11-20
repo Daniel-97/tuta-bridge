@@ -40,8 +40,8 @@ const BRIDGE_PASSWORD: &str = "bridge-hunter2";
 /// Fixed instant for the expiry decisions the watch baseline makes.
 const NOW_MS: i64 = 2_000_000_000_000;
 
-const GREETING: &str = "* OK [CAPABILITY IMAP4rev1 IDLE ID] tuta-bridge ready";
-const LOGIN_OK: &str = "a1 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed";
+const GREETING: &str = "* OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] tuta-bridge ready";
+const LOGIN_OK: &str = "a1 OK [CAPABILITY IMAP4rev1 IDLE ID MOVE] LOGIN completed";
 /// ENVELOPE of the seeded partial header: NIL date (no `sent_at_ms`),
 /// the one sender tripled into from/sender/reply-to, no recipients.
 const ENVELOPE: &str = "(NIL \"subject\" ((NIL NIL \"sender\" \"example.invalid\")) ((NIL NIL \"sender\" \"example.invalid\")) ((NIL NIL \"sender\" \"example.invalid\")) NIL NIL NIL NIL NIL)";
@@ -430,11 +430,11 @@ async fn serve_logs_in_lists_and_fetches_end_to_end() {
     wire.expect("a2 OK LIST completed").await;
 
     wire.send("a3 SELECT INBOX").await;
-    wire.expect("* FLAGS (\\Seen)").await;
+    wire.expect("* FLAGS (\\Seen \\Deleted)").await;
     wire.expect("* 1 EXISTS").await;
     wire.expect("* 0 RECENT").await;
     wire.expect("* OK [UNSEEN 1]").await;
-    wire.expect("* OK [PERMANENTFLAGS ()] Read-only mailbox")
+    wire.expect("* OK [PERMANENTFLAGS (\\Seen)] Flags permitted")
         .await;
     wire.expect("* OK [UIDVALIDITY 7]").await;
     wire.expect("* OK [UIDNEXT 2]").await;

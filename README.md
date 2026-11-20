@@ -2,7 +2,7 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M5 complete for a single account (login, status/logout, dump, minimal state, sync, live event watching, and a read-only IMAP server). IMAP is read-only; writes (M6) and SMTP (M7) are not implemented yet.
+Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, and an IMAP server with read/unread, move and delete). SMTP (M7) is not implemented yet.
 
 ## Credentials
 
@@ -97,7 +97,7 @@ Limits:
 - `watch` never fetches or stores message bodies, attachments, or `.eml`
   files; event lookups reload header metadata only.
 
-## IMAP server (read-only)
+## IMAP server
 
 `tuta-bridge serve` runs one process with two loops: the `watch` event
 loop keeping the index current, and a TLS-only IMAP listener that
@@ -107,7 +107,7 @@ answers from it. Ctrl-C stops the process.
 # Set the password IMAP clients must use (prompted twice, hidden input)
 tuta-bridge passwd
 
-# Serve read-only IMAP while watching Tuta events (Ctrl-C to stop)
+# Serve IMAP while watching Tuta events (Ctrl-C to stop)
 tuta-bridge serve
 ```
 
@@ -156,9 +156,10 @@ Use manual account configuration (not the automatic account dialog):
 - Outgoing (SMTP) fields are placeholders: SMTP is not implemented, so
   sending always fails.
 
-Deleting or moving a mail, or changing a read/unread flag, is refused
-by the server with `NO` — the bridge is read-only, and the change stays
-local to the client until it refreshes.
+Marking mail read/unread, moving it between folders (drag and drop)
+and deleting it (Thunderbird's default "move to Trash") are applied to
+Tuta. Starring a mail (`\Flagged`) and copying a mail are refused with
+`NO`: Tuta has neither.
 
 ### mbsync
 
@@ -186,23 +187,31 @@ Near :tuta-bridge-local:
 Patterns *
 Create Near
 Expunge None
-Sync PullNew PullFlags
+Sync PullNew PullFlags PushFlags
 SyncState *
 ```
 
 `CertificateFile` points at the bridge certificate
 (`$XDG_DATA_HOME/tuta-bridge/imap-cert.pem`), so mbsync verifies TLS
-without a per-host exception. `Sync PullNew PullFlags` pulls new mail
-and flag changes only: the server refuses every write, so pushing
-would only produce errors. The `Far`/`Near` names require mbsync ≥ 1.3
+without a per-host exception. `Sync PullNew PullFlags PushFlags` pulls new mail
+and flag changes and pushes read/unread changes back; only `\Seen` is
+kept by Tuta, so other pushed flags are refused. The `Far`/`Near` names require mbsync ≥ 1.3
 (older releases spell them `Master`/`Slave`).
 
 ### Limits of v1
 
-- **Read-only.** `STORE`, `APPEND`, `COPY`, `MOVE`, `EXPUNGE`, and
+- **Writes.** `STORE` accepts `\Seen` (applied to Tuta) and
+  `\Deleted` (kept by the session until `EXPUNGE`/`CLOSE`); every other
+  flag answers `NO`, and `PERMANENTFLAGS` is `(\Seen)`. `MOVE`/`UID MOVE`
+  (RFC 6851) move mail to another folder; the moved mail gets a new UID
+  in the target when the Tuta event arrives. `EXPUNGE` moves `\Deleted`
+  mail to Trash, and deletes it for good only when it already is in
+  Trash. `COPY` answers `NO` (Tuta has no copy), as do `APPEND` and
   folder mutations (`CREATE`, `DELETE`, `RENAME`, `SUBSCRIBE`,
-  `UNSUBSCRIBE`) answer `NO`; write support is planned for a later
-  milestone.
+  `UNSUBSCRIBE`). `EXAMINE`d mailboxes refuse every write. `UIDPLUS` is
+  not advertised, so `UID EXPUNGE` is unknown.
+- IDLE pushes new mail (`EXISTS`) and removals; read-state changes made
+  elsewhere reach the client at its next `NOOP`/poll or during IDLE.
 - `SEARCH BODY` and `SEARCH TEXT` are unsupported — bodies are never
   stored. `NEW`/`OLD` are unsupported too (`RECENT` is always zero), as
   are `ANSWERED`, `DELETED`, `DRAFT`, `FLAGGED`, and keyword keys: the

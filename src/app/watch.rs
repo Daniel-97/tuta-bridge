@@ -681,6 +681,7 @@ impl ServeUseCase {
             }),
             source: session.shared_mail(),
             renderer,
+            writer: session.shared_writer(),
         });
         let _session = session;
 

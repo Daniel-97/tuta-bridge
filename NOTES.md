@@ -284,6 +284,42 @@
   and no received time keeps re-loading per body request, the same
   accepted posture as permanently-unavailable content.
 
+## M6 IMAP writes
+
+- Write path: `MailboxWriter` (`src/ports/mailbox_writer.rs`) over the
+  SDK. Read state goes through `MailFacade::set_unread_status_for_mails`
+  (`UnreadMailStateService`), Trash through `trash_mails`
+  (`SimpleMoveMailService`, which only allows Trash/Archive targets),
+  moves to any folder through `MoveMailService` (`MoveMailData`, target =
+  the `MailSet` id), and permanent deletes through `MailService` DELETE
+  (`DeleteMailData`, folder = the Trash `MailSet` id). Requests are
+  chunked at 50 mails, the SDK's `MAX_MAIL_UPDATE_LIMIT`.
+- The store addresses a folder by its `entries` list id, while move and
+  delete want the `MailSet` element id: `TutaMailboxWriter` loads the
+  mailbox's mail sets per write (a handful of rows) and matches on
+  `entries`. No schema change.
+- Remote first, then local: the backend updates `unread` in place or
+  removes the source rows only after the remote call succeeded; a failed
+  call answers `NO` and changes nothing. The event that later echoes our
+  own change is idempotent: the header upsert keeps the UID and enriched
+  fields, and the removal of an already-removed row is a no-op. A moved
+  mail never gets a target row from the write itself — the event assigns
+  its new UID, exactly like a move made in the web client.
+- The session updates its own view with what it just changed (unread
+  pairs, removed UIDs announced as itemized `* n EXPUNGE` in descending
+  order), so the next sync point does not announce the same change twice.
+- `\Deleted` is session state: Tuta has no such flag. `STORE +FLAGS
+  \Deleted` marks UIDs in the session, `EXPUNGE` (and `CLOSE` on a
+  `SELECT`ed mailbox, silently) sends them to Trash, or deletes them for
+  good when the mailbox is Trash. Selecting another mailbox forgets the
+  marks; it is therefore not in `PERMANENTFLAGS`, which is `(\Seen)`.
+  Only Trash ever destroys mail.
+- Refused: `COPY` (Tuta has no copy; a mail lives in one folder; labels
+  would be the multi-membership mechanism), `APPEND`, folder mutations,
+  every flag but `\Seen`/`\Deleted`, and any write on an `EXAMINE`d
+  mailbox. `MOVE` is advertised; `UIDPLUS` is not (no `COPYUID`: the new
+  UID is only known when the event arrives).
+
 ## M1/M2 manual acceptance (2026-11-16)
 
 - Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.

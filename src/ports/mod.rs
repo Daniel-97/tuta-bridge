@@ -6,6 +6,7 @@ pub mod imap_backend;
 pub mod local_password;
 pub mod mail_source;
 pub mod mailbox_events;
+pub mod mailbox_writer;
 pub mod prompt;
 pub mod renderer;
 pub mod session;
@@ -19,6 +20,7 @@ pub use imap_backend::{FetchResponse, ImapBackend, MailboxView, SelectedMailbox}
 pub use local_password::LocalPasswordStore;
 pub use mail_source::MailSource;
 pub use mailbox_events::{MailboxChanged, MailboxEventSender};
+pub use mailbox_writer::{MailRef, MailboxWriter};
 pub use prompt::LoginPrompt;
 pub use renderer::MessageRenderer;
 pub use session::{NewSession, Session, SessionFactory, SessionRequest};

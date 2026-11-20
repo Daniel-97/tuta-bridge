@@ -5,6 +5,7 @@ use secrecy::SecretString;
 
 use super::event_stream::EventHandles;
 use super::mail_source::MailSource;
+use super::mailbox_writer::{MailRef, MailboxWriter};
 use crate::domain::{AccountInfo, Error, Result, StoredCredentials};
 
 pub struct SessionRequest {
@@ -30,6 +31,14 @@ pub trait Session: Send + Sync {
     /// session itself stays with the watch loop; the shared `Arc`
     /// keeps the logged-in state alive independently of either holder.
     fn shared_mail(&self) -> Arc<dyn MailSource>;
+
+    /// The write seam `serve` hands to the IMAP backend.
+    ///
+    /// Defaults to a writer that refuses every change, so adapters
+    /// without write support keep the bridge read-only.
+    fn shared_writer(&self) -> Arc<dyn MailboxWriter> {
+        Arc::new(ReadOnlyWriter)
+    }
 
     /// Group ids the event bus must be subscribed to, in subscription order.
     ///
@@ -72,5 +81,27 @@ pub trait SessionFactory: Send + Sync {
     async fn discard(&self, access_token: &str) -> Result<()> {
         let _ = access_token;
         Ok(())
+    }
+}
+
+/// A [`MailboxWriter`] that refuses every write.
+pub struct ReadOnlyWriter;
+
+#[async_trait::async_trait]
+impl MailboxWriter for ReadOnlyWriter {
+    async fn set_unread(&self, _mails: &[MailRef], _unread: bool) -> Result<()> {
+        Err(Error::Unsupported("read-only session".into()))
+    }
+
+    async fn move_to_folder(&self, _target: &str, _mails: &[MailRef]) -> Result<()> {
+        Err(Error::Unsupported("read-only session".into()))
+    }
+
+    async fn move_to_trash(&self, _mails: &[MailRef]) -> Result<()> {
+        Err(Error::Unsupported("read-only session".into()))
+    }
+
+    async fn delete_permanently(&self, _folder: &str, _mails: &[MailRef]) -> Result<()> {
+        Err(Error::Unsupported("read-only session".into()))
     }
 }

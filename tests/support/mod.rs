@@ -17,6 +17,7 @@ use tuta_bridge::ports::event_lookup::EventLookup;
 use tuta_bridge::ports::event_stream::{EventHandles, EventStream};
 use tuta_bridge::ports::imap_backend::{FetchResponse, ImapBackend, MailboxView, SelectedMailbox};
 use tuta_bridge::ports::mail_source::MailSource;
+use tuta_bridge::ports::mailbox_writer::{MailRef, MailboxWriter};
 use tuta_bridge::ports::prompt::LoginPrompt;
 use tuta_bridge::ports::renderer::MessageRenderer;
 use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
@@ -1377,6 +1378,10 @@ pub struct FakeImapBackend {
     pub store_failing: Mutex<bool>,
     /// How many FETCH calls asked for at least one body.
     pub body_fetches: AtomicUsize,
+    /// Every write the session asked for, as `verb mailbox uids [target]`.
+    pub writes: Mutex<Vec<String>>,
+    /// While set, every write fails like a refused remote call.
+    pub writes_failing: Mutex<bool>,
 }
 
 impl FakeImapBackend {
@@ -1392,6 +1397,8 @@ impl FakeImapBackend {
             search_uids: Mutex::new(Vec::new()),
             store_failing: Mutex::new(false),
             body_fetches: AtomicUsize::new(0),
+            writes: Mutex::new(Vec::new()),
+            writes_failing: Mutex::new(false),
         }
     }
 
@@ -1497,6 +1504,43 @@ impl FakeImapBackend {
         );
     }
 
+    fn name_of(&self, id: MailboxId) -> Option<String> {
+        self.views
+            .iter()
+            .find(|view| view.id == id)
+            .map(|view| view.name.clone())
+    }
+
+    pub fn writes(&self) -> Vec<String> {
+        self.writes.lock().unwrap().clone()
+    }
+
+    /// Record one write; fail it when writes are scripted to fail.
+    fn record_write(&self, line: String) -> Result<()> {
+        self.writes.lock().unwrap().push(line);
+        if *self.writes_failing.lock().unwrap() {
+            return Err(Error::Network("mailbox write failed".into()));
+        }
+        Ok(())
+    }
+
+    /// Drop `uids` from the named mailbox and return the ones it had.
+    fn remove_uids(&self, name: &str, uids: &[u32]) -> Vec<u32> {
+        let mut removed = Vec::new();
+        self.script(name, |snapshot| {
+            snapshot.uids.retain(|uid| {
+                if uids.contains(uid) {
+                    removed.push(*uid);
+                    false
+                } else {
+                    true
+                }
+            });
+            snapshot.unread.retain(|uid| !uids.contains(uid));
+        });
+        removed
+    }
+
     fn opened(&self, view: &MailboxView) -> Option<SelectedMailbox> {
         let snapshot = self.snapshots.lock().unwrap().get(&view.name).cloned()?;
         Some(SelectedMailbox {
@@ -1518,6 +1562,48 @@ impl FakeImapBackend {
 
 #[async_trait::async_trait]
 impl ImapBackend for FakeImapBackend {
+    async fn store_seen(
+        &self,
+        mailbox: MailboxId,
+        uids: &[u32],
+        seen: bool,
+    ) -> Result<Vec<(u32, bool)>> {
+        let name = self.name_of(mailbox).expect("scripted mailbox");
+        self.record_write(format!("seen {name} {uids:?} {seen}"))?;
+        let mut applied = Vec::new();
+        self.script(&name, |snapshot| {
+            for uid in uids {
+                if !snapshot.uids.contains(uid) {
+                    continue;
+                }
+                snapshot.unread.retain(|known| known != uid);
+                if !seen {
+                    snapshot.unread.push(*uid);
+                }
+                applied.push((*uid, !seen));
+            }
+        });
+        Ok(applied)
+    }
+
+    async fn move_mails(
+        &self,
+        mailbox: MailboxId,
+        uids: &[u32],
+        target: MailboxId,
+    ) -> Result<Vec<u32>> {
+        let name = self.name_of(mailbox).expect("scripted mailbox");
+        let target = self.name_of(target).expect("scripted mailbox");
+        self.record_write(format!("move {name} {uids:?} {target}"))?;
+        Ok(self.remove_uids(&name, uids))
+    }
+
+    async fn expunge_mails(&self, mailbox: MailboxId, uids: &[u32]) -> Result<Vec<u32>> {
+        let name = self.name_of(mailbox).expect("scripted mailbox");
+        self.record_write(format!("expunge {name} {uids:?}"))?;
+        Ok(self.remove_uids(&name, uids))
+    }
+
     async fn login(&self, user: &str, password: &SecretString) -> Result<bool> {
         Ok(user == self.expected_user && password.expose_secret() == self.expected_password)
     }
@@ -1630,5 +1716,65 @@ impl ImapBackend for FakeImapBackend {
             return Ok(scripted.clone());
         }
         Ok(self.search_uids.lock().unwrap().clone())
+    }
+}
+
+/// One recorded [`MailboxWriter`] call, with element ids only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriterCall {
+    SetUnread(Vec<String>, bool),
+    MoveToFolder(String, Vec<String>),
+    MoveToTrash(Vec<String>),
+    DeletePermanently(String, Vec<String>),
+}
+
+/// A [`MailboxWriter`] that records every call and can be made to fail.
+#[derive(Default)]
+pub struct FakeMailboxWriter {
+    pub calls: Mutex<Vec<WriterCall>>,
+    pub failing: Mutex<bool>,
+}
+
+impl FakeMailboxWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn calls(&self) -> Vec<WriterCall> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: WriterCall) -> Result<()> {
+        self.calls.lock().unwrap().push(call);
+        if *self.failing.lock().unwrap() {
+            return Err(Error::Network("mailbox write failed".into()));
+        }
+        Ok(())
+    }
+}
+
+fn element_ids(mails: &[MailRef]) -> Vec<String> {
+    mails.iter().map(|mail| mail.element_id.clone()).collect()
+}
+
+#[async_trait::async_trait]
+impl MailboxWriter for FakeMailboxWriter {
+    async fn set_unread(&self, mails: &[MailRef], unread: bool) -> Result<()> {
+        self.record(WriterCall::SetUnread(element_ids(mails), unread))
+    }
+
+    async fn move_to_folder(&self, target: &str, mails: &[MailRef]) -> Result<()> {
+        self.record(WriterCall::MoveToFolder(target.into(), element_ids(mails)))
+    }
+
+    async fn move_to_trash(&self, mails: &[MailRef]) -> Result<()> {
+        self.record(WriterCall::MoveToTrash(element_ids(mails)))
+    }
+
+    async fn delete_permanently(&self, folder: &str, mails: &[MailRef]) -> Result<()> {
+        self.record(WriterCall::DeletePermanently(
+            folder.into(),
+            element_ids(mails),
+        ))
     }
 }
