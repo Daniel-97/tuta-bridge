@@ -447,6 +447,13 @@ async fn serve_logs_in_lists_and_fetches_end_to_end() {
         .await;
     wire.expect("a4 OK UID FETCH completed").await;
 
+    // The write seam reaches serve through Session::shared_writer: a
+    // STORE goes to the session's writer and answers the new flags.
+    wire.send("a6 UID STORE 1 +FLAGS (\\Seen)").await;
+    wire.expect("* 1 FETCH (FLAGS (\\Seen) UID 1)").await;
+    wire.expect("a6 OK UID STORE completed").await;
+    assert_eq!(session.writer.calls().len(), 1);
+
     wire.send("a5 LOGOUT").await;
     wire.expect("* BYE tuta-bridge signing off").await;
     wire.expect("a5 OK LOGOUT completed").await;
