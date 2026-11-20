@@ -519,6 +519,12 @@ impl SqliteStateStore {
 /// migrate it once. Every step and the new version commit together: a
 /// failed or interrupted migration leaves the database at its old
 /// version.
+///
+/// Every step is idempotent. Binaries from before the version gate
+/// stamp `user_version = 2` on every open without reading it, so a
+/// database this binary migrated is re-stamped to 2 by one run of an
+/// older build, and the next open here replays steps 3 to 6 over a
+/// schema that already has them.
 async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
     let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -535,14 +541,10 @@ async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
         add_mime_structure_column(&mut transaction).await?;
     }
     if version < 3 {
-        for statement in MAILBOX_AUTOINCREMENT_STATEMENTS {
-            sqlx::query(statement).execute(&mut *transaction).await?;
-        }
+        rebuild_mailboxes_with_autoincrement(&mut transaction).await?;
     }
     if version < 4 {
-        for statement in UIDVALIDITY_FLOOR_STATEMENTS {
-            sqlx::query(statement).execute(&mut *transaction).await?;
-        }
+        add_uidvalidity_floor_column(&mut transaction).await?;
     }
     if version < 5 {
         sqlx::query(MESSAGES_BY_ELEMENT_INDEX_SQL)
@@ -601,6 +603,29 @@ const MAILBOX_AUTOINCREMENT_STATEMENTS: &[&str] = &[
     "ALTER TABLE mailboxes_rebuilt RENAME TO mailboxes",
 ];
 
+/// Run the v3 rebuild unless `mailboxes` already uses `AUTOINCREMENT`.
+///
+/// Rebuilding an `AUTOINCREMENT` table again would not be harmless: the
+/// dropped table takes its `sqlite_sequence` row with it, and the copy
+/// restarts the sequence at the highest id still present — handing out
+/// again the ids of mailboxes deleted since.
+async fn rebuild_mailboxes_with_autoincrement(
+    connection: &mut SqliteConnection,
+) -> anyhow::Result<()> {
+    let definition: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mailboxes'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if definition.to_ascii_uppercase().contains("AUTOINCREMENT") {
+        return Ok(());
+    }
+    for statement in MAILBOX_AUTOINCREMENT_STATEMENTS {
+        sqlx::query(statement).execute(&mut *connection).await?;
+    }
+    Ok(())
+}
+
 /// v6 migration: forget every stored enrichment.
 ///
 /// Earlier binaries decoded mail details without their To/Cc/Bcc
@@ -622,18 +647,35 @@ const RESET_ENRICHMENT_SQL: &str =
 /// and the list id, so without this one each removal scanned every
 /// stored message of the account.
 const MESSAGES_BY_ELEMENT_INDEX_SQL: &str =
-    "CREATE INDEX messages_by_element ON messages (tuta_element_id, mailbox_id)";
+    "CREATE INDEX IF NOT EXISTS messages_by_element ON messages (tuta_element_id, mailbox_id)";
 
 /// v4 migration: a per-account UIDVALIDITY high-water mark.
 ///
 /// The mark starts at the highest value any stored mailbox carries, so
 /// existing mailboxes keep their UIDVALIDITY and every mailbox created or
-/// renamed from now on gets a greater one.
-const UIDVALIDITY_FLOOR_STATEMENTS: &[&str] = &[
-    "ALTER TABLE accounts ADD COLUMN uidvalidity_floor INTEGER NOT NULL DEFAULT 0",
-    "UPDATE accounts SET uidvalidity_floor = COALESCE(
-        (SELECT MAX(uidvalidity) FROM mailboxes WHERE account_id = accounts.id), 0)",
-];
+/// renamed from now on gets a greater one. The column is added only when
+/// missing, and an existing mark is never lowered: a replay after an
+/// older binary deleted the mailbox that carried the highest value must
+/// not hand that value out again.
+async fn add_uidvalidity_floor_column(connection: &mut SqliteConnection) -> anyhow::Result<()> {
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'uidvalidity_floor'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if columns == 0 {
+        sqlx::query("ALTER TABLE accounts ADD COLUMN uidvalidity_floor INTEGER NOT NULL DEFAULT 0")
+            .execute(&mut *connection)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE accounts SET uidvalidity_floor = MAX(uidvalidity_floor, COALESCE(
+            (SELECT MAX(uidvalidity) FROM mailboxes WHERE account_id = accounts.id), 0))",
+    )
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
 
 /// v2 migration: add the metadata-only `mime_structure` column.
 ///
@@ -2785,6 +2827,86 @@ mod tests {
             .unwrap();
         assert!(after_reset.0 > third.0);
         assert_ne!(after_reset, first);
+    }
+
+    #[tokio::test]
+    async fn reopens_after_an_older_binary_restamped_the_version() {
+        // Binaries from before the version gate stamp user_version = 2 on
+        // every open. One run of such a build over a migrated database
+        // must not leave it unopenable here: every step replays cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        version_two_database(&path).await;
+        let store = SqliteStateStore::open(&path).await.unwrap();
+        let floor_before: i64 = sqlx::query_scalar("SELECT uidvalidity_floor FROM accounts")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let created = store
+            .upsert_mailbox(1, &folder("entries-c", "Later", FolderKind::Custom), 100)
+            .await
+            .unwrap();
+        let created_uidvalidity = store
+            .mailboxes(1)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|mailbox| mailbox.id == created)
+            .unwrap()
+            .uidvalidity;
+        assert!(i64::from(created_uidvalidity) > floor_before);
+
+        // The older build: it deletes the mailbox carrying the highest
+        // UIDVALIDITY (a resync of its own would) and re-stamps 2.
+        sqlx::query("DELETE FROM mailboxes WHERE id = ?")
+            .bind(created.0)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version = 2")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.pool().close().await;
+        drop(store);
+
+        let store = SqliteStateStore::open(&path).await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Ids, UIDVALIDITY and UIDs survived the replay, and the mark was
+        // not lowered: the deleted mailbox's value is never handed out
+        // again.
+        let seen: Vec<(i64, u32, u32)> = store
+            .mailboxes(1)
+            .await
+            .unwrap()
+            .iter()
+            .map(|mailbox| (mailbox.id.0, mailbox.uidvalidity, mailbox.next_uid))
+            .collect();
+        assert_eq!(seen, vec![(1, 100, 8), (2, 100, 4)]);
+        let floor_after: i64 = sqlx::query_scalar("SELECT uidvalidity_floor FROM accounts")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert!(floor_after >= i64::from(created_uidvalidity));
+        let again = store
+            .upsert_mailbox(1, &folder("entries-d", "Again", FolderKind::Custom), 100)
+            .await
+            .unwrap();
+        let again_uidvalidity = store
+            .mailboxes(1)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|mailbox| mailbox.id == again)
+            .unwrap()
+            .uidvalidity;
+        assert!(again_uidvalidity > created_uidvalidity);
+        assert!(again.0 > created.0, "row ids are not reused either");
     }
 
     #[tokio::test]
