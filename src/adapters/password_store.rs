@@ -8,6 +8,7 @@
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::adapters::keyring_store::keyring_error;
 use crate::domain::{Error, Result};
 use crate::ports::local_password::LocalPasswordStore;
 
@@ -33,7 +34,7 @@ impl LocalPasswordStore for KeyringPasswordStore {
     async fn set(&self, password: &SecretString) -> Result<()> {
         entry()?
             .set_password(password.expose_secret())
-            .map_err(|_| Error::Storage("keyring write failed".into()))
+            .map_err(|e| keyring_error(&e, "write"))
     }
 
     async fn load(&self) -> Result<Option<SecretString>> {
@@ -42,7 +43,7 @@ impl LocalPasswordStore for KeyringPasswordStore {
             // same allocation is zeroized when the value drops.
             Ok(password) => Ok(Some(SecretString::new(password.into()))),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err(Error::Storage("keyring read failed".into())),
+            Err(e) => Err(keyring_error(&e, "read")),
         }
     }
 }

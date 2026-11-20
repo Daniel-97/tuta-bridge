@@ -51,6 +51,24 @@ impl Clock for FakeClock {
 /// Hands out handles to one shared scripted session on every resume.
 struct FakeEventFactory {
     session: Arc<FakeEventSession>,
+    /// Errors returned by the next resumes, in order, before they succeed.
+    resume_errors: std::sync::Mutex<Vec<Error>>,
+    resumes: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeEventFactory {
+    fn new(session: &Arc<FakeEventSession>) -> Self {
+        Self {
+            session: Arc::clone(session),
+            resume_errors: std::sync::Mutex::new(Vec::new()),
+            resumes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn failing_resumes(self, errors: Vec<Error>) -> Self {
+        *self.resume_errors.lock().unwrap() = errors;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -60,6 +78,12 @@ impl SessionFactory for FakeEventFactory {
     }
 
     async fn resume(&self, _credentials: &StoredCredentials) -> Result<Box<dyn Session>> {
+        self.resumes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut errors = self.resume_errors.lock().unwrap();
+        if !errors.is_empty() {
+            return Err(errors.remove(0));
+        }
         Ok(Box::new(FakeEventSessionHandle(Arc::clone(&self.session))))
     }
 }
@@ -116,9 +140,7 @@ fn use_case(
     state: Arc<FakeStateStore>,
 ) -> WatchUseCase {
     WatchUseCase {
-        factory: Arc::new(FakeEventFactory {
-            session: Arc::clone(session),
-        }) as Arc<dyn SessionFactory>,
+        factory: Arc::new(FakeEventFactory::new(session)) as Arc<dyn SessionFactory>,
         credentials: credentials as Arc<dyn tuta_bridge::ports::credentials::CredentialStore>,
         config_path,
         state: state as Arc<dyn StateStore>,
@@ -495,6 +517,63 @@ async fn connect_failure_is_retried_with_backoff() {
             .as_deref(),
         Some("batch-4")
     );
+}
+
+#[tokio::test]
+async fn network_failures_at_resume_are_retried() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, _marker) = synced_account(&state).await;
+
+    // The network is down for the first two resumes, as at boot.
+    let session = event_session();
+    session.push_script(vec![
+        Ok(EventFrame::Batch(empty_batch("batch-5", "group1"))),
+        Err(Error::Login("stop".into())),
+    ]);
+    let factory = Arc::new(FakeEventFactory::new(&session).failing_resumes(vec![
+        Error::Network("offline".into()),
+        Error::Network("offline".into()),
+    ]));
+    let mut watch = use_case(&session, credentials, config_path, state.clone());
+    watch.factory = Arc::clone(&factory) as Arc<dyn SessionFactory>;
+
+    let error = watch.run_until(std::future::pending()).await.unwrap_err();
+
+    assert_eq!(factory.resumes.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert!(matches!(error, Error::Login(_)));
+    assert_eq!(
+        state
+            .last_batch(account, "group1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("batch-5")
+    );
+}
+
+#[tokio::test]
+async fn an_expired_session_at_resume_is_not_retried() {
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let _ = synced_account(&state).await;
+
+    let session = event_session();
+    let factory = Arc::new(
+        FakeEventFactory::new(&session).failing_resumes(vec![Error::Login(
+            "session is no longer valid; run login again".into(),
+        )]),
+    );
+    let mut watch = use_case(&session, credentials, config_path, state);
+    watch.factory = Arc::clone(&factory) as Arc<dyn SessionFactory>;
+
+    let error = watch.run_until(std::future::pending()).await.unwrap_err();
+
+    assert_eq!(factory.resumes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(error.exit_code(), 4);
+    assert_eq!(session.events_calls(), 0);
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, an IMAP server with read/unread, move and delete, an optional read-only POP3 server, and optional SMTP submission). Sending is **not end-to-end encrypted** — see "SMTP submission" below.
+Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, an IMAP server with read/unread, move and delete, an optional read-only POP3 server, and optional SMTP submission), plus a `systemd --user` unit for `serve`. Sending is **not end-to-end encrypted** — see "SMTP submission" below.
 
 ## Credentials
 
@@ -38,7 +38,7 @@ tuta-bridge watch
   refer to two different folders.
 - Only one of `sync`, `resync`, `watch`, and `serve` can run at a time. They
   share a lock file (`state.sqlite3.lock`); starting a second one fails
-  immediately (exit code 2) with `error: storage error: the state database
+  immediately (exit code 10) with `error: already in use: the state database
   is in use by another tuta-bridge process (sync, resync, watch or serve);
   stop it first`. Stop
   `watch`/`serve` before running `sync` or `resync`. The lock is released
@@ -147,12 +147,14 @@ tuta-bridge serve
   (without the user name), and the connection is closed after the
   third failure. Failed attempts wait in a single queue, so opening
   more connections does not allow more guesses.
-- Ctrl-C stops `serve`. A Ctrl-C pressed during the initial baseline
+- Ctrl-C or SIGTERM stops `serve` cleanly (exit code 0). A stop requested during the initial baseline
   sync takes effect only after that sync finishes; once the event
   stream is running the stop is immediate.
 - `serve` resumes the stored session exactly like `watch`, so run
   `login` first; fatal authentication errors end it with the same
-  message.
+  message. A resume that fails because the network is not up yet is
+  retried with the same backoff as a dropped event stream.
+- To run it in the background at login, see "Running as a service".
 
 ### Thunderbird
 
@@ -328,6 +330,86 @@ smtp_port = 9925
   `In-Reply-To`/`References` (Tuta builds its own threading headers),
   and the `Date:` (Tuta stamps the send time).
 
+## Running as a service
+
+On Linux `serve` can run as a `systemd --user` service: it starts at login
+with no terminal, comes back after a crash or a kill, and logs to the
+journal. The unit is `contrib/systemd/tuta-bridge.service`; it expects the
+binary at `~/.cargo/bin/tuta-bridge` (edit `ExecStart` otherwise).
+
+```sh
+cargo install --path .
+tuta-bridge login     # once, interactively
+tuta-bridge passwd    # once, interactively
+
+install -Dm644 contrib/systemd/tuta-bridge.service \
+    ~/.config/systemd/user/tuta-bridge.service
+systemctl --user daemon-reload
+systemctl --user enable --now tuta-bridge
+
+systemctl --user status tuta-bridge     # state and last log lines
+journalctl --user -u tuta-bridge -f     # follow the log
+systemctl --user stop tuta-bridge       # stop until the next login
+systemctl --user disable --now tuta-bridge
+```
+
+The log holds what `serve` prints in a terminal: listen addresses,
+counters, and fixed error strings — never subjects, addresses, or ids.
+Colours are turned off when stderr is not a terminal.
+
+### Restart policy and exit codes
+
+`serve` separates failures a restart can fix from failures that need you.
+Its exit code carries that distinction, and the unit restarts only on the
+first kind (`Restart=always`, `RestartSec=10`,
+`RestartPreventExitStatus=1 3 4 5 8 9 10`). A unit stopped with
+`systemctl --user stop` is never restarted. Five starts within two minutes
+stop the restarts as well; the unit then stays failed until
+`systemctl --user reset-failed tuta-bridge`.
+
+| Exit | Meaning | Restarted | What to do |
+| ---- | ------- | --------- | ---------- |
+| 0 | stopped by Ctrl-C or SIGTERM | only after a kill | — |
+| 1 | configuration error, local password missing | no | fix the config, run `tuta-bridge passwd` |
+| 2 | storage error (state database) | yes | if it repeats, check the data directory |
+| 3 | no active account or stored credentials | no | `tuta-bridge login` |
+| 4 | session expired or revoked, second factor required | no | `tuta-bridge login` again |
+| 5 | folder not found | no | — |
+| 6 | network error | yes | — |
+| 8 | system keyring unavailable or locked | no | unlock the keyring, then `systemctl --user start tuta-bridge` |
+| 9 | unsupported: server model or client version changed, state database from a newer build | no | update tuta-bridge |
+| 10 | already in use: another bridge holds the state lock, or a port is taken | no | stop the other process |
+
+A network that is down when the service starts (at boot or before Wi-Fi
+connects) does not end `serve`: the session resume is retried in-process
+with backoff, like a dropped event stream.
+
+### Troubleshooting
+
+- **Keyring locked or unavailable** (`error: system keyring unavailable:
+  the Secret Service is not running or the keyring is locked`, exit 8).
+  `serve` reads the Tuta session and the local IMAP password from the
+  Secret Service, which works only when your keyring is unlocked in the
+  session — normally at a graphical login with the keyring password equal
+  to the login password. Do not enable lingering (`loginctl
+  enable-linger`) for this unit: without a login nothing unlocks the
+  keyring. If the keyring is locked, the desktop may show an unlock
+  prompt when the unit starts; dismissing it ends the unit with exit 8.
+  Check that a Secret Service is running (`busctl --user list | grep
+  org.freedesktop.secrets`) and that the login keyring is unlocked (for
+  example in Seahorse), then start the unit again.
+- **Port already in use** (`error: already in use: imap port 9930 is
+  already in use`, exit 10). Another program, or a bridge started by
+  hand, holds the port: `ss -ltnp 'sport = :9930'`. Stop it, or change
+  `imap_port` (and `pop3_port`/`smtp_port`) in the config.
+- **Lock held by another instance** (`error: already in use: the state
+  database is in use by another tuta-bridge process`, exit 10). A `serve`,
+  `watch`, `sync`, or `resync` is running elsewhere, for example in a
+  terminal: stop it, then start the unit.
+- **Session expired** (`error: login failed: ... run login again`, exit 4).
+  The unit stops once and stays stopped: run `tuta-bridge login`, then
+  `systemctl --user start tuta-bridge`.
+
 ## Dump
 
 Write messages from a mailbox folder to one `.eml` file per message:
@@ -367,6 +449,9 @@ tuta-bridge passwd
 
 # Serve read-only IMAP on 127.0.0.1:9930 (Ctrl-C to stop)
 tuta-bridge serve
+
+# Run serve as a systemd --user service (Linux, see "Running as a service")
+systemctl --user enable --now tuta-bridge
 
 # Remove stored credentials and clear the active account
 tuta-bridge logout
