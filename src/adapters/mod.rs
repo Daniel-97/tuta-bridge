@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod dav;
 pub mod imap;
 pub mod keyring_store;
 pub mod mime;

@@ -34,6 +34,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 
+use crate::adapters::dav::DavServeLimits;
 use crate::adapters::imap::backend::TutaImapBackend;
 use crate::adapters::imap::server::{self, ensure_certificate, tls_acceptor, ServeLimits};
 use crate::adapters::mime::MimeRenderer;
@@ -842,7 +843,7 @@ impl ServeUseCase {
         //    its own — only a fatal error can — ends serve with that
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
-        let (imap_limits, pop3_limits, smtp_limits) = shared_listener_limits();
+        let (imap_limits, pop3_limits, smtp_limits, _dav_limits) = shared_listener_limits();
         let smtp_auth = Arc::clone(&backend);
         let smtp_tls = tls.clone();
         let mut smtp_accepting = pin!(async move {
@@ -885,19 +886,28 @@ impl ServeUseCase {
     }
 }
 
-/// The limits of the three listeners, sharing one failed-login gate:
-/// IMAP, POP3 and SMTP check the same bridge password, so their
-/// failed-login delays must queue behind each other, or a local process
-/// would get one guessing channel per protocol.
-pub fn shared_listener_limits() -> (ServeLimits, Pop3ServeLimits, SmtpServeLimits) {
+/// The limits of the listeners, sharing one failed-login gate: IMAP,
+/// POP3, SMTP and the DAV listeners check the same bridge password, so
+/// their failed-login delays must queue behind each other, or a local
+/// process would get one guessing channel per protocol. Every DAV
+/// listener (CardDAV, CalDAV) uses a clone of the one `DavServeLimits`,
+/// which keeps the gate shared.
+pub fn shared_listener_limits() -> (
+    ServeLimits,
+    Pop3ServeLimits,
+    SmtpServeLimits,
+    DavServeLimits,
+) {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let mut imap = ServeLimits::default();
     imap.session.login_gate = Arc::clone(&gate);
     let mut pop3 = Pop3ServeLimits::default();
     pop3.session.login_gate = Arc::clone(&gate);
     let mut smtp = SmtpServeLimits::default();
-    smtp.session.login_gate = gate;
-    (imap, pop3, smtp)
+    smtp.session.login_gate = Arc::clone(&gate);
+    let mut dav = DavServeLimits::default();
+    dav.session.login_gate = gate;
+    (imap, pop3, smtp, dav)
 }
 
 #[cfg(test)]
@@ -906,7 +916,7 @@ mod tests {
 
     #[test]
     fn every_listener_shares_one_login_gate() {
-        let (imap, pop3, smtp) = shared_listener_limits();
+        let (imap, pop3, smtp, dav) = shared_listener_limits();
         assert!(Arc::ptr_eq(
             &imap.session.login_gate,
             &pop3.session.login_gate
@@ -914,6 +924,16 @@ mod tests {
         assert!(Arc::ptr_eq(
             &imap.session.login_gate,
             &smtp.session.login_gate
+        ));
+        assert!(Arc::ptr_eq(
+            &imap.session.login_gate,
+            &dav.session.login_gate
+        ));
+        // A second DAV listener gets a clone: still the same gate.
+        let caldav = dav.clone();
+        assert!(Arc::ptr_eq(
+            &imap.session.login_gate,
+            &caldav.session.login_gate
         ));
     }
 
