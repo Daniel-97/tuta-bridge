@@ -1,3 +1,4 @@
+use super::contact_store::ContactStore;
 use crate::domain::{
     BatchOutcome, Folder, MailboxId, MessageHeader, Result, StateChange, StoredMailbox,
     StoredMessage,
@@ -5,6 +6,12 @@ use crate::domain::{
 
 #[async_trait::async_trait]
 pub trait StateStore: Send + Sync {
+    /// The CardDAV contact cache kept in the same database, if this
+    /// store has one. Defaults to none.
+    fn contact_store(&self) -> Option<&dyn ContactStore> {
+        None
+    }
+
     async fn upsert_account(&self, mail_address: &str) -> Result<i64>;
     /// Create or refresh the mailbox of `folder`.
     ///

@@ -334,3 +334,43 @@ fn action_changes(element_id: String, action: MailAction) -> Vec<StateChange> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Contacts (CardDAV)
+// ---------------------------------------------------------------------------
+
+/// The coalesced effect of one contact's events within a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactEventAction {
+    /// Created or updated: reload it.
+    Refresh,
+    /// Deleted: drop its row.
+    Remove,
+}
+
+/// The `Contact` events of `batch`, one action per contact in
+/// first-seen order; a later event of the same contact replaces the
+/// earlier action. The mail processor above counts these events as
+/// skipped and touches no mailbox for them, so IMAP hears nothing; the
+/// CardDAV contact cache ([`crate::app::contacts::ContactBook`])
+/// applies them after the batch.
+pub fn contact_events(batch: &EventBatch) -> Vec<(String, String, ContactEventAction)> {
+    let mut actions: Vec<(String, String, ContactEventAction)> = Vec::new();
+    for event in &batch.events {
+        if event.application != TUTANOTA_APP || event.type_id != crate::domain::CONTACT_TYPE_ID {
+            continue;
+        }
+        let action = match event.operation {
+            EntityOperation::Create | EntityOperation::Update => ContactEventAction::Refresh,
+            EntityOperation::Delete => ContactEventAction::Remove,
+        };
+        match actions
+            .iter_mut()
+            .find(|(list, element, _)| *list == event.list_id && *element == event.element_id)
+        {
+            Some(existing) => existing.2 = action,
+            None => actions.push((event.list_id.clone(), event.element_id.clone(), action)),
+        }
+    }
+    actions
+}

@@ -191,6 +191,7 @@ fn main() {
                     connect_timeout: CONNECT_TIMEOUT,
                     lookup_failure_threshold: LOOKUP_FAILURE_THRESHOLD,
                     notifier: None,
+                    contacts: None,
                 };
                 uc.run().await?;
                 Ok(())

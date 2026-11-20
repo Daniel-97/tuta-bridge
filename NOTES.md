@@ -462,3 +462,57 @@ from the review:
 - XML: `quick-xml` 0.41 (no default features, MSRV 1.79). It is the most widely used Rust XML reader, mature and streaming, with a namespace resolver (`NsReader`) — the one thing WebDAV parsing cannot do without — and no transitive dependencies. A DOCTYPE is refused, so no entity is ever declared; only the predefined entities and character references resolve. Depth (32) and element count (10 000) are bounded. Output is rendered by hand with fixed prefixes `d` / `card` / `cal` / `cs` / `ical` and an inline `xmlns` for anything else.
 - Privacy: log lines carry the handler's fixed label, fixed text and counters (`attempt`, `requests`, `status`). Paths, user names, bodies and handler error texts are never logged or echoed; the `authorization` header is stripped before the request reaches the handler.
 - Left to the features: URL layout and principal/home-set properties, which properties `allprop` returns (`PropRequest::names` tells whether an expensive one was named explicitly), `Depth: infinity` policy, report support (`supported-report-set`, `403`/`501` for unknown reports), filters beyond the CalDAV `time-range` convenience field, ETag/ctag/sync-token minting, and percent-encoding of the hrefs they hand out.
+
+## CardDAV (#7)
+
+- Layout: `src/adapters/carddav` (`handler.rs` the `DavHandler`,
+  `vcard.rs` the renderer), `src/app/contacts.rs` (`ContactBook`: cache
+  freshness, rendering, event refresh), `src/adapters/sqlite_contacts.rs`
+  (the `ContactStore` impl and schema step 7), ports `contact_source`
+  (SDK seam, `Session::shared_contacts`, default `NoContacts`) and
+  `contact_store` (reached through `StateStore::contact_store()`, default
+  `None`, so `FakeStateStore` and every other store stay untouched),
+  `src/adapters/tuta/contact_source.rs` (the SDK adapter).
+- Schema step 7 (`CONTACT_SCHEMA_STATEMENTS`, `CREATE … IF NOT EXISTS`,
+  idempotent): `contact_books(account_id PK, epoch, revision, loaded,
+  list_id)` and `contacts(account_id, element_id PK, list_id, etag,
+  revision, deleted)` + index `(account_id, revision)`, both cascading
+  with the account. Metadata only: no names, addresses or vCard bodies.
+- ETag: the first 128 bits of SHA-256 over the rendered vCard (the SDK's
+  `crypto_primitives::sha::sha256`, no new dependency), strong. The
+  renderer is deterministic, so a full reload of an unchanged contact
+  keeps its ETag and its revision. A renderer change changes ETags once.
+- Revision: every inserted/changed/tombstoned row takes `++revision` of
+  its book, inside one `BEGIN IMMEDIATE` transaction. `getctag` is
+  `<epoch>-<revision>`; `sync-token` is
+  `urn:tuta-bridge:carddav:sync:<epoch>-<revision>`. Deletions are kept
+  as tombstones so `sync-collection` can report them as `404`; a token
+  from another epoch or from the future answers `403 valid-sync-token`.
+  The random epoch makes tokens from a recreated database invalid.
+- Freshness: `serve` spawns a full load at start (in the background, IMAP
+  is not delayed). Each applied event batch passes its `Contact` events
+  (type id 64, `CONTACT_TYPE_ID`) to `ContactBook::apply_batch`:
+  create/update reloads that contact through the crypto entity client,
+  delete tombstones it; events of another contact list than the loaded
+  one are ignored. The mail processor still counts them as skipped and
+  touches no mailbox, so IDLE/IMAP hear nothing. A failed refresh, and
+  every index recovery (missed events), only mark the book stale; the
+  next listing request reloads it (a never-loaded book that cannot load
+  answers `503`; a stale one that cannot reload serves the cache). Every
+  render heals the cache when it finds a different ETag, so a client
+  never loops on an ETag mismatch.
+- Rendering on demand: `GET` and small multigets (≤ 4) load contacts one
+  by one; larger ones, filtered queries and `address-data` in queries
+  load the whole book once (which also refreshes the cache).
+- Thunderbird flow: discovery via `/.well-known/carddav` →
+  `current-user-principal` → `addressbook-home-set` → depth-1 PROPFIND
+  for `resourcetype`/`current-user-privilege-set` (only `read` →
+  read-only book); sync is `PROPFIND Depth: 1` (`getctag`, `getetag`)
+  then `addressbook-multiget`, or `sync-collection` when it holds a
+  sync token. Both paths are covered by `tests/carddav.rs`, but no live
+  Thunderbird or Tuta account has been run against it yet.
+- Privacy: the SDK's contact path (`ContactFacade`, crypto entity
+  client loads of `Contact`) does not log, so no new `tracing` directive
+  is needed. Console output is fixed text plus counters ("address book
+  loaded: N contacts", "contacts updated: …"). Domain contact types have
+  no `Debug`.

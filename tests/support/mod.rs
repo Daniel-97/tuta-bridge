@@ -1149,6 +1149,8 @@ pub struct FakeEventSession {
     pub marker_calls: Mutex<Vec<HashMap<String, String>>>,
     /// The write seam handed to `serve` through `shared_writer`.
     pub writer: Arc<FakeMailboxWriter>,
+    /// The address book handed to `serve` through `shared_contacts`.
+    pub contacts: Arc<FakeContactSource>,
 }
 
 impl FakeEventSession {
@@ -1164,6 +1166,7 @@ impl FakeEventSession {
             mail: Arc::new(FakeMailSource::new()),
             marker_calls: Mutex::new(Vec::new()),
             writer: Arc::new(FakeMailboxWriter::new()),
+            contacts: Arc::new(FakeContactSource::new(Vec::new())),
         }
     }
 
@@ -1232,6 +1235,10 @@ impl Session for FakeEventSessionHandle {
 
     fn shared_writer(&self) -> Arc<dyn MailboxWriter> {
         Arc::clone(&self.0.writer) as Arc<dyn MailboxWriter>
+    }
+
+    fn shared_contacts(&self) -> Arc<dyn tuta_bridge::ports::contact_source::ContactSource> {
+        Arc::clone(&self.0.contacts) as Arc<dyn tuta_bridge::ports::contact_source::ContactSource>
     }
 
     fn event_groups(&self) -> Vec<String> {
@@ -1821,5 +1828,87 @@ impl MailboxWriter for FakeMailboxWriter {
             folder.into(),
             element_ids(mails),
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeContactSource (CardDAV)
+// ---------------------------------------------------------------------------
+
+/// An in-memory address book. Contacts are keyed by element id; every
+/// load is counted, and loads can be made to fail with a network error.
+pub struct FakeContactSource {
+    pub cards: Mutex<Vec<tuta_bridge::domain::ContactCard>>,
+    pub fail: std::sync::atomic::AtomicBool,
+    pub full_loads: AtomicUsize,
+    pub single_loads: AtomicUsize,
+}
+
+impl FakeContactSource {
+    pub fn new(cards: Vec<tuta_bridge::domain::ContactCard>) -> Self {
+        Self {
+            cards: Mutex::new(cards),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            full_loads: AtomicUsize::new(0),
+            single_loads: AtomicUsize::new(0),
+        }
+    }
+
+    /// Replace or add one contact.
+    pub fn put(&self, card: tuta_bridge::domain::ContactCard) {
+        let mut cards = self.cards.lock().unwrap();
+        cards.retain(|existing| existing.element_id != card.element_id);
+        cards.push(card);
+    }
+
+    pub fn remove(&self, element_id: &str) {
+        self.cards
+            .lock()
+            .unwrap()
+            .retain(|card| card.element_id != element_id);
+    }
+
+    pub fn set_failing(&self, failing: bool) {
+        self.fail.store(failing, Ordering::SeqCst);
+    }
+
+    pub fn full_loads(&self) -> usize {
+        self.full_loads.load(Ordering::SeqCst)
+    }
+
+    pub fn single_loads(&self) -> usize {
+        self.single_loads.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl tuta_bridge::ports::contact_source::ContactSource for FakeContactSource {
+    async fn contacts(&self) -> Result<tuta_bridge::ports::contact_source::ContactListing> {
+        self.full_loads.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(Error::Network("contacts unavailable".into()));
+        }
+        Ok(tuta_bridge::ports::contact_source::ContactListing {
+            cards: self.cards.lock().unwrap().clone(),
+            skipped: 0,
+        })
+    }
+
+    async fn contact(
+        &self,
+        list_id: &str,
+        element_id: &str,
+    ) -> Result<Option<tuta_bridge::domain::ContactCard>> {
+        self.single_loads.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(Error::Network("contacts unavailable".into()));
+        }
+        Ok(self
+            .cards
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|card| card.list_id == list_id && card.element_id == element_id)
+            .cloned())
     }
 }

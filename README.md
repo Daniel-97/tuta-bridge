@@ -330,6 +330,92 @@ smtp_port = 9925
   `In-Reply-To`/`References` (Tuta builds its own threading headers),
   and the `Date:` (Tuta stamps the send time).
 
+## CardDAV server (optional)
+
+`serve` can serve your Tuta address book read-only over CardDAV, for
+Thunderbird's address book and its address auto-complete. It is off
+unless the config file names a port:
+
+```toml
+carddav_port = 9932
+```
+
+- Same listener rules as IMAP: `127.0.0.1` only (implicit TLS, the same
+  self-signed certificate), HTTP Basic with the account address and the
+  bridge password, the failed-login delay shared with IMAP/POP3/SMTP, at
+  most 16 connections.
+- The address book is loaded in the background when `serve` starts and
+  kept fresh by the event stream: a contact changed in the Tuta web
+  client is updated on the client's next refresh. Only metadata (ids and
+  ETags) is cached in the state database; vCards are decrypted and
+  rendered on demand.
+
+### Thunderbird
+
+1. Address Book → *New Address Book* → *Add CardDAV Address Book*.
+2. Username: your Tuta address. Location: `https://127.0.0.1:9932/`
+   (Thunderbird finds the address book through `/.well-known/carddav`).
+3. Thunderbird first asks to accept the bridge's self-signed
+   certificate: confirm the security exception for `127.0.0.1:9932`
+   (if the dialog does not appear, open *Settings → Privacy & Security →
+   Certificates → Manage Certificates → Servers → Add Exception* and
+   enter `https://127.0.0.1:9932`). Then enter the bridge password.
+4. Pick *Tuta contacts*. The book is read-only in Thunderbird.
+
+### URL layout
+
+| URL                                    | Resource                         |
+|----------------------------------------|----------------------------------|
+| `/`, `/.well-known/carddav`            | entry points (→ the principal)   |
+| `/principal/`                          | current-user-principal           |
+| `/addressbooks/`                       | addressbook-home-set             |
+| `/addressbooks/contacts/`              | the address book                 |
+| `/addressbooks/contacts/<id>.vcf`      | one contact                      |
+
+### Field mapping (vCard 4.0)
+
+| Tuta                                   | vCard                                       |
+|----------------------------------------|---------------------------------------------|
+| contact id                             | `UID` (`tuta-contact-<id>`)                 |
+| title, first, middle, last name, suffix| `N` (and composed into `FN`)                |
+| nickname                               | `NICKNAME`                                  |
+| email addresses                        | `EMAIL;TYPE=home/work`                      |
+| phone numbers                          | `TEL;TYPE=home/work/cell/fax`               |
+| postal addresses (free text)           | `ADR;TYPE=home/work`, as the street part    |
+| company, department                    | `ORG`                                       |
+| job title (role)                       | `TITLE`                                     |
+| birthday                               | `BDAY` (`--MMDD` without a year)            |
+| first anniversary                      | `ANNIVERSARY`                               |
+| websites                               | `URL;TYPE=home/work`                        |
+| relationships                          | `RELATED;VALUE=text` with a `TYPE`          |
+| comment                                | `NOTE`                                      |
+
+`FN` falls back to the nickname, company, first email or first phone
+number when a contact has no name. "Other" and custom-labelled values
+carry no `TYPE`; the custom label text is not exported.
+
+Dropped (no clean vCard equivalent or not loaded): the photo, social
+network ids, messenger handles, pronouns, phonetic names, custom dates
+other than the first anniversary, custom type labels, and the
+preshared password.
+
+### Limits of v1
+
+- Read-only: `PUT`, `DELETE`, `PROPPATCH` and `MKCOL` answer `403`;
+  edit contacts in the Tuta client.
+- One address book: the user's own contacts. Shared contact lists and
+  contact groups are not served.
+- `PROPFIND` serves depth 0 and 1; `Depth: infinity` (or no `Depth`) is
+  answered as depth 1.
+- Reports: `addressbook-multiget`, `addressbook-query` and
+  `sync-collection`. Query filters support `prop-filter` on `FN`, `N`,
+  `NICKNAME`, `EMAIL`, `TEL`, `ORG` and `NOTE` with `text-match`
+  (case-insensitive equals/contains/starts-with/ends-with, negation) or
+  `is-not-defined`; anything else (`param-filter`, other properties)
+  answers `403` with `supported-filter`. Only vCard 4.0 is produced.
+- Filtered queries and multigets of more than a few cards load the
+  whole address book from Tuta.
+
 ## Running as a service
 
 On Linux `serve` can run as a `systemd --user` service: it starts at login

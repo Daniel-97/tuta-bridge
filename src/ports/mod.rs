@@ -1,4 +1,6 @@
 pub mod clock;
+pub mod contact_source;
+pub mod contact_store;
 pub mod credentials;
 pub mod event_lookup;
 pub mod event_stream;

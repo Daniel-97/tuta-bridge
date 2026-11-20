@@ -34,7 +34,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::adapters::dav::DavServeLimits;
+use crate::adapters::carddav::CardDavHandler;
+use crate::adapters::dav::{serve_dav, DavHandler, DavServeLimits};
 use crate::adapters::imap::backend::TutaImapBackend;
 use crate::adapters::imap::server::{self, ensure_certificate, tls_acceptor, ServeLimits};
 use crate::adapters::mime::MimeRenderer;
@@ -45,6 +46,7 @@ use crate::adapters::tuta::event_wire::is_invalid_event;
 use crate::adapters::tuta::generated_id::{
     batch_is_expired, generated_id_timestamp, timestamp_to_generated_id,
 };
+use crate::app::contacts::ContactBook;
 use crate::app::enrich::EnvelopeEnricher;
 use crate::app::event_sync::{deletes_folder, EventProcessor, EventReport};
 use crate::app::state_sync::{current_uidvalidity, sync_with};
@@ -173,9 +175,19 @@ pub struct WatchUseCase {
     /// default — publishes nothing; send errors from a closed channel
     /// are ignored because they only mean nobody idles.
     pub notifier: Option<MailboxEventSender>,
+    /// The CardDAV address book: `Contact` events of every applied
+    /// batch refresh its cache, and an index recovery marks it stale.
+    /// `None` — the default — leaves contacts alone.
+    pub contacts: Option<Arc<ContactBook>>,
 }
 
 impl WatchUseCase {
+    /// Attach the CardDAV address book.
+    pub fn with_contacts(mut self, contacts: Arc<ContactBook>) -> Self {
+        self.contacts = Some(contacts);
+        self
+    }
+
     /// Attach a mailbox-change broadcaster.
     ///
     /// Additive: construction sites without a notifier keep their
@@ -361,6 +373,17 @@ impl WatchUseCase {
                                     let _ = notifier.send(MailboxChanged(*mailbox));
                                 }
                             }
+                            // Contact events refresh the CardDAV cache;
+                            // IMAP hears nothing of them. A failure only
+                            // marks the book stale.
+                            if let Some(contacts) = &self.contacts {
+                                let refresh = contacts.apply_batch(&batch);
+                                let Some(refreshed) = unless_stopped(&mut stop, refresh).await
+                                else {
+                                    return Ok(());
+                                };
+                                print_contact_report(&refreshed);
+                            }
                             // A deleted folder cannot be resolved from
                             // its event, and no `sync` can run beside
                             // this process, so the stored folders are
@@ -473,6 +496,11 @@ impl WatchUseCase {
         )
         .await?;
         print_sync_report(&report);
+        // Contact events may have been missed as well: the next CardDAV
+        // request reloads the address book.
+        if let Some(contacts) = &self.contacts {
+            contacts.mark_stale();
+        }
 
         let mut batches = HashMap::new();
         for group in groups {
@@ -646,6 +674,18 @@ where
     }
 }
 
+/// Print what an event batch did to the address book; counts only.
+fn print_contact_report(report: &crate::app::contacts::ContactEventReport) {
+    if report.failed {
+        println!("contact refresh failed; the address book reloads on the next CardDAV request");
+    } else if !report.counts.is_empty() {
+        println!(
+            "contacts updated: {} added, {} changed, {} removed",
+            report.counts.added, report.counts.updated, report.counts.removed
+        );
+    }
+}
+
 /// Print the counters of an index sync; counts only, never mail data.
 fn print_sync_report(report: &SyncReport) {
     println!(
@@ -775,6 +815,23 @@ impl ServeUseCase {
             writer: session.shared_writer(),
         });
         let mail_sender = session.shared_sender();
+        // CardDAV is opt-in: the address book exists only when the
+        // config names a port. Its port is validated before anything
+        // is opened, like the others.
+        let carddav = match config.carddav_port {
+            Some(carddav_port) => {
+                validate_imap_port(carddav_port).map_err(|_| {
+                    Error::Config("carddav_port must be between 1 and 65535".into())
+                })?;
+                let book = ContactBook::new(
+                    account_id,
+                    Arc::clone(&self.state),
+                    session.shared_contacts(),
+                )?;
+                Some((carddav_port, Arc::new(book)))
+            }
+            None => None,
+        };
         let _session = session;
 
         // 5. The watch task feeds the same store and broadcasts every
@@ -795,8 +852,13 @@ impl ServeUseCase {
             connect_timeout: self.connect_timeout,
             lookup_failure_threshold: self.lookup_failure_threshold,
             notifier: None,
+            contacts: None,
         }
         .with_notifier(sender.clone());
+        let watch = match &carddav {
+            Some((_, book)) => watch.with_contacts(Arc::clone(book)),
+            None => watch,
+        };
         let mut watch_task = tokio::spawn(async move {
             watch
                 .run_until(async move {
@@ -836,6 +898,32 @@ impl ServeUseCase {
             }
             None => None,
         };
+        // CardDAV listens on its own port; the baseline load of the
+        // address book runs in the background so IMAP is not delayed.
+        let carddav_listener = match &carddav {
+            Some((carddav_port, book)) => {
+                let carddav_listener = bind_loopback("carddav", *carddav_port).await?;
+                println!("serving CardDAV on 127.0.0.1:{carddav_port} (read-only)");
+                Some((carddav_listener, Arc::clone(book)))
+            }
+            None => None,
+        };
+        let baseline = carddav.as_ref().map(|(_, book)| {
+            let book = Arc::clone(book);
+            tokio::spawn(async move {
+                match book.reload().await {
+                    Ok(_) => match book.listing().await {
+                        Ok(contacts) => {
+                            println!("address book loaded: {} contacts", contacts.len())
+                        }
+                        Err(_) => println!("address book loaded"),
+                    },
+                    Err(_) => {
+                        println!("address book load failed; retrying on the next CardDAV request")
+                    }
+                }
+            })
+        });
         println!("serving IMAP on 127.0.0.1:{port}; press Ctrl-C to stop");
 
         // 7. Accept until the stop future resolves, then end the
@@ -843,7 +931,26 @@ impl ServeUseCase {
         //    its own — only a fatal error can — ends serve with that
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
-        let (imap_limits, pop3_limits, smtp_limits, _dav_limits) = shared_listener_limits();
+        let (imap_limits, pop3_limits, smtp_limits, dav_limits) = shared_listener_limits();
+        let carddav_auth = Arc::clone(&backend);
+        let carddav_tls = tls.clone();
+        let carddav_limits = dav_limits.clone();
+        let mut carddav_accepting = pin!(async move {
+            match carddav_listener {
+                Some((carddav_listener, book)) => {
+                    let handler: Arc<dyn DavHandler> = Arc::new(CardDavHandler::new(book));
+                    serve_dav(
+                        carddav_listener,
+                        carddav_tls,
+                        carddav_auth,
+                        handler,
+                        carddav_limits,
+                    )
+                    .await
+                }
+                None => std::future::pending().await,
+            }
+        });
         let smtp_auth = Arc::clone(&backend);
         let smtp_tls = tls.clone();
         let mut smtp_accepting = pin!(async move {
@@ -877,6 +984,10 @@ impl ServeUseCase {
             () = &mut accepting => {}
             () = &mut pop3_accepting => {}
             () = &mut smtp_accepting => {}
+            () = &mut carddav_accepting => {}
+        }
+        if let Some(baseline) = baseline {
+            baseline.abort();
         }
         let _ = stop_watch.send(());
         match watch_task.await {

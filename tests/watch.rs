@@ -98,6 +98,7 @@ fn temp_config() -> (tempfile::TempDir, PathBuf) {
         imap_port: None,
         pop3_port: None,
         smtp_port: None,
+        carddav_port: None,
     }
     .save(&path)
     .unwrap();
@@ -153,6 +154,7 @@ fn use_case(
         connect_timeout: Duration::from_secs(5),
         lookup_failure_threshold: 10,
         notifier: None,
+        contacts: None,
     }
 }
 
@@ -1367,4 +1369,85 @@ async fn sync_notifies_every_current_mailbox() {
         .map(|mailbox| mailbox.id)
         .collect();
     assert_eq!(notified, current);
+}
+
+// ---------------------------------------------------------------------------
+// Contacts (CardDAV)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn contact_events_refresh_the_address_book_and_reach_no_mailbox() {
+    use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
+    use tuta_bridge::app::contacts::ContactBook;
+    use tuta_bridge::domain::{ContactCard, CONTACT_TYPE_ID};
+    use tuta_bridge::ports::contact_source::ContactSource;
+
+    let (_dir, config_path) = temp_config();
+    let credentials = fake_credentials();
+    let state = Arc::new(FakeStateStore::new());
+    let (account, _) = synced_account(&state).await;
+
+    // The address book lives in its own (SQLite) store with one contact.
+    let contact = |nickname: &str| ContactCard {
+        list_id: "contact-list".into(),
+        element_id: "c1".into(),
+        first_name: "Ada".into(),
+        nickname: nickname.into(),
+        ..ContactCard::default()
+    };
+    let contacts_state = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    let contacts_account = contacts_state.upsert_account(LOGIN).await.unwrap();
+    let source = Arc::new(support::FakeContactSource::new(vec![contact("one")]));
+    let book = Arc::new(
+        ContactBook::new(
+            contacts_account,
+            contacts_state as Arc<dyn StateStore>,
+            Arc::clone(&source) as Arc<dyn ContactSource>,
+        )
+        .unwrap(),
+    );
+    book.reload().await.unwrap();
+    let before = book.lookup("c1").await.unwrap().unwrap();
+    source.put(contact("two"));
+
+    let batch = EventBatch {
+        batch_id: "batch-2".to_string(),
+        owner_group_id: "group1".to_string(),
+        application_types_hash: "types-hash".to_string(),
+        events: vec![EntityEvent {
+            application: TUTANOTA_APP.to_string(),
+            type_id: CONTACT_TYPE_ID,
+            list_id: "contact-list".to_string(),
+            element_id: "c1".to_string(),
+            operation: EntityOperation::Update,
+        }],
+    };
+    let session = event_session();
+    session.push_script(vec![
+        Ok(EventFrame::Batch(batch)),
+        Err(Error::Login("stop".into())),
+    ]);
+    let (sender, mut receiver) = tokio::sync::broadcast::channel::<MailboxChanged>(16);
+    let error = use_case(&session, credentials, config_path, state.clone())
+        .with_notifier(sender)
+        .with_contacts(Arc::clone(&book))
+        .run_until(std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Login(_)));
+
+    // The batch marker moved, the contact's ETag changed, and no mailbox
+    // was announced.
+    assert_eq!(
+        state
+            .last_batch(account, "group1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("batch-2")
+    );
+    let after = book.lookup("c1").await.unwrap().unwrap();
+    assert_ne!(after.etag, before.etag);
+    assert!(receiver.try_recv().is_err());
+    assert!(session.lookup.calls().is_empty());
 }
