@@ -761,19 +761,13 @@ impl ServeUseCase {
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
         let mut stop = pin!(stop);
+        let (imap_limits, pop3_limits, smtp_limits) = shared_listener_limits();
         let smtp_auth = Arc::clone(&backend);
         let smtp_tls = tls.clone();
         let mut smtp_accepting = pin!(async move {
             match smtp_listener {
                 Some(smtp_listener) => {
-                    serve_smtp(
-                        smtp_listener,
-                        smtp_tls,
-                        smtp_auth,
-                        mail_sender,
-                        SmtpServeLimits::default(),
-                    )
-                    .await
+                    serve_smtp(smtp_listener, smtp_tls, smtp_auth, mail_sender, smtp_limits).await
                 }
                 None => std::future::pending().await,
             }
@@ -783,24 +777,12 @@ impl ServeUseCase {
         let mut pop3_accepting = pin!(async move {
             match pop3_listener {
                 Some(pop3_listener) => {
-                    serve_pop3(
-                        pop3_listener,
-                        pop3_tls,
-                        pop3_backend,
-                        Pop3ServeLimits::default(),
-                    )
-                    .await
+                    serve_pop3(pop3_listener, pop3_tls, pop3_backend, pop3_limits).await
                 }
                 None => std::future::pending().await,
             }
         });
-        let mut accepting = pin!(server::serve(
-            listener,
-            tls,
-            backend,
-            sender,
-            ServeLimits::default()
-        ));
+        let mut accepting = pin!(server::serve(listener, tls, backend, sender, imap_limits));
         tokio::select! {
             biased;
             _ = &mut stop => {}
@@ -822,9 +804,37 @@ impl ServeUseCase {
     }
 }
 
+/// The limits of the three listeners, sharing one failed-login gate:
+/// IMAP, POP3 and SMTP check the same bridge password, so their
+/// failed-login delays must queue behind each other, or a local process
+/// would get one guessing channel per protocol.
+pub fn shared_listener_limits() -> (ServeLimits, Pop3ServeLimits, SmtpServeLimits) {
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let mut imap = ServeLimits::default();
+    imap.session.login_gate = Arc::clone(&gate);
+    let mut pop3 = Pop3ServeLimits::default();
+    pop3.session.login_gate = Arc::clone(&gate);
+    let mut smtp = SmtpServeLimits::default();
+    smtp.session.login_gate = gate;
+    (imap, pop3, smtp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_listener_shares_one_login_gate() {
+        let (imap, pop3, smtp) = shared_listener_limits();
+        assert!(Arc::ptr_eq(
+            &imap.session.login_gate,
+            &pop3.session.login_gate
+        ));
+        assert!(Arc::ptr_eq(
+            &imap.session.login_gate,
+            &smtp.session.login_gate
+        ));
+    }
 
     #[test]
     fn backoff_grows_and_caps() {
