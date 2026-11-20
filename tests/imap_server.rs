@@ -14,11 +14,15 @@
 mod support;
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::broadcast;
-use tuta_bridge::adapters::imap::server::{ensure_certificate, serve, tls_acceptor};
-use tuta_bridge::adapters::imap::session::run_session;
+use tokio::io::{split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::Instant;
+use tuta_bridge::adapters::imap::server::{
+    ensure_certificate, serve, tls_acceptor, Accept, ServeLimits,
+};
+use tuta_bridge::adapters::imap::session::{run_session, SessionLimits};
 use tuta_bridge::domain::{MailboxId, Result};
 use tuta_bridge::ports::imap_backend::ImapBackend;
 use tuta_bridge::ports::mailbox_events::MailboxChanged;
@@ -114,12 +118,26 @@ async fn spawn_session(
     tokio::task::JoinHandle<Result<()>>,
     broadcast::Sender<MailboxChanged>,
 ) {
+    spawn_session_with(backend, capacity, SessionLimits::default()).await
+}
+
+/// [`spawn_session`] with explicit limits.
+async fn spawn_session_with(
+    backend: Arc<FakeImapBackend>,
+    capacity: usize,
+    limits: SessionLimits,
+) -> (
+    DuplexWire,
+    tokio::task::JoinHandle<Result<()>>,
+    broadcast::Sender<MailboxChanged>,
+) {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sender, _) = broadcast::channel(capacity);
     let session = tokio::spawn(run_session(
         server,
         Arc::clone(&backend) as Arc<dyn ImapBackend>,
         sender.subscribe(),
+        limits,
     ));
     let (reader, writer) = split(client);
     (
@@ -171,6 +189,7 @@ async fn expect_select_block<R, W>(
     wire: &mut Wire<R, W>,
     tag: &str,
     exists: usize,
+    // The message number of the first unseen message, not a count.
     unseen: Option<usize>,
     uidvalidity: u32,
     uidnext: u32,
@@ -201,14 +220,62 @@ async fn expect_select_block<R, W>(
 
 async fn select_inbox(wire: &mut DuplexWire) {
     wire.send("a3 SELECT Inbox").await;
-    expect_select_block(wire, "a3", 2, Some(1), 7, 4, false).await;
+    expect_select_block(wire, "a3", 2, Some(2), 7, 4, false).await;
 }
 
 // ---------------------------------------------------------------------------
 // Session contract
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn failed_logins_are_delayed_serialized_and_bounded() {
+    let limits = SessionLimits::default();
+    let (delay, attempts) = (limits.login_failure_delay, limits.max_login_attempts);
+    assert!(delay >= Duration::from_secs(1) && attempts > 1);
+
+    // Two connections of one listener share its limits.
+    let (mut first, first_session, _) = spawn_session_with(backend(), 16, limits.clone()).await;
+    let (mut second, second_session, _) = spawn_session_with(backend(), 16, limits).await;
+    first.expect(GREETING).await;
+    second.expect(GREETING).await;
+
+    // A wrong password is answered only after the delay, and two
+    // connections guessing at once wait one after the other: a second
+    // connection does not double the guessing rate.
+    let started = Instant::now();
+    first.send("a1 LOGIN user@example.invalid wrong").await;
+    second.send("b1 LOGIN user@example.invalid wrong").await;
+    first.expect("a1 NO authentication failed").await;
+    second.expect("b1 NO authentication failed").await;
+    assert_eq!(started.elapsed(), delay * 2);
+
+    // A correct login is never delayed, even behind a failing one.
+    let started = Instant::now();
+    second.send("b2 LOGIN user@example.invalid wrong").await;
+    first.send("a2 LOGIN user@example.invalid hunter2").await;
+    first
+        .expect("a2 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed")
+        .await;
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    second.expect("b2 NO authentication failed").await;
+
+    // The connection that keeps failing is closed.
+    for attempt in 3..=attempts {
+        second
+            .send(&format!("b{attempt} LOGIN user@example.invalid wrong"))
+            .await;
+        second
+            .expect(&format!("b{attempt} NO authentication failed"))
+            .await;
+    }
+    second.expect("* BYE too many failed logins").await;
+    second.expect_eof().await;
+    second_session.await.unwrap().unwrap();
+    drop(first);
+    first_session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn greets_authenticates_and_lists() {
     let (mut wire, session, _) = spawn_session(backend(), 16).await;
 
@@ -220,28 +287,63 @@ async fn greets_authenticates_and_lists() {
     wire.expect(LOGIN_OK).await;
 
     // LIST "" "*": the Inbox carries no special-use attribute, the
-    // Archive does, and the non-ASCII name travels as a literal.
+    // Archive does, and the non-ASCII name travels in modified UTF-7.
     wire.send("a2 LIST \"\" \"*\"").await;
     wire.expect("* LIST () \"/\" \"Inbox\"").await;
     wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
-    let name = wire.literal("* LIST () \"/\" ").await;
-    assert_eq!(name, "Caffè".as_bytes());
-    wire.expect("").await;
+    wire.expect("* LIST () \"/\" \"Caff&AOg-\"").await;
     wire.expect("a2 OK LIST completed").await;
 
     // LSUB mirrors LIST: the bridge has no separate subscription view.
     wire.send("a3 LSUB \"\" \"*\"").await;
     wire.expect("* LSUB () \"/\" \"Inbox\"").await;
     wire.expect("* LSUB (\\Archive) \"/\" \"Archive\"").await;
-    let name = wire.literal("* LSUB () \"/\" ").await;
-    assert_eq!(name, "Caffè".as_bytes());
-    wire.expect("").await;
+    wire.expect("* LSUB () \"/\" \"Caff&AOg-\"").await;
     wire.expect("a3 OK LSUB completed").await;
 
     // An exact pattern lists just that mailbox.
     wire.send("a4 LIST \"\" \"Archive\"").await;
     wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
     wire.expect("a4 OK LIST completed").await;
+
+    // Real wildcards: a pattern selects what it matches, not
+    // everything, and the reference is a prefix of it.
+    wire.send("b1 LIST \"\" \"Arch%\"").await;
+    wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
+    wire.expect("b1 OK LIST completed").await;
+    wire.send("b2 LIST \"Arch\" \"*e\"").await;
+    wire.expect("* LIST (\\Archive) \"/\" \"Archive\"").await;
+    wire.expect("b2 OK LIST completed").await;
+    wire.send("b3 LIST \"\" \"Archive/%\"").await;
+    wire.expect("b3 OK LIST completed").await;
+    // INBOX is found in any casing, as SELECT finds it.
+    wire.send("b4 LIST \"\" \"INBOX\"").await;
+    wire.expect("* LIST () \"/\" \"Inbox\"").await;
+    wire.expect("b4 OK LIST completed").await;
+    wire.send("b5 LSUB \"\" inbox").await;
+    wire.expect("* LSUB () \"/\" \"Inbox\"").await;
+    wire.expect("b5 OK LSUB completed").await;
+    // The empty pattern is the delimiter probe.
+    wire.send("b6 LIST \"\" \"\"").await;
+    wire.expect("* LIST (\\Noselect) \"/\" \"\"").await;
+    wire.expect("b6 OK LIST completed").await;
+    // A pattern in modified UTF-7 matches the name it encodes.
+    wire.send("b7 LIST \"\" \"Caff&AOg-\"").await;
+    wire.expect("* LIST () \"/\" \"Caff&AOg-\"").await;
+    wire.expect("b7 OK LIST completed").await;
+
+    // The name the client was given selects the mailbox, and STATUS
+    // answers under the same wire name.
+    wire.send("a5 STATUS \"Caff&AOg-\" (MESSAGES)").await;
+    wire.expect("* STATUS \"Caff&AOg-\" (MESSAGES 0)").await;
+    wire.expect("a5 OK STATUS completed").await;
+    wire.send("a6 SELECT \"Caff&AOg-\"").await;
+    expect_select_block(&mut wire, "a6", 0, None, 11, 1, false).await;
+    // A client that sends the name raw instead still reaches it.
+    wire.send("a7 EXAMINE {6}").await;
+    wire.expect("+ ").await;
+    wire.send_raw("Caffè\r\n".as_bytes()).await;
+    expect_select_block(&mut wire, "a7", 0, None, 11, 1, true).await;
 
     drop(wire);
     session.await.unwrap().unwrap();
@@ -283,16 +385,99 @@ async fn login_accepts_client_literals() {
 }
 
 #[tokio::test]
+async fn literals_are_capped_per_command_and_tightly_before_login() {
+    // Before login a client has a user name and a password to send:
+    // anything larger is refused without a continuation, and the
+    // connection closes.
+    let (mut wire, session, _) = spawn_session(backend(), 16).await;
+    wire.expect(GREETING).await;
+    wire.send("a1 LOGIN {5000}").await;
+    wire.expect("a1 NO literal too large").await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+
+    // The cap is on the command, not on each literal: chaining small
+    // ones stops at the same total, before the continuation that
+    // would cross it. Each announcing line is charged with its own
+    // length too: 13 + 20 fits in 40, adding 4 + 7 does not.
+    let limits = SessionLimits {
+        pre_auth_literal_bytes: 40,
+        command_literal_bytes: 12,
+        ..SessionLimits::default()
+    };
+    let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
+    wire.expect(GREETING).await;
+    wire.send("a1 LOGIN {20}").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"user@example.invalid {7}\r\n").await;
+    wire.expect("a1 NO literal too large").await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+
+    // Logged in, the larger budget applies — and is one total too:
+    // 21 + 6, then 12 + 6 (the line after a literal starts after its
+    // bytes), fit in 50; a further 12 + 1 does not.
+    let limits = SessionLimits {
+        command_literal_bytes: 50,
+        ..SessionLimits::default()
+    };
+    let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("a4 SEARCH SUBJECT {6}").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"abcdef SUBJECT {6}\r\n").await;
+    wire.expect("+ ").await;
+    wire.send_raw(b"ghijkl SUBJECT {1}\r\n").await;
+    wire.expect("a4 NO literal too large").await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn chained_empty_literals_are_charged_before_login() {
+    // An empty literal announces no bytes, yet every announcing line
+    // is kept until the command ends. A chain of `{0}` literals must
+    // therefore run out of budget like any other, before login, with
+    // the default limits.
+    let (mut wire, session, _) = spawn_session(backend(), 16).await;
+    wire.expect(GREETING).await;
+    wire.send("a1 LOGIN {0}").await;
+    wire.expect("+ ").await;
+
+    let budget = SessionLimits::default().pre_auth_literal_bytes;
+    let mut continuations = 0usize;
+    loop {
+        wire.send_raw(b" {0}\r\n").await;
+        let reply = wire.line().await;
+        if reply == "+ " {
+            continuations += 1;
+            assert!(
+                continuations <= budget,
+                "empty literals must consume the pre-auth budget"
+            );
+            continue;
+        }
+        assert_eq!(reply, "a1 NO literal too large");
+        break;
+    }
+    // Each ` {0}` line is charged 4 + 1 bytes.
+    assert!(continuations <= budget / 5);
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn select_reports_counts_and_read_only_flags() {
     let (mut wire, session, _) = spawn_session(backend(), 16).await;
     login(&mut wire).await;
 
     wire.send("a3 SELECT Inbox").await;
-    expect_select_block(&mut wire, "a3", 2, Some(1), 7, 4, false).await;
+    expect_select_block(&mut wire, "a3", 2, Some(2), 7, 4, false).await;
 
     // EXAMINE reports the same block but answers READ-ONLY.
     wire.send("a4 EXAMINE Inbox").await;
-    expect_select_block(&mut wire, "a4", 2, Some(1), 7, 4, true).await;
+    expect_select_block(&mut wire, "a4", 2, Some(2), 7, 4, true).await;
 
     // A mailbox without unseen messages skips the UNSEEN line.
     wire.send("a5 SELECT Archive").await;
@@ -369,6 +554,101 @@ async fn fetch_streams_bodies_and_skips_expunged_uids() {
     )
     .await;
     wire.expect("a7 OK FETCH completed").await;
+
+    // A bare item with a bracketed list is one item, with or without
+    // the surrounding parentheses.
+    wire.send("a8 FETCH 1 BODY.PEEK[HEADER.FIELDS (DATE FROM)]")
+        .await;
+    let bytes = wire
+        .literal("* 1 FETCH (BODY[HEADER.FIELDS (DATE FROM)] ")
+        .await;
+    assert_eq!(bytes, body);
+    wire.expect(")").await;
+    wire.expect("a8 OK FETCH completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chunked_download_loads_its_message_once() {
+    let body: Vec<u8> = (0..1000u32)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    let fetched = |body: &[u8]| FakeFetched {
+        body: body.to_vec(),
+        ..bare_fetch()
+    };
+    let scripted = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_fetch(1, fetched(&body))
+            .with_fetch(3, fetched(b"other message")),
+    );
+    let loads = || {
+        scripted
+            .body_fetches
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let (mut wire, session, _) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+
+    // Three chunks of one message: one load, every chunk exact, and
+    // the metadata items still answered each time.
+    for (tag, offset) in [("a4", 0usize), ("a5", 400), ("a6", 800)] {
+        wire.send(&format!(
+            "{tag} UID FETCH 1 (UID BODY.PEEK[]<{offset}.400>)"
+        ))
+        .await;
+        let bytes = wire
+            .literal(&format!("* 1 FETCH (UID 1 BODY[]<{offset}> "))
+            .await;
+        assert_eq!(bytes, body[offset..(offset + 400).min(body.len())]);
+        wire.expect(")").await;
+        wire.expect(&format!("{tag} OK UID FETCH completed")).await;
+    }
+    assert_eq!(loads(), 1);
+
+    // Another message replaces the kept one; a whole-body fetch never
+    // uses it.
+    wire.send("a7 UID FETCH 3 (BODY.PEEK[]<0.5>)").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[]<0> ").await, b"other");
+    wire.expect(" UID 3)").await;
+    wire.expect("a7 OK UID FETCH completed").await;
+    assert_eq!(loads(), 2);
+    wire.send("a8 UID FETCH 3 (BODY.PEEK[])").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[] ").await, b"other message");
+    wire.expect(" UID 3)").await;
+    wire.expect("a8 OK UID FETCH completed").await;
+    assert_eq!(loads(), 3);
+
+    // The kept bytes age out …
+    wire.send("a9 UID FETCH 3 (BODY.PEEK[]<5.3>)").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[]<5> ").await, b" me");
+    wire.expect(" UID 3)").await;
+    wire.expect("a9 OK UID FETCH completed").await;
+    assert_eq!(loads(), 3);
+    tokio::time::sleep(Duration::from_secs(6 * 60)).await;
+    wire.send("b1 UID FETCH 3 (BODY.PEEK[]<5.3>)").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[]<5> ").await, b" me");
+    wire.expect(" UID 3)").await;
+    wire.expect("b1 OK UID FETCH completed").await;
+    assert_eq!(loads(), 4);
+
+    // … and go when another mailbox view is selected.
+    wire.send("b2 SELECT Inbox").await;
+    expect_select_block(&mut wire, "b2", 2, Some(2), 7, 4, false).await;
+    wire.send("b3 UID FETCH 3 (BODY.PEEK[]<5.3>)").await;
+    assert_eq!(wire.literal("* 2 FETCH (BODY[]<5> ").await, b" me");
+    wire.expect(" UID 3)").await;
+    wire.expect("b3 OK UID FETCH completed").await;
+    assert_eq!(loads(), 5);
 
     drop(wire);
     session.await.unwrap().unwrap();
@@ -449,7 +729,7 @@ async fn oversized_lines_answer_bad_and_keep_the_session_framed() {
     // The same refusal during IDLE: the BAD ends the idling state
     // and the dispatch loop continues on the next line.
     wire.send("a3 SELECT Inbox").await;
-    expect_select_block(&mut wire, "a3", 2, Some(1), 7, 4, false).await;
+    expect_select_block(&mut wire, "a3", 2, Some(2), 7, 4, false).await;
     wire.send("i1 IDLE").await;
     wire.expect("+ idling").await;
     let mut oversized_idle = String::from("x");
@@ -584,6 +864,168 @@ async fn idle_emits_exists_on_changes_and_done_ends_it() {
 
     drop(wire);
     session.await.unwrap().unwrap();
+}
+
+/// A fetch answer that renders nothing but what the session itself
+/// knows; enough for `(UID)` and `(UID FLAGS)` requests.
+fn bare_fetch() -> FakeFetched {
+    FakeFetched {
+        flags: "\\Seen".into(),
+        internal_date: "\"14-Nov-2023 22:13:20 +0000\"".into(),
+        envelope: None,
+        bodystructure: None,
+        rfc822_size: None,
+        body: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn message_numbers_hold_until_an_expunge_is_announced() {
+    let scripted = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 6, 0, vec![1, 3, 5]),
+            )
+            .with_fetch(3, bare_fetch())
+            .with_fetch(5, bare_fetch())
+            .with_fetch(6, bare_fetch())
+            .with_search(vec![1, 3, 5, 6]),
+    );
+    let (mut wire, session, _sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    wire.send("a3 SELECT Inbox").await;
+    expect_select_block(&mut wire, "a3", 3, None, 7, 6, false).await;
+
+    // The store loses uid 1 and gains uid 6 under the session. Until
+    // the session says so, every number keeps naming the message the
+    // client knows by it: 2 is still uid 3, 1 answers nothing, and the
+    // unannounced arrival has no number at all.
+    scripted.remove_message("Inbox", 1);
+    scripted.add_message("Inbox", 6);
+    wire.send("a4 FETCH 1:* (UID)").await;
+    wire.expect("* 2 FETCH (UID 3)").await;
+    wire.expect("* 3 FETCH (UID 5)").await;
+    wire.expect("a4 OK FETCH completed").await;
+    wire.send("a5 SEARCH SEEN").await;
+    wire.expect("* SEARCH 1 2 3").await;
+    wire.expect("a5 OK SEARCH completed").await;
+    wire.send("a6 UID SEARCH SEEN").await;
+    wire.expect("* SEARCH 1 3 5").await;
+    wire.expect("a6 OK UID SEARCH completed").await;
+    wire.send("a7 UID FETCH 6 (UID)").await;
+    wire.expect("a7 OK UID FETCH completed").await;
+
+    // NOOP is where the change may be announced: the expunge first,
+    // then the arrival — the count is the same as before, and both
+    // events are still reported.
+    wire.send("a8 NOOP").await;
+    wire.expect("* 1 EXPUNGE").await;
+    wire.expect("* 3 EXISTS").await;
+    wire.expect("a8 OK NOOP completed").await;
+    wire.send("a9 FETCH 1:* (UID)").await;
+    wire.expect("* 1 FETCH (UID 3)").await;
+    wire.expect("* 2 FETCH (UID 5)").await;
+    wire.expect("* 3 FETCH (UID 6)").await;
+    wire.expect("a9 OK FETCH completed").await;
+
+    // CHECK is a sync point too, and a read-state change is a FETCH.
+    scripted.set_unread("Inbox", 5, true);
+    wire.send("b1 CHECK").await;
+    wire.expect("* 2 FETCH (FLAGS ())").await;
+    wire.expect("b1 OK CHECK completed").await;
+
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn idle_announces_expunges_and_flag_changes_live() {
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+
+    // One mail out and one in between two notifications.
+    scripted.remove_message("Inbox", 1);
+    scripted.add_message("Inbox", 4);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* 1 EXPUNGE").await;
+    wire.expect("* 2 EXISTS").await;
+
+    // The remaining unread mail is read elsewhere.
+    scripted.set_unread("Inbox", 3, false);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* 1 FETCH (FLAGS (\\Seen))").await;
+
+    wire.send("DONE").await;
+    wire.expect("i1 OK IDLE completed").await;
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_deleted_mailbox_ends_the_selected_session_with_bye() {
+    // The folder is deleted in Tuta: the watcher removes the mailbox
+    // and announces its id one last time. An idling session ends with
+    // the fixed BYE instead of an error.
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    scripted.remove_mailbox("Inbox");
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* BYE mailbox state was resynced; reconnect")
+        .await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+
+    // Outside IDLE the next command finds the mailbox gone.
+    let scripted = backend();
+    let (mut wire, session, _sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    scripted.remove_mailbox("Inbox");
+    wire.send("a4 FETCH 1 (UID)").await;
+    wire.expect("* BYE mailbox state was resynced; reconnect")
+        .await;
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_store_error_ends_the_session_with_bye_not_a_bare_drop() {
+    const BYE: &str = "* BYE internal error; reconnect";
+
+    // The validity check before a command cannot read the store.
+    let scripted = backend();
+    let (mut wire, session, _sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    scripted.set_store_failing(true);
+    wire.send("a4 FETCH 1 (UID)").await;
+    wire.expect(BYE).await;
+    wire.expect_eof().await;
+    assert!(session.await.unwrap().is_err());
+
+    // Nor can the comparison a notification triggers during IDLE.
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session(Arc::clone(&scripted), 16).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    scripted.set_store_failing(true);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect(BYE).await;
+    wire.expect_eof().await;
+    assert!(session.await.unwrap().is_err());
 }
 
 #[tokio::test]
@@ -761,7 +1203,7 @@ async fn id_command_answers_and_noop_flushes_notifications() {
     wire.expect("a2 OK [CAPABILITY IMAP4rev1 IDLE ID] LOGIN completed")
         .await;
     wire.send("a3 SELECT Inbox").await;
-    expect_select_block(&mut wire, "a3", 2, Some(1), 7, 4, false).await;
+    expect_select_block(&mut wire, "a3", 2, Some(2), 7, 4, false).await;
 
     // A stored change for the selected mailbox arrives: NOOP reports the
     // new count even outside IDLE.
@@ -871,6 +1313,20 @@ async fn search_returns_uids() {
     wire.expect("* SEARCH").await;
     wire.expect("a7 OK UID SEARCH completed").await;
 
+    // UTF-8 and US-ASCII are the searchable charsets; anything else
+    // is refused with the response code naming what is.
+    wire.send("a8 UID SEARCH CHARSET UTF-8 SEEN").await;
+    wire.expect("* SEARCH 2 5").await;
+    wire.expect("a8 OK UID SEARCH completed").await;
+    wire.send("a9 UID SEARCH CHARSET KOI8-R SEEN").await;
+    wire.expect("a9 NO [BADCHARSET (UTF-8)] charset not supported")
+        .await;
+    // A key the index cannot answer is a NO, a bare SEARCH a BAD.
+    wire.send("b1 SEARCH BODY x").await;
+    wire.expect("b1 NO search key not supported").await;
+    wire.send("b2 SEARCH").await;
+    wire.expect("b2 BAD invalid SEARCH").await;
+
     drop(wire);
     session.await.unwrap().unwrap();
 }
@@ -907,6 +1363,251 @@ async fn state_inappropriate_commands_answer_bad() {
 
     drop(wire);
     session.await.unwrap().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Time bounds (paused clock: no test waits on a real timeout)
+// ---------------------------------------------------------------------------
+
+const TIMEOUT_BYE: &str = "* BYE idle for too long; closing connection";
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_connection_is_closed_at_its_deadline() {
+    let limits = SessionLimits::default();
+    let allowed = limits.pre_auth_timeout;
+    let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
+    let started = Instant::now();
+    wire.expect(GREETING).await;
+
+    // Commands do not extend the deadline: it bounds the whole phase,
+    // so a client trickling input gains nothing.
+    tokio::time::sleep(allowed / 2).await;
+    wire.send("a1 NOOP").await;
+    wire.expect("a1 OK NOOP completed").await;
+    wire.expect(TIMEOUT_BYE).await;
+    assert_eq!(started.elapsed(), allowed);
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_authenticated_session_times_out_only_after_long_inactivity() {
+    let limits = SessionLimits::default();
+    let (pre_auth, idle) = (limits.pre_auth_timeout, limits.idle_timeout);
+    assert!(idle >= Duration::from_secs(30 * 60), "RFC 3501 §5.4");
+    let (mut wire, session, _) = spawn_session_with(backend(), 16, limits).await;
+    login(&mut wire).await;
+
+    // Past the unauthenticated deadline the session is still served,
+    // and every command restarts the inactivity clock.
+    tokio::time::sleep(pre_auth * 2).await;
+    wire.send("a2 NOOP").await;
+    wire.expect("a2 OK NOOP completed").await;
+    let last_command = Instant::now();
+    wire.expect(TIMEOUT_BYE).await;
+    assert_eq!(last_command.elapsed(), idle);
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_runs_for_the_inactivity_timeout_at_most() {
+    let limits = SessionLimits::default();
+    let idle = limits.idle_timeout;
+    let scripted = backend();
+    let (mut wire, session, sender) = spawn_session_with(Arc::clone(&scripted), 16, limits).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("i1 IDLE").await;
+    wire.expect("+ idling").await;
+    let idling_since = Instant::now();
+
+    // A 29-minute IDLE, as RFC 2177 clients run them, is never cut,
+    // and updates keep flowing through it.
+    tokio::time::sleep(Duration::from_secs(29 * 60)).await;
+    scripted.add_message("Inbox", 4);
+    sender.send(MailboxChanged(MailboxId(1))).unwrap();
+    wire.expect("* 3 EXISTS").await;
+
+    // Updates do not extend it: a client that never re-issues IDLE
+    // is logged off when the timeout is reached.
+    wire.expect(TIMEOUT_BYE).await;
+    assert_eq!(idling_since.elapsed(), idle);
+    wire.expect_eof().await;
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_client_that_stops_reading_ends_its_session() {
+    // More body than the 64 KiB duplex buffer holds, and a client that
+    // never reads it: the write stalls, and the session ends on the
+    // write timeout instead of staying parked forever.
+    let scripted = Arc::new(
+        FakeImapBackend::new(USER, PASSWORD)
+            .with_mailbox(
+                MailboxId(1),
+                "Inbox",
+                "",
+                FakeSelected::new(7, 4, 1, vec![1, 3]),
+            )
+            .with_fetch(
+                1,
+                FakeFetched {
+                    body: vec![b'x'; 200_000],
+                    ..bare_fetch()
+                },
+            ),
+    );
+    let limits = SessionLimits::default();
+    let allowed = limits.write_timeout;
+    let (mut wire, session, _) = spawn_session_with(scripted, 16, limits).await;
+    login(&mut wire).await;
+    select_inbox(&mut wire).await;
+    wire.send("a4 FETCH 1 (BODY.PEEK[])").await;
+    let stalled_since = Instant::now();
+
+    let outcome = session.await.unwrap();
+    assert!(outcome.is_err(), "a stalled write must end the session");
+    assert_eq!(stalled_since.elapsed(), allowed);
+}
+
+// ---------------------------------------------------------------------------
+// Accept loop
+// ---------------------------------------------------------------------------
+
+/// An in-memory listener: the test hands it connections — or accept
+/// errors — through a channel.
+struct ChannelListener(mpsc::UnboundedReceiver<std::io::Result<DuplexStream>>);
+
+impl Accept for ChannelListener {
+    type Stream = DuplexStream;
+
+    async fn accept(&mut self) -> std::io::Result<DuplexStream> {
+        match self.0.recv().await {
+            Some(accepted) => accepted,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// The accept loop over an in-memory listener, with the production
+/// certificate machinery and a test-only accept-all TLS client.
+struct ServeHarness {
+    incoming: mpsc::UnboundedSender<std::io::Result<DuplexStream>>,
+    connector: tokio_rustls::TlsConnector,
+    _dir: tempfile::TempDir,
+}
+
+type TlsWire = Wire<
+    tokio::io::ReadHalf<tokio_rustls::client::TlsStream<DuplexStream>>,
+    tokio::io::WriteHalf<tokio_rustls::client::TlsStream<DuplexStream>>,
+>;
+
+impl ServeHarness {
+    fn start(limits: ServeLimits) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = ensure_certificate(dir.path()).unwrap();
+        let tls = tls_acceptor(&cert_pem, &key_pem).unwrap();
+        let (incoming, accepted) = mpsc::unbounded_channel();
+        let (sender, _) = broadcast::channel(16);
+        tokio::spawn(serve(
+            ChannelListener(accepted),
+            tls,
+            backend() as Arc<dyn ImapBackend>,
+            sender,
+            limits,
+        ));
+        Self {
+            incoming,
+            connector: accept_all_connector(),
+            _dir: dir,
+        }
+    }
+
+    /// Hand the listener one connection and return the client's end.
+    fn dial(&self) -> DuplexStream {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        self.incoming.send(Ok(server)).unwrap();
+        client
+    }
+
+    /// Connect a TLS client and read the greeting.
+    async fn connect(&self) -> TlsWire {
+        greeted(self.connector.clone(), self.dial()).await
+    }
+}
+
+/// Complete the TLS handshake over `stream` and read the greeting.
+async fn greeted(connector: tokio_rustls::TlsConnector, stream: DuplexStream) -> TlsWire {
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+    let tls_client = connector.connect(server_name, stream).await.unwrap();
+    let (reader, writer) = split(tls_client);
+    let mut wire = Wire {
+        reader: BufReader::new(reader),
+        writer,
+    };
+    wire.expect(GREETING).await;
+    wire
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_accept_does_not_end_the_accept_loop() {
+    let limits = ServeLimits::default();
+    let pause = limits.accept_retry_delay;
+    let harness = ServeHarness::start(limits);
+
+    // The listener fails twice — out of descriptors, say — and the
+    // loop is still there for the next client, after one pause each.
+    let started = Instant::now();
+    for _ in 0..2 {
+        harness
+            .incoming
+            .send(Err(std::io::Error::other("too many open files")))
+            .unwrap();
+    }
+    let mut wire = harness.connect().await;
+    assert_eq!(started.elapsed(), pause * 2);
+    wire.send("a1 LOGOUT").await;
+    wire.expect("* BYE tuta-bridge signing off").await;
+    wire.expect("a1 OK LOGOUT completed").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_client_is_dropped_at_the_handshake_timeout() {
+    let limits = ServeLimits::default();
+    let allowed = limits.handshake_timeout;
+    let harness = ServeHarness::start(limits);
+
+    // Connected, and then nothing: no ClientHello ever arrives.
+    let mut silent = harness.dial();
+    let started = Instant::now();
+    let mut probe = [0u8; 1];
+    assert_eq!(silent.read(&mut probe).await.unwrap(), 0);
+    assert_eq!(started.elapsed(), allowed);
+
+    // The loop serves the next client as usual.
+    harness.connect().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn connections_beyond_the_cap_wait_for_a_free_slot() {
+    let harness = ServeHarness::start(ServeLimits {
+        max_connections: 2,
+        ..ServeLimits::default()
+    });
+    let mut first = harness.connect().await;
+    let _second = harness.connect().await;
+
+    // A third client is not served while both slots are taken …
+    let third = tokio::spawn(greeted(harness.connector.clone(), harness.dial()));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!third.is_finished(), "the cap must hold the third client");
+
+    // … and is served as soon as one of them ends.
+    first.send("a1 LOGOUT").await;
+    first.expect("* BYE tuta-bridge signing off").await;
+    first.expect("a1 OK LOGOUT completed").await;
+    third.await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1654,18 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAll {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
+}
+
+/// A TLS client configuration whose verifier is test-only accept-all.
+fn accept_all_connector() -> tokio_rustls::TlsConnector {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAll(provider)))
+        .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
 }
 
 #[tokio::test]
@@ -1006,17 +1719,11 @@ async fn serves_a_full_client_round_over_tls() {
         tls,
         Arc::clone(&scripted) as Arc<dyn ImapBackend>,
         sender,
+        ServeLimits::default(),
     ));
 
     // 3. A TLS client whose verifier is test-only accept-all.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAll(provider)))
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let connector = accept_all_connector();
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();

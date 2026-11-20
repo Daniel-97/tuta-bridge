@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -11,8 +12,8 @@ use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, Logged
 
 use super::blob::{fetch_blob_element, load_attachment, request_archive_read_token};
 use super::content::{
-    address_from_encrypted, address_from_mail_address, draft_details_are_intact, mail_is_intact,
-    parse_headers, select_body, sent_at_from, threading_headers,
+    address_from_encrypted, address_from_mail_address, draft_details_are_intact, from_address,
+    mail_is_intact, parse_headers, select_body, sent_at_from, threading_headers,
 };
 use super::wire::decrypt_mail_details;
 use crate::domain::{
@@ -114,6 +115,28 @@ pub fn header_from_parts(
     })
 }
 
+/// Build the list-level [`MessageHeader`] of a loaded [`Mail`].
+///
+/// Returns `None` for a mail that must not be indexed: one whose intactness
+/// check fails (a subject or sender that did not decrypt comes back as an
+/// empty default, not as an error), or one without an id. Callers count
+/// every `None` as a skipped mail so the page is treated as incomplete.
+pub fn header_from_mail(mail: &Mail) -> Option<MessageHeader> {
+    if !mail_is_intact(mail) {
+        return None;
+    }
+    let id = mail._id.as_ref()?;
+    header_from_parts(
+        id.list_id.as_str(),
+        id.element_id.as_str(),
+        mail.receivedDate.as_millis() as i64,
+        &mail.subject,
+        &mail.sender,
+        mail.firstRecipient.as_ref(),
+        mail.unread,
+    )
+}
+
 /// Resolve a requested folder name (alias or custom name) case-insensitively.
 pub fn resolve_folder<'a>(folders: &'a [Folder], requested: &str) -> Result<&'a Folder> {
     let requested = requested.trim();
@@ -129,6 +152,52 @@ pub fn resolve_folder<'a>(folders: &'a [Folder], requested: &str) -> Result<&'a 
         return Ok(folder);
     }
     Err(Error::FolderNotFound(requested.to_string()))
+}
+
+/// Entries requested per range load: the page size the SDK's own `load_all`
+/// uses, so it is a count the server is known to accept.
+pub const ENTRY_PAGE_SIZE: usize = 1000;
+
+/// Load up to `limit` list elements in pages of at most `page_size`.
+///
+/// `load(start, count)` returns the elements after `start`; `id_of` yields
+/// the cursor of an element. Paging stops at `limit`, at a short or empty
+/// page (the end of the list), or — defensively — when the cursor stops
+/// advancing, so a misbehaving server cannot loop it forever. An element
+/// without a cursor in a full page is an error: the rest of the list would
+/// otherwise be dropped silently.
+pub async fn load_paged<T, F, Fut>(
+    limit: usize,
+    page_size: usize,
+    start: String,
+    mut load: F,
+    id_of: impl Fn(&T) -> Option<String>,
+) -> Result<Vec<T>>
+where
+    F: FnMut(String, usize) -> Fut,
+    Fut: Future<Output = Result<Vec<T>>>,
+{
+    let mut items: Vec<T> = Vec::new();
+    let mut cursor = start;
+    while items.len() < limit && page_size > 0 {
+        let count = (limit - items.len()).min(page_size);
+        let page = load(cursor.clone(), count).await?;
+        let full = page.len() >= count;
+        let next = page.last().map(&id_of);
+        items.extend(page);
+        if !full {
+            break;
+        }
+        match next {
+            Some(Some(next)) if next != cursor => cursor = next,
+            Some(None) if items.len() < limit => {
+                return Err(Error::Network("failed to load message entries".into()))
+            }
+            _ => break,
+        }
+    }
+    items.truncate(limit);
+    Ok(items)
 }
 
 /// Tuta implementation of the mail source: lists folders and message summaries.
@@ -244,14 +313,11 @@ impl MailSource for TutaMailSource {
             .load_user_mailbox()
             .await
             .map_err(|_| Error::Network("failed to load mailbox".into()))?;
+        // `load_all` pages through the whole list: labels are MailSets too,
+        // so a single fixed-size range would silently drop folders.
         let sets: Vec<MailSet> = mail_facade
             .get_crypto_entity_client()
-            .load_range(
-                &mailbox.mailSets.mailSets,
-                &GeneratedId::min_id(),
-                100,
-                ListLoadDirection::ASC,
-            )
+            .load_all(&mailbox.mailSets.mailSets, ListLoadDirection::ASC)
             .await
             .map_err(|_| Error::Network("failed to load folders".into()))?;
 
@@ -266,15 +332,29 @@ impl MailSource for TutaMailSource {
         // A mail set's `entries` list contains MailSetEntry elements, each of
         // which references the actual Mail. Loading Mail directly from that
         // list returns an empty page.
-        let entries: Vec<MailSetEntry> = crypto_client
-            .load_range(
-                &GeneratedId(folder.list_id.clone()),
-                &CustomId(GeneratedId::max_id().to_string()),
-                limit,
-                ListLoadDirection::DESC,
-            )
-            .await
-            .map_err(|_| Error::Network("failed to load message entries".into()))?;
+        let list_id = GeneratedId(folder.list_id.clone());
+        let entries: Vec<MailSetEntry> = load_paged(
+            limit,
+            ENTRY_PAGE_SIZE,
+            GeneratedId::max_id().to_string(),
+            |start, count| {
+                let crypto_client = Arc::clone(&crypto_client);
+                let list_id = list_id.clone();
+                async move {
+                    crypto_client
+                        .load_range::<MailSetEntry, _>(
+                            &list_id,
+                            &CustomId(start),
+                            count,
+                            ListLoadDirection::DESC,
+                        )
+                        .await
+                        .map_err(|_| Error::Network("failed to load message entries".into()))
+                }
+            },
+            |entry: &MailSetEntry| entry._id.as_ref().map(|id| id.element_id.0.clone()),
+        )
+        .await?;
 
         let mut mails = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -318,37 +398,38 @@ impl MailSource for TutaMailSource {
             .map_err(|_| Error::Network("failed to load message entries".into()))?;
 
         let mut headers = Vec::with_capacity(entries.len());
-        let mut skipped = 0;
+        // The entry list loaded in full, so every mail that cannot be
+        // turned into a header is still known by id: the folder lists it.
+        // Naming it lets the caller keep its stored row and reconcile the
+        // rest of the folder.
+        let mut unreadable = Vec::new();
         for entry in entries {
-            // One unreadable mail must not fail the whole folder: count it and
-            // keep loading the remaining headers.
+            let id = (
+                entry.mail.list_id.as_str().to_string(),
+                entry.mail.element_id.as_str().to_string(),
+            );
+            // One unreadable mail must not fail the whole folder: record it
+            // and keep loading the remaining headers.
             let mail: Mail = match crypto_client.load(&entry.mail).await {
                 Ok(mail) => mail,
                 Err(_) => {
-                    skipped += 1;
+                    unreadable.push(id);
                     continue;
                 }
             };
-            let Some(id) = mail._id.as_ref() else {
-                continue;
-            };
-            if let Some(header) = header_from_parts(
-                id.list_id.as_str(),
-                id.element_id.as_str(),
-                mail.receivedDate.as_millis() as i64,
-                &mail.subject,
-                &mail.sender,
-                mail.firstRecipient.as_ref(),
-                mail.unread,
-            ) {
-                headers.push(header);
+            // A mail that loaded but is not intact (or cannot be
+            // referenced) is dropped like an unreadable one.
+            match header_from_mail(&mail) {
+                Some(header) => headers.push(header),
+                None => unreadable.push(id),
             }
         }
 
         Ok(MessagePage {
             headers,
             next_start: None,
-            skipped,
+            skipped: unreadable.len(),
+            unreadable,
         })
     }
 
@@ -385,14 +466,7 @@ impl MailSource for TutaMailSource {
             .unwrap_or_default();
         let (message_id, in_reply_to, references) = threading_headers(&headers);
 
-        let mut from = address_from_mail_address(&mail.sender);
-        if let Some(envelope) = mail
-            .differentEnvelopeSender
-            .as_deref()
-            .filter(|a| !a.is_empty())
-        {
-            from.address = envelope.to_string();
-        }
+        let from = from_address(&mail);
 
         let mut attachments = Vec::new();
         for attachment_id in &mail.attachments {
@@ -449,5 +523,41 @@ impl MailSource for TutaMailSource {
             body_text,
             attachments,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::tuta::content::tests::intact_mail;
+
+    #[test]
+    fn intact_mail_maps_to_a_header_with_its_own_ids() {
+        let mut mail = intact_mail();
+        mail.subject = "hello".into();
+        let header = header_from_mail(&mail).expect("an intact mail maps");
+        assert_eq!(header.list_id, "list");
+        assert_eq!(header.element_id, "element");
+        assert_eq!(header.subject, "hello");
+    }
+
+    #[test]
+    fn mail_with_decryption_errors_is_not_indexed() {
+        let mut mail = intact_mail();
+        mail._errors =
+            serde_json::from_str(r#"{"subject":{"String":"decryption failed"}}"#).unwrap();
+        assert!(header_from_mail(&mail).is_none());
+
+        let mut mail = intact_mail();
+        mail.sender._errors =
+            serde_json::from_str(r#"{"name":{"String":"decryption failed"}}"#).unwrap();
+        assert!(header_from_mail(&mail).is_none());
+    }
+
+    #[test]
+    fn mail_without_an_id_is_not_indexed() {
+        let mut mail = intact_mail();
+        mail._id = None;
+        assert!(header_from_mail(&mail).is_none());
     }
 }

@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::{ExposeSecret, SecretString};
-use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem};
+use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem, ImapArg};
+use tuta_bridge::adapters::imap::search::{parse_search, SearchKey};
 use tuta_bridge::domain::{
     AccountId, AccountInfo, BatchOutcome, Error, EventFrame, Folder, MailPlacement, MailboxId,
     MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
@@ -126,6 +127,11 @@ pub struct FakeStateStore {
     pub last_batches: Mutex<HashMap<(i64, String), String>>,
     next_account_id: Mutex<i64>,
     next_mailbox_id: Mutex<i64>,
+    /// Highest UIDVALIDITY ever handed out per account.
+    uidvalidity_floors: Mutex<HashMap<i64, u32>>,
+    /// When nonzero, the next this many `apply_batch` calls fail like a
+    /// locked database, writing nothing.
+    busy_apply_batches: Mutex<usize>,
 }
 
 impl FakeStateStore {
@@ -138,7 +144,15 @@ impl FakeStateStore {
             last_batches: Mutex::new(HashMap::new()),
             next_account_id: Mutex::new(1),
             next_mailbox_id: Mutex::new(1),
+            uidvalidity_floors: Mutex::new(HashMap::new()),
+            busy_apply_batches: Mutex::new(0),
         }
+    }
+
+    /// Make the next `count` `apply_batch` calls fail with the busy
+    /// storage error.
+    pub fn fail_next_apply_batches_busy(&self, count: usize) {
+        *self.busy_apply_batches.lock().unwrap() = count;
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -173,6 +187,16 @@ impl FakeStateStore {
             .collect()
     }
 
+    /// Reserve a UIDVALIDITY the account never used: `at_least` or the
+    /// account's high-water mark plus one, whichever is greater. The mark
+    /// survives removed mailboxes and `reset_account`.
+    fn allocate_uidvalidity(&self, account_id: i64, at_least: u32) -> u32 {
+        let mut floors = self.uidvalidity_floors.lock().unwrap();
+        let floor = floors.entry(account_id).or_insert(0);
+        *floor = at_least.max(*floor + 1);
+        *floor
+    }
+
     /// Upsert without recording a call, shared by `upsert_mailbox` and
     /// `apply_batch`.
     fn upsert_mailbox_entry(
@@ -184,10 +208,15 @@ impl FakeStateStore {
         let key = (account_id, folder.list_id.clone());
         let mut mailboxes = self.mailboxes.lock().unwrap();
         if let Some(mailbox) = mailboxes.get_mut(&key) {
+            // A rename gets a fresh UIDVALIDITY, like the SQLite adapter.
+            if mailbox.name != folder.name && !mailbox.name.is_empty() {
+                mailbox.uidvalidity = self.allocate_uidvalidity(account_id, uidvalidity);
+            }
             mailbox.name = folder.name.clone();
             mailbox.kind = folder.kind.clone();
             return mailbox.id;
         }
+        let uidvalidity = self.allocate_uidvalidity(account_id, uidvalidity);
         let mut next_mailbox_id = self.next_mailbox_id.lock().unwrap();
         let mailbox = StoredMailbox {
             id: MailboxId(*next_mailbox_id),
@@ -368,6 +397,8 @@ pub struct FakeEventLookup {
     /// When nonzero, the next this many lookups fail with a network
     /// error; consumed before the `fail` flag is consulted.
     pub failing_calls: Mutex<usize>,
+    /// When set, every mail lookup hangs forever.
+    pub hang: Mutex<bool>,
     pub calls: Mutex<Vec<String>>,
 }
 
@@ -379,8 +410,16 @@ impl FakeEventLookup {
             folders: Mutex::new(HashMap::new()),
             fail: Mutex::new(false),
             failing_calls: Mutex::new(0),
+            hang: Mutex::new(false),
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Make every mail lookup hang forever; only a stop future can end
+    /// a batch that needs one.
+    pub fn with_hang(self) -> Self {
+        *self.hang.lock().unwrap() = true;
+        self
     }
 
     /// Configure the placements of one mail; `None` marks the mail
@@ -462,6 +501,10 @@ impl EventLookup for FakeEventLookup {
         mail_element_id: &str,
     ) -> Result<Option<Vec<MailPlacement>>> {
         self.calls.lock().unwrap().push("headers_for_mail".into());
+        if *self.hang.lock().unwrap() {
+            // A hung lookup never resolves on its own.
+            return std::future::pending().await;
+        }
         if *self.fail.lock().unwrap() || self.consume_failing_call() {
             return Err(Error::Network("event entity unavailable".into()));
         }
@@ -559,6 +602,14 @@ impl StateStore for FakeStateStore {
         changes: &[StateChange],
     ) -> Result<BatchOutcome> {
         self.calls.lock().unwrap().push("apply_batch".into());
+        {
+            let mut busy = self.busy_apply_batches.lock().unwrap();
+            if *busy > 0 {
+                *busy -= 1;
+                // The SQLite adapter's message for a locked database.
+                return Err(Error::Storage("state database is busy".into()));
+            }
+        }
         // Mailboxes whose rows this batch changes, deduplicated and in
         // first-touch order.
         let mut touched: Vec<MailboxId> = Vec::new();
@@ -861,9 +912,15 @@ pub struct FakeMailSource {
     pub content: Option<MessageContent>,
     pub failing_elements: Vec<String>,
     pub fail_folders: bool,
+    /// When nonzero, the next this many `folders()` calls fail.
+    pub failing_folder_calls: Mutex<usize>,
+    /// When set, `folders()` hangs forever.
+    pub hang_folders: Mutex<bool>,
     pub headers_by_folder: Mutex<HashMap<String, Vec<MessageHeader>>>,
     pub failing_header_folders: Mutex<Vec<String>>,
     pub skipped_by_folder: Mutex<HashMap<String, usize>>,
+    /// Skipped mails the folder still lists, by folder list id.
+    pub unreadable_by_folder: Mutex<HashMap<String, Vec<(String, String)>>>,
     pub message_limits: Mutex<Vec<usize>>,
     pub message_folders: Mutex<Vec<Folder>>,
     pub header_limits: Mutex<Vec<usize>>,
@@ -879,9 +936,12 @@ impl FakeMailSource {
             content: None,
             failing_elements: Vec::new(),
             fail_folders: false,
+            failing_folder_calls: Mutex::new(0),
+            hang_folders: Mutex::new(false),
             headers_by_folder: Mutex::new(HashMap::new()),
             failing_header_folders: Mutex::new(Vec::new()),
             skipped_by_folder: Mutex::new(HashMap::new()),
+            unreadable_by_folder: Mutex::new(HashMap::new()),
             message_limits: Mutex::new(Vec::new()),
             message_folders: Mutex::new(Vec::new()),
             header_limits: Mutex::new(Vec::new()),
@@ -898,6 +958,16 @@ impl FakeMailSource {
             .insert(list_id.to_string(), headers);
     }
 
+    /// Make the next `count` `folders()` calls fail with a network error.
+    pub fn fail_next_folders(&self, count: usize) {
+        *self.failing_folder_calls.lock().unwrap() = count;
+    }
+
+    /// Make `folders()` hang forever; only a stop future can end a sync.
+    pub fn hang_folders(&self) {
+        *self.hang_folders.lock().unwrap() = true;
+    }
+
     /// Make `headers_page` fail for `list_id`.
     pub fn fail_headers_in(&self, list_id: &str) {
         self.failing_header_folders
@@ -907,6 +977,14 @@ impl FakeMailSource {
     }
 
     /// Report `count` unreadable mails for `list_id`'s header page.
+    /// Mark mails as listed by the folder but impossible to load.
+    pub fn set_unreadable(&self, list_id: &str, mails: Vec<(String, String)>) {
+        self.unreadable_by_folder
+            .lock()
+            .unwrap()
+            .insert(list_id.to_owned(), mails);
+    }
+
     pub fn set_skipped(&self, list_id: &str, count: usize) {
         self.skipped_by_folder
             .lock()
@@ -939,7 +1017,17 @@ impl Default for FakeMailSource {
 impl MailSource for FakeMailSource {
     async fn folders(&self) -> Result<Vec<Folder>> {
         self.calls.lock().unwrap().push("folders".to_string());
-        if self.fail_folders {
+        if *self.hang_folders.lock().unwrap() {
+            // A hung listing never resolves on its own.
+            return std::future::pending().await;
+        }
+        let scripted_failure = {
+            let mut failing = self.failing_folder_calls.lock().unwrap();
+            let fail = *failing > 0;
+            *failing = failing.saturating_sub(1);
+            fail
+        };
+        if self.fail_folders || scripted_failure {
             return Err(Error::Network("folders failed".into()));
         }
         Ok(self.folders.clone())
@@ -993,10 +1081,18 @@ impl MailSource for FakeMailSource {
             .get(&folder.list_id)
             .copied()
             .unwrap_or(0);
+        let unreadable = self
+            .unreadable_by_folder
+            .lock()
+            .unwrap()
+            .get(&folder.list_id)
+            .cloned()
+            .unwrap_or_default();
         Ok(MessagePage {
             headers,
             next_start: None,
-            skipped,
+            skipped: skipped + unreadable.len(),
+            unreadable,
         })
     }
 }
@@ -1219,24 +1315,26 @@ impl MessageRenderer for FakeRenderer {
 // FakeImapBackend
 // ---------------------------------------------------------------------------
 
-/// One scripted `SELECT` snapshot. The uid list doubles as the message
-/// count (`exists` is its length), so a new stored message is one pushed
-/// uid — exactly how the real store reports a growing mailbox.
+/// One scripted mailbox state. The uid list doubles as the message
+/// count, so a new stored message is one pushed uid — exactly how the
+/// real store reports a growing mailbox. `new` marks the last `unseen`
+/// uids unread.
 #[derive(Clone)]
 pub struct FakeSelected {
     pub uidvalidity: u32,
     pub uidnext: u32,
-    pub unseen: usize,
     pub uids: Vec<u32>,
+    pub unread: Vec<u32>,
 }
 
 impl FakeSelected {
     pub fn new(uidvalidity: u32, uidnext: u32, unseen: usize, uids: Vec<u32>) -> Self {
+        let unread = uids[uids.len().saturating_sub(unseen)..].to_vec();
         Self {
             uidvalidity,
             uidnext,
-            unseen,
             uids,
+            unread,
         }
     }
 }
@@ -1271,10 +1369,14 @@ pub struct FakeImapBackend {
     /// Uids whose FETCH answers a fixed error: the row exists but its
     /// details cannot be loaded.
     pub failing_fetches: Mutex<Vec<u32>>,
-    /// Non-ALL search answers, keyed by the exact criteria.
-    pub search_scripts: Mutex<HashMap<Vec<String>, Vec<u32>>>,
+    /// Non-ALL search answers, keyed by the exact parsed keys.
+    pub search_scripts: Mutex<Vec<(Vec<SearchKey>, Vec<u32>)>>,
     /// The fallback non-ALL search answer.
     pub search_uids: Mutex<Vec<u32>>,
+    /// While set, reading a mailbox by id fails like a store error.
+    pub store_failing: Mutex<bool>,
+    /// How many FETCH calls asked for at least one body.
+    pub body_fetches: AtomicUsize,
 }
 
 impl FakeImapBackend {
@@ -1286,8 +1388,10 @@ impl FakeImapBackend {
             snapshots: Mutex::new(HashMap::new()),
             fetches: Mutex::new(HashMap::new()),
             failing_fetches: Mutex::new(Vec::new()),
-            search_scripts: Mutex::new(HashMap::new()),
+            search_scripts: Mutex::new(Vec::new()),
             search_uids: Mutex::new(Vec::new()),
+            store_failing: Mutex::new(false),
+            body_fetches: AtomicUsize::new(0),
         }
     }
 
@@ -1323,10 +1427,12 @@ impl FakeImapBackend {
 
     /// Script the exact `SEARCH` result for one criteria list.
     pub fn with_search_result(self, criteria: &[&str], uids: Vec<u32>) -> Self {
-        self.search_scripts.lock().unwrap().insert(
-            criteria.iter().map(|token| token.to_string()).collect(),
-            uids,
-        );
+        let args: Vec<ImapArg> = criteria
+            .iter()
+            .map(|token| ImapArg::Atom(token.to_string()))
+            .collect();
+        let keys = parse_search(&args).unwrap_or_else(|_| panic!("criteria must parse"));
+        self.search_scripts.lock().unwrap().push((keys, uids));
         self
     }
 
@@ -1347,15 +1453,66 @@ impl FakeImapBackend {
             .uidvalidity = uidvalidity;
     }
 
-    /// Simulate one new stored message: append a uid.
+    /// Simulate one new stored message: append a uid (read).
     pub fn add_message(&self, name: &str, uid: u32) {
-        self.snapshots
-            .lock()
-            .unwrap()
-            .get_mut(name)
-            .unwrap_or_else(|| panic!("mailbox {name} is not scripted"))
-            .uids
-            .push(uid);
+        self.script(name, |snapshot| snapshot.uids.push(uid));
+    }
+
+    /// Simulate a message leaving the mailbox.
+    pub fn remove_message(&self, name: &str, uid: u32) {
+        self.script(name, |snapshot| {
+            snapshot.uids.retain(|known| *known != uid);
+            snapshot.unread.retain(|known| *known != uid);
+        });
+    }
+
+    /// Simulate a read-state change on one stored message.
+    pub fn set_unread(&self, name: &str, uid: u32, unread: bool) {
+        self.script(name, |snapshot| {
+            snapshot.unread.retain(|known| *known != uid);
+            if unread {
+                snapshot.unread.push(uid);
+            }
+        });
+    }
+
+    /// Simulate the state store failing (or recovering) under a live
+    /// session.
+    pub fn set_store_failing(&self, failing: bool) {
+        *self.store_failing.lock().unwrap() = failing;
+    }
+
+    /// Simulate the folder being deleted: its id stops resolving.
+    pub fn remove_mailbox(&self, name: &str) {
+        self.snapshots.lock().unwrap().remove(name);
+    }
+
+    fn script(&self, name: &str, change: impl FnOnce(&mut FakeSelected)) {
+        change(
+            self.snapshots
+                .lock()
+                .unwrap()
+                .get_mut(name)
+                .unwrap_or_else(|| panic!("mailbox {name} is not scripted")),
+        );
+    }
+
+    fn opened(&self, view: &MailboxView) -> Option<SelectedMailbox> {
+        let snapshot = self.snapshots.lock().unwrap().get(&view.name).cloned()?;
+        Some(SelectedMailbox {
+            view: MailboxView {
+                id: view.id,
+                name: view.name.clone(),
+                special_use: view.special_use,
+            },
+            uidvalidity: snapshot.uidvalidity,
+            uidnext: snapshot.uidnext,
+            messages: snapshot
+                .uids
+                .iter()
+                .map(|uid| (*uid, snapshot.unread.contains(uid)))
+                .collect(),
+        })
     }
 }
 
@@ -1391,24 +1548,18 @@ impl ImapBackend for FakeImapBackend {
                     })
                     .flatten()
             });
-        let Some(view) = found else {
-            return Ok(None);
-        };
-        let snapshot = self.snapshots.lock().unwrap().get(&view.name).cloned();
-        let Some(snapshot) = snapshot else {
-            return Ok(None);
-        };
-        Ok(Some(SelectedMailbox {
-            view: MailboxView {
-                id: view.id,
-                name: view.name.clone(),
-                special_use: view.special_use,
-            },
-            uidvalidity: snapshot.uidvalidity,
-            uidnext: snapshot.uidnext,
-            exists: snapshot.uids.len(),
-            unseen: snapshot.unseen,
-        }))
+        Ok(found.and_then(|view| self.opened(view)))
+    }
+
+    async fn snapshot(&self, mailbox: MailboxId) -> Result<Option<SelectedMailbox>> {
+        if *self.store_failing.lock().unwrap() {
+            return Err(Error::Storage("state unavailable".into()));
+        }
+        Ok(self
+            .views
+            .iter()
+            .find(|view| view.id == mailbox)
+            .and_then(|view| self.opened(view)))
     }
 
     async fn fetch(
@@ -1441,6 +1592,9 @@ impl ImapBackend for FakeImapBackend {
         let Some(fetched) = fetches.get(&uid) else {
             return Ok(None);
         };
+        if items.iter().any(|item| item.is_body()) {
+            self.body_fetches.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Some(FetchResponse {
             uid,
             flags: fetched.flags.clone(),
@@ -1448,20 +1602,31 @@ impl ImapBackend for FakeImapBackend {
             envelope: fetched.envelope.clone(),
             bodystructure: fetched.bodystructure.clone(),
             rfc822_size: fetched.rfc822_size,
-            body: Some(fetched.body.clone()),
+            bodies: items
+                .iter()
+                .filter(|item| item.is_body())
+                .map(|_| fetched.body.clone())
+                .collect(),
         }))
     }
 
-    async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>> {
-        // The session enumerates a mailbox with the ALL criteria.
-        if criteria.len() == 1 && criteria[0].eq_ignore_ascii_case("ALL") {
-            if let Some(view) = self.views.iter().find(|view| view.id == mailbox) {
-                if let Some(snapshot) = self.snapshots.lock().unwrap().get(&view.name) {
-                    return Ok(snapshot.uids.clone());
-                }
-            }
+    async fn search(
+        &self,
+        _mailbox: MailboxId,
+        keys: &[SearchKey],
+        view: &[u32],
+    ) -> Result<Vec<u32>> {
+        // ALL is every message of the searching session's view.
+        if keys == [SearchKey::All] {
+            return Ok(view.to_vec());
         }
-        if let Some(scripted) = self.search_scripts.lock().unwrap().get(criteria) {
+        if let Some((_, scripted)) = self
+            .search_scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(scripted, _)| scripted == keys)
+        {
             return Ok(scripted.clone());
         }
         Ok(self.search_uids.lock().unwrap().clone())

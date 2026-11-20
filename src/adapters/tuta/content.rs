@@ -107,6 +107,18 @@ pub fn address_from_mail_address(address: &MailAddress) -> Address {
     }
 }
 
+/// The address a mail's `From:` header must carry: always `Mail.sender`.
+///
+/// `Mail.differentEnvelopeSender` is deliberately ignored. It is the
+/// envelope (technical) sender when that differs from the header `From` —
+/// a bounce or mailing-service address. The reference client keeps showing
+/// `Mail.sender` and only names the technical sender in an authentication
+/// warning; putting it into `From:` would make replies go to the bounce
+/// address and disagree with the list-level header.
+pub fn from_address(mail: &Mail) -> Address {
+    address_from_mail_address(&mail.sender)
+}
+
 /// Convert a Tuta [`EncryptedMailAddress`] into our [`Address`], dropping empty names.
 pub fn address_from_encrypted(address: &EncryptedMailAddress) -> Address {
     Address {
@@ -229,7 +241,7 @@ pub fn mail_is_intact(mail: &Mail) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tutasdk::entities::generated::sys::Blob;
     use tutasdk::entities::generated::tutanota::{Header, Recipients};
@@ -327,7 +339,7 @@ mod tests {
         }
     }
 
-    fn intact_mail() -> Mail {
+    pub(crate) fn intact_mail() -> Mail {
         Mail {
             _id: Some(IdTupleGenerated::new(
                 GeneratedId("list".into()),
@@ -461,6 +473,17 @@ mod tests {
         let mut file = intact_file();
         file.blobs = Vec::new();
         assert!(!file_is_intact(&file));
+    }
+
+    #[test]
+    fn from_is_the_header_sender_not_the_envelope_sender() {
+        let mut mail = intact_mail();
+        mail.sender.name = "Company".into();
+        mail.sender.address = "news@company.example".into();
+        mail.differentEnvelopeSender = Some("bounces+123@mailer.example".into());
+        let from = from_address(&mail);
+        assert_eq!(from.address, "news@company.example");
+        assert_eq!(from.name.as_deref(), Some("Company"));
     }
 
     #[test]

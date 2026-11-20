@@ -11,6 +11,7 @@ use tuta_bridge::adapters::mime::MimeRenderer;
 use tuta_bridge::adapters::password_store::KeyringPasswordStore;
 use tuta_bridge::adapters::terminal_prompt::TerminalPrompt;
 use tuta_bridge::adapters::tuta::session::TutaSessionFactory;
+use tuta_bridge::adapters::tuta::timeout_rest_client::TimeoutRestClient;
 use tuta_bridge::app::dump::{DumpArgs, DumpUseCase};
 use tuta_bridge::app::login::LoginUseCase;
 use tuta_bridge::app::logout::LogoutUseCase;
@@ -97,8 +98,10 @@ fn main() {
     }
 
     // 5. Build the SDK components.
+    // The native client has no timeout of its own; every exchange gets a
+    // deadline so a stalled connection fails instead of hanging the command.
     let raw: Arc<dyn RestClient> = match NativeRestClient::try_new() {
-        Ok(c) => Arc::new(c),
+        Ok(c) => Arc::new(TimeoutRestClient::new(Arc::new(c))),
         Err(e) => exit_with_error(Error::Network(e.to_string())),
     };
     let data_dir = match data_dir() {

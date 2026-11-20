@@ -6,6 +6,7 @@
 //! fixed error message without echo of the URL or any account data.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -23,6 +24,16 @@ use crate::ports::event_stream::EventStream;
 /// Must match the version of the pinned Tuta SDK revision, otherwise the
 /// server rejects the connection as an outdated client.
 pub const TUTA_CLIENT_VERSION: &str = "369.261113.0";
+
+/// How long the event bus may stay silent before the stream probes it.
+///
+/// A connection that dies without a FIN (suspend, NAT drop) never produces
+/// a read error, so silence alone cannot be told from a quiet mailbox.
+/// After this long without any frame the stream sends a ping; if another
+/// full interval passes with still nothing — not even the pong — the
+/// connection is declared dead. A half-open socket therefore surfaces
+/// within two intervals.
+pub const IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Build the authenticated event-bus websocket URL.
 ///
@@ -130,6 +141,10 @@ pub fn close_error(code: Option<u16>) -> Error {
 /// access token, which must never end up in logs or errors.
 pub struct TutaEventStream {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// Silence tolerated before a probe, and again before giving up.
+    idle: Duration,
+    /// A ping was sent and nothing has been received since.
+    probing: bool,
 }
 
 impl TutaEventStream {
@@ -138,10 +153,19 @@ impl TutaEventStream {
     /// Failures — DNS, TLS, handshake rejection — map to one fixed network
     /// error that never includes the URL.
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_with_idle(url, IDLE_PROBE_INTERVAL).await
+    }
+
+    /// [`Self::connect`] with an explicit idle-probe interval.
+    pub async fn connect_with_idle(url: &str, idle: Duration) -> Result<Self> {
         let (socket, _response) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|_| Error::Network("event stream connect failed".into()))?;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            idle,
+            probing: false,
+        })
     }
 }
 
@@ -149,7 +173,25 @@ impl TutaEventStream {
 impl EventStream for TutaEventStream {
     async fn next_frame(&mut self) -> Result<EventFrame> {
         loop {
-            let Some(message) = self.socket.next().await else {
+            let received = match tokio::time::timeout(self.idle, self.socket.next()).await {
+                Ok(received) => received,
+                // Silence. The first quiet interval sends a probe; a second
+                // one without any frame means nobody is on the other end.
+                Err(_) if self.probing => {
+                    return Err(Error::Network("event stream timed out".into()));
+                }
+                Err(_) => {
+                    self.socket
+                        .send(Message::Ping(Vec::new()))
+                        .await
+                        .map_err(|_| Error::Network("event stream disconnected".into()))?;
+                    self.probing = true;
+                    continue;
+                }
+            };
+            // Any frame at all — the pong included — proves the peer is alive.
+            self.probing = false;
+            let Some(message) = received else {
                 return Err(close_error(None));
             };
             let message = match message {

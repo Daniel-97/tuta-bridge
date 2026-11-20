@@ -207,11 +207,11 @@ pub async fn request_archive_read_token(
         .await
         .map_err(|_| Error::Network("mail details token failed".into()))?;
     if response.status < 200 || response.status >= 300 {
-        let detail = String::from_utf8_lossy(response.body.as_deref().unwrap_or_default());
-        let detail: String = detail.chars().take(500).collect();
+        // Status only: the server's response body never enters an error
+        // string, which callers print and log.
         return Err(Error::Network(format!(
-            "mail details token failed: status {}; {}",
-            response.status, detail
+            "mail details token failed: status {}",
+            response.status
         )));
     }
     parse_archive_access(response.body.as_deref().unwrap_or_default())
@@ -256,11 +256,9 @@ pub async fn request_instance_read_token(
         .await
         .map_err(|_| Error::Message("attachment token request failed".into()))?;
     if response.status < 200 || response.status >= 300 {
-        let detail = String::from_utf8_lossy(response.body.as_deref().unwrap_or_default());
-        let detail: String = detail.chars().take(500).collect();
         return Err(Error::Message(format!(
-            "attachment token failed: status {}; {}",
-            response.status, detail
+            "attachment token failed: status {}",
+            response.status
         )));
     }
     parse_archive_access(response.body.as_deref().unwrap_or_default())
@@ -353,6 +351,22 @@ pub fn decrypt_chunks(key: &GenericAesKey, chunks: &[Vec<u8>]) -> Result<Vec<u8>
     Ok(out)
 }
 
+/// Check a decrypted attachment against the size its file declares.
+///
+/// `TutanotaFile.size` is the encrypted blob size (it includes the AES
+/// version/IV/MAC overhead), so the plaintext can only be upper-bounded
+/// by it, never compared for equality. A negative declared size is invalid
+/// and rejected outright; cast to `usize` it would become a huge bound and
+/// disable the check.
+pub fn check_attachment_size(decrypted_len: usize, declared_size: i64) -> Result<()> {
+    let error = || Error::Message("attachment size mismatch".into());
+    let declared = usize::try_from(declared_size).map_err(|_| error())?;
+    if decrypted_len > declared {
+        return Err(error());
+    }
+    Ok(())
+}
+
 /// Resolve the session key used to decrypt an attachment's blobs.
 async fn resolve_file_session_key(
     logged: &LoggedInSdk,
@@ -396,6 +410,8 @@ pub async fn load_attachment(
     if !file_is_intact(&file) {
         return Err(Error::Message("attachment file corrupted".into()));
     }
+    // Reject an invalid declared size before any blob is downloaded.
+    check_attachment_size(0, file.size)?;
 
     if file.blobs.is_empty() {
         return Ok(Attachment {
@@ -457,11 +473,7 @@ pub async fn load_attachment(
     }
 
     let data = decrypt_chunks(&key, &ciphertext_chunks)?;
-    // `TutanotaFile.size` is the encrypted blob size (it includes the AES
-    // version/IV/MAC overhead), so it is not equal to the decrypted length.
-    if data.len() > file.size as usize {
-        return Err(Error::Message("attachment size mismatch".into()));
-    }
+    check_attachment_size(data.len(), file.size)?;
 
     Ok(Attachment {
         name: file.name,

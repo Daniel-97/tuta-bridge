@@ -14,10 +14,11 @@ use tutasdk::bindings::suspendable_rest_client::SuspensionBehavior;
 use tutasdk::crypto::crypto_facade::create_auth_verifier;
 use tutasdk::crypto::generate_key_from_passphrase;
 use tutasdk::CLIENT_VERSION;
+use zeroize::Zeroizing;
 
 use super::json::{
     create_session_body, parse_pending, parse_salt_response, parse_session_response, salt_query,
-    second_factor_body, second_factor_query, ChallengeType,
+    second_factor_body, second_factor_delete_body, second_factor_query, ChallengeType, SessionId,
 };
 use crate::domain::Error;
 use crate::ports::session::{NewSession, SessionRequest};
@@ -39,9 +40,8 @@ enum AuthFailure {
 
 /// Print a short, opt-in diagnostic line for an HTTP response.
 ///
-/// Enabled only by `TUTA_BRIDGE_DEBUG_HTTP=1`. The URL query (which contains
-/// `_body` with the mail address/verifier) is never printed; only the path,
-/// status, and recognized error fields from a JSON response.
+/// Enabled only by the global `--debug` flag. See [`debug_line`] for what
+/// the line may contain.
 fn debug_http(
     enabled: bool,
     phase: &str,
@@ -53,63 +53,21 @@ fn debug_http(
     if !enabled {
         return;
     }
-    let path = url.split('?').next().unwrap_or(url);
-    let detail = body
-        .map(describe_error_body)
-        .unwrap_or_else(|| "<empty body>".to_string());
-    eprintln!("http debug: {phase} {method} {path} -> {status}; {detail}");
+    eprintln!("{}", debug_line(phase, method, url, status, body));
 }
 
-fn describe_error_body(body: &[u8]) -> String {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        let text = String::from_utf8_lossy(body);
-        let truncated: String = text.chars().take(500).collect();
-        return format!("<non-json> {truncated}");
-    };
-
-    let redacted = redact_json(value);
-    let compact =
-        serde_json::to_string(&redacted).unwrap_or_else(|_| "<unprintable json>".to_string());
-    let truncated: String = compact.chars().take(2000).collect();
-    truncated
-}
-
-/// Redact values that could carry credentials or account identifiers. The
-/// server's error code/message remain visible for diagnosis.
-fn redact_json(value: serde_json::Value) -> serde_json::Value {
-    const SENSITIVE: &[&str] = &[
-        "password",
-        "passphrase",
-        "authverifier",
-        "accesstoken",
-        "encryptedpassphrasekey",
-        "mailaddress",
-        "salt",
-        "accesskey",
-        "totp",
-        "otpcode",
-        "session",
-    ];
-    match value {
-        serde_json::Value::Object(map) => {
-            let redacted = map
-                .into_iter()
-                .map(|(key, value)| {
-                    let lower = key.to_ascii_lowercase();
-                    if SENSITIVE.contains(&lower.as_str()) {
-                        (key, serde_json::Value::String("<redacted>".to_string()))
-                    } else {
-                        (key, redact_json(value))
-                    }
-                })
-                .collect();
-            serde_json::Value::Object(redacted)
-        }
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(redact_json).collect())
-        }
-        other => other,
-    }
+/// Build the diagnostic line: phase, method, URL path, status, and the body
+/// length in bytes.
+///
+/// Safe by construction rather than by redaction: the URL query (its `_body`
+/// carries the mail address and the access token) is cut off, and no part of
+/// a response body is ever printed. Tuta JSON is keyed by numeric attribute
+/// ids, so a successful session response is `{"1221":"<access token>",...}`
+/// and no list of sensitive key names could recognise it.
+fn debug_line(phase: &str, method: &str, url: &str, status: u32, body: Option<&[u8]>) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let length = body.map_or(0, <[u8]>::len);
+    format!("http debug: {phase} {method} {path} -> {status}; body {length} bytes")
 }
 
 impl TutaPreSession {
@@ -159,13 +117,16 @@ impl TutaPreSession {
         let key = generate_key_from_passphrase(password.expose_secret(), salt_resp.salt);
         drop(password);
 
-        // Step 4: Create auth verifier
-        let verifier = create_auth_verifier(key.clone());
+        // Step 4: Create auth verifier. It authenticates the account, so it
+        // is wiped when this function returns, like the access key below.
+        // (The request bodies built from them move into the REST client and
+        // are outside this function's control.)
+        let verifier = Zeroizing::new(create_auth_verifier(key.clone()));
 
         // Step 5: Generate access key (32 random bytes) and base64-encode it
-        let mut access_key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut access_key_bytes);
-        let access_key_b64 = BASE64_STANDARD.encode(access_key_bytes);
+        let mut access_key_bytes = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(access_key_bytes.as_mut_slice());
+        let access_key_b64 = Zeroizing::new(BASE64_STANDARD.encode(access_key_bytes.as_slice()));
 
         // Step 6: Create session
         let session_body =
@@ -185,45 +146,28 @@ impl TutaPreSession {
             .await?;
         let mut session_resp = parse_session_response(&session_data)?;
 
-        // Step 7: Handle challenges. Only TOTP (type 1) is supported; any other
-        // challenge type is rejected immediately.
+        // Step 7: Handle challenges, then (step 8) poll for approval.
         let session_id = super::json::session_id_from_access_token(&session_resp.access_token)?;
-        let mut need_poll = false;
 
-        for challenge in &session_resp.challenges {
-            match challenge {
-                ChallengeType::Totp => {
-                    let code = (totp)()?;
-                    let totp_body = second_factor_body(&session_id, &code);
-                    let totp_url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
-                    let mut totp_headers = self.common_headers(true);
-                    totp_headers.insert("v".to_string(), "158".to_string());
-                    self.request_json(
-                        HttpMethod::POST,
-                        &totp_url,
-                        Some(totp_body),
-                        totp_headers,
-                        AuthFailure::SecondFactor,
-                        "second factor request",
-                    )
-                    .await?;
-                    need_poll = true;
-                }
-                ChallengeType::Other(_) => {
-                    return Err(Error::Unsupported(
-                        "second factor type not supported".into(),
-                    ));
-                }
+        // From here on the server holds a session waiting for its second
+        // factor. If the challenge cannot be completed, cancel it instead
+        // of leaving it pending.
+        if let Err(error) = self
+            .complete_challenges(&session_resp.challenges, &session_id, totp.as_ref())
+            .await
+        {
+            self.cancel_pending(&session_id).await;
+            return Err(error);
+        }
+        if !session_resp.challenges.is_empty() {
+            if let Err(error) = self.poll_second_factor(&session_resp.access_token).await {
+                self.cancel_pending(&session_id).await;
+                return Err(error);
             }
         }
 
-        // Step 8: Poll for approval
-        if need_poll {
-            self.poll_second_factor(&session_resp.access_token).await?;
-        }
-
         // Step 9: Build encrypted passphrase key
-        let access_key = Aes256Key::from_bytes(&access_key_bytes)
+        let access_key = Aes256Key::from_bytes(access_key_bytes.as_slice())
             .map_err(|_| Error::Login("invalid access key".into()))?;
         let mut random_iv_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut random_iv_bytes);
@@ -237,6 +181,97 @@ impl TutaPreSession {
             access_token: std::mem::take(&mut session_resp.access_token),
             encrypted_passphrase_key,
         })
+    }
+
+    /// Answer the session's second-factor challenges (step 7).
+    ///
+    /// The server sends one challenge per registered second-factor type and
+    /// any one of them completes the login, so — like the reference client,
+    /// which looks for the TOTP challenge among them — answer the TOTP
+    /// challenge when there is one and ignore the others. Only a login that
+    /// offers no TOTP at all is unsupported.
+    async fn complete_challenges(
+        &self,
+        challenges: &[ChallengeType],
+        session_id: &SessionId,
+        totp: &(dyn Fn() -> crate::domain::Result<String> + Send + Sync),
+    ) -> crate::domain::Result<()> {
+        if challenges.contains(&ChallengeType::Totp) {
+            let code = Zeroizing::new((totp)()?);
+            let totp_body = second_factor_body(session_id, &code);
+            let totp_url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
+            let mut totp_headers = self.common_headers(true);
+            totp_headers.insert("v".to_string(), "158".to_string());
+            self.request_json(
+                HttpMethod::POST,
+                &totp_url,
+                Some(totp_body),
+                totp_headers,
+                AuthFailure::SecondFactor,
+                "second factor request",
+            )
+            .await?;
+        } else if !challenges.is_empty() {
+            return Err(Error::Unsupported(
+                "second factor type not supported".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Best-effort cancel of a session still waiting for its second factor,
+    /// the same `SecondFactorAuthService` DELETE the reference client sends
+    /// when the user cancels. Failures are ignored: the login already failed
+    /// and that error is the one to report.
+    async fn cancel_pending(&self, session_id: &SessionId) {
+        let url = format!("{}/rest/sys/secondfactorauthservice", self.base_url);
+        let _ = self
+            .request_json(
+                HttpMethod::DELETE,
+                &url,
+                Some(second_factor_delete_body(session_id)),
+                self.common_headers(true),
+                AuthFailure::SecondFactor,
+                "second factor cancel",
+            )
+            .await;
+    }
+
+    /// Delete the server session behind `access_token`.
+    ///
+    /// For a session that was created and approved but will not be kept
+    /// (the login failed before it could be resumed and closed normally).
+    /// A session the server no longer knows (401/404) counts as deleted.
+    pub async fn delete_session(&self, access_token: &str) -> crate::domain::Result<()> {
+        let session_id = super::json::session_id_from_access_token(access_token)?;
+        let url = format!(
+            "{}/rest/sys/session/{}/{}",
+            self.base_url, session_id.list_id, session_id.element_id
+        );
+        let mut headers = self.common_headers(false);
+        headers.insert("accessToken".to_string(), access_token.to_string());
+        let options = RestClientOptions {
+            headers,
+            body: None,
+            suspension_behavior: Some(SuspensionBehavior::Suspend),
+        };
+        let response = self
+            .rest
+            .request_binary(url.clone(), HttpMethod::DELETE, options)
+            .await
+            .map_err(|_| Error::Network("failed to close session".into()))?;
+        debug_http(
+            self.debug,
+            "session delete",
+            "DELETE",
+            &url,
+            response.status,
+            response.body.as_deref(),
+        );
+        match response.status {
+            200..=299 | 401 | 404 => Ok(()),
+            _ => Err(Error::Network("failed to close session".into())),
+        }
     }
 
     /// Poll the second-factor auth service until approval is confirmed or timeout.
@@ -336,32 +371,48 @@ impl TutaPreSession {
 
 #[cfg(test)]
 mod tests {
-    use super::describe_error_body;
+    use super::debug_line;
 
+    /// Real wire shape: Tuta JSON is keyed by numeric attribute ids, so the
+    /// access token sits under `1221` and the salt under `422`.
     #[test]
-    fn describes_json_error_fields_without_the_raw_body() {
-        let body = br#"{"errorCode":"invalid","message":"bad request","other":"ignored"}"#;
-        let text = describe_error_body(body);
-        assert!(text.contains(r#""errorCode":"invalid""#));
-        assert!(text.contains(r#""message":"bad request""#));
-        assert!(text.contains(r#""other":"ignored""#));
+    fn never_prints_a_successful_session_response_body() {
+        let body = br#"{"1220":"0","1221":"SECRETACCESSTOKEN","1222":[],"1223":["SECRETUSERID"]}"#;
+        let line = debug_line(
+            "session request",
+            "POST",
+            "https://app.tuta.com/rest/sys/sessionservice",
+            201,
+            Some(body),
+        );
+        assert_eq!(
+            line,
+            format!(
+                "http debug: session request POST https://app.tuta.com/rest/sys/sessionservice -> 201; body {} bytes",
+                body.len()
+            )
+        );
+        assert!(!line.contains("SECRETACCESSTOKEN"));
+        assert!(!line.contains("SECRETUSERID"));
     }
 
     #[test]
-    fn redacts_sensitive_json_values() {
-        let body = br#"{"message":"bad request","mailAddress":"a@b.c","accessToken":"tok","nested":{"password":"pw"}}"#;
-        let text = describe_error_body(body);
-        assert!(text.contains(r#""message":"bad request""#));
-        assert!(!text.contains("a@b.c"));
-        assert!(!text.contains("tok"));
-        assert!(!text.contains("pw"));
-        assert!(text.contains("<redacted>"));
+    fn never_prints_error_bodies_or_the_url_query() {
+        let line = debug_line(
+            "second factor poll",
+            "GET",
+            "https://app.tuta.com/rest/sys/secondfactorauthservice?_body=%7B%221235%22%3A%22SECRETTOKEN%22%7D",
+            400,
+            Some(br#"{"422":"SECRETSALT","message":"a@b.c"}"#),
+        );
+        assert!(line.ends_with("/rest/sys/secondfactorauthservice -> 400; body 38 bytes"));
+        assert!(!line.contains("SECRET"));
+        assert!(!line.contains("a@b.c"));
     }
 
     #[test]
-    fn describes_non_json_body_with_a_truncated_prefix() {
-        let text = describe_error_body(b"<html>oops</html>");
-        assert!(text.starts_with("<non-json>"));
-        assert!(text.contains("<html>oops</html>"));
+    fn reports_an_empty_body_as_zero_bytes() {
+        let line = debug_line("salt request", "GET", "http://127.0.0.1:1/x", 500, None);
+        assert!(line.ends_with("-> 500; body 0 bytes"));
     }
 }

@@ -12,8 +12,9 @@ use std::sync::Mutex;
 
 use secrecy::{ExposeSecret, SecretString};
 use tuta_bridge::adapters::imap::backend::TutaImapBackend;
-use tuta_bridge::adapters::imap::codec::parse_fetch_items;
+use tuta_bridge::adapters::imap::codec::{self, ImapArg};
 use tuta_bridge::adapters::imap::render::bodystructure;
+use tuta_bridge::adapters::imap::search::parse_search;
 use tuta_bridge::adapters::mime::MimeRenderer;
 use tuta_bridge::app::enrich::EnvelopeEnricher;
 use tuta_bridge::domain::{
@@ -190,10 +191,47 @@ async fn world() -> TestWorld {
     world_with(Arc::new(FakePasswordStore::with("bridge-password"))).await
 }
 
+/// Run `a SEARCH <raw>` over `backend`, tokenized like the session
+/// tokenizes it, with every stored message in view.
+async fn search_line(backend: &TutaImapBackend, mailbox: MailboxId, raw: &str) -> Vec<u32> {
+    let request = codec::parse_line(&format!("a SEARCH {raw}"))
+        .unwrap_or_else(|_| panic!("search line must tokenize"));
+    let keys = parse_search(&request.args).unwrap_or_else(|_| panic!("criteria must parse"));
+    let view: Vec<u32> = backend
+        .store
+        .message_uids(mailbox)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(uid, _)| uid)
+        .collect();
+    backend.search(mailbox, &keys, &view).await.unwrap()
+}
+
 /// Run one SEARCH over `backend` with `&str` criteria for brevity.
+/// The FETCH items of `raw`, parsed the way the session parses them:
+/// tokenized as a command first.
+fn parse_fetch_items(raw: &str) -> Result<Vec<codec::FetchItem>> {
+    let request = codec::parse_line(&format!("a FETCH 1 {raw}"))?;
+    codec::parse_fetch_items(&request.args[1..])
+}
+
 async fn search(backend: &TutaImapBackend, mailbox: MailboxId, criteria: &[&str]) -> Vec<u32> {
-    let owned: Vec<String> = criteria.iter().map(|c| c.to_string()).collect();
-    backend.search(mailbox, &owned).await.unwrap()
+    let args: Vec<ImapArg> = criteria
+        .iter()
+        .map(|token| ImapArg::Atom(token.to_string()))
+        .collect();
+    let keys = parse_search(&args).unwrap_or_else(|_| panic!("criteria must parse"));
+    // The session's view: every stored uid, in order.
+    let view: Vec<u32> = backend
+        .store
+        .message_uids(mailbox)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(uid, _)| uid)
+        .collect();
+    backend.search(mailbox, &keys, &view).await.unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -332,8 +370,8 @@ async fn mailboxes_list_special_use() {
         .unwrap()
         .expect("lowercase inbox resolves");
     assert_eq!(selected.view.id, world.inbox);
-    assert_eq!(selected.exists, 2);
-    assert_eq!(selected.unseen, 1);
+    assert_eq!(selected.messages.len(), 2);
+    assert_eq!(selected.unseen(), 1);
     assert_eq!(selected.uidnext, 3);
     assert_eq!(selected.uidvalidity, 100);
 
@@ -371,7 +409,7 @@ async fn fetch_serves_envelopes_from_the_index_and_enriches_structure_once() {
 
     let content = world.source.content.clone().unwrap();
     let expected_bytes = MimeRenderer.render(&content).unwrap();
-    let expected_structure = bodystructure(&content);
+    let expected_structure = bodystructure(&content, &expected_bytes);
 
     // ENVELOPE serves from the stored (partial) header: no source call,
     // unknown fields stay NIL until enrichment.
@@ -393,7 +431,7 @@ async fn fetch_serves_envelopes_from_the_index_and_enriches_structure_once() {
     assert!(envelope.ends_with(" NIL NIL NIL NIL NIL)"));
     assert_eq!(response.bodystructure, None);
     assert_eq!(response.rfc822_size, None);
-    assert_eq!(response.body, None);
+    assert!(response.bodies.is_empty());
 
     // BODYSTRUCTURE enriches once: one content load, the persisted
     // structure is returned, and the row gains the complete envelope.
@@ -459,7 +497,10 @@ async fn fetch_serves_envelopes_from_the_index_and_enriches_structure_once() {
         .unwrap()
         .expect("row exists");
     assert_eq!(world.source.content_calls(), 2);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
     assert_eq!(response.rfc822_size, Some(expected_bytes.len() as u64));
 
     // A following RFC822.SIZE answers from the store, no new render.
@@ -493,7 +534,10 @@ async fn fetch_serves_envelopes_from_the_index_and_enriches_structure_once() {
         .unwrap()
         .expect("row exists");
     assert_eq!(world.source.content_calls(), 4);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
     let stored = world
         .store
         .message_by_uid(world.inbox, uid_two)
@@ -540,7 +584,10 @@ async fn body_peek_does_not_persist_anything() {
         .unwrap()
         .expect("row exists");
     assert_eq!(world.source.content_calls(), 1);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
     let stored = world
         .store
         .message_by_uid(world.inbox, uid)
@@ -572,7 +619,7 @@ async fn body_peek_does_not_persist_anything() {
         .unwrap()
         .expect("row exists");
     assert_eq!(
-        response.body.as_deref(),
+        response.bodies.first().map(Vec::as_slice),
         Some(b"Subject: full subject\r\n\r\n".as_slice())
     );
     let stored = world
@@ -622,7 +669,11 @@ async fn body_sections_slice_and_parts_are_refused() {
         .await
         .unwrap()
         .expect("row exists");
-    let header = response.body.expect("header section renders");
+    let header = response
+        .bodies
+        .into_iter()
+        .next()
+        .expect("header section renders");
     let header_text = String::from_utf8_lossy(&header);
     assert!(header_text.contains("Subject: full subject\r\n"));
     assert!(header.ends_with(b"\r\n\r\n"));
@@ -636,7 +687,11 @@ async fn body_sections_slice_and_parts_are_refused() {
         .await
         .unwrap()
         .expect("row exists");
-    let text = response.body.expect("text section renders");
+    let text = response
+        .bodies
+        .into_iter()
+        .next()
+        .expect("text section renders");
     assert!(!text.is_empty());
     assert_eq!(
         [header.as_slice(), text.as_slice()].concat(),
@@ -652,7 +707,10 @@ async fn body_sections_slice_and_parts_are_refused() {
         .await
         .unwrap()
         .expect("row exists");
-    assert_eq!(response.body.as_deref(), Some(header.as_slice()));
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(header.as_slice())
+    );
 
     // Numeric part sections are refused with the fixed message, before
     // any content load. `FetchResponse` deliberately has no `Debug`
@@ -695,7 +753,11 @@ async fn rfc822_header_is_peek_and_persists_nothing() {
         .await
         .unwrap()
         .expect("row exists");
-    let body = response.body.expect("header section renders");
+    let body = response
+        .bodies
+        .into_iter()
+        .next()
+        .expect("header section renders");
     assert!(String::from_utf8_lossy(&body).contains("Subject: full subject\r\n"));
     assert!(body.ends_with(b"\r\n\r\n"));
     assert!(
@@ -748,6 +810,95 @@ async fn fetch_unknown_uid_returns_none() {
         .is_none());
     // Nothing was loaded or persisted for the phantom row.
     assert_eq!(world.source.content_calls(), 0);
+}
+
+#[tokio::test]
+async fn same_named_and_slashed_folders_stay_reachable_and_distinct() {
+    let world = world().await;
+    let folder = |list_id: &str, name: &str| Folder {
+        list_id: list_id.into(),
+        name: name.into(),
+        kind: FolderKind::Custom,
+    };
+    let mut ids = Vec::new();
+    for (list_id, name) in [
+        ("work-a", "Work"),
+        ("work-b", "Work"),
+        ("slashed", "Clients/ACME"),
+        ("shadow", "INBOX"),
+    ] {
+        ids.push(
+            world
+                .store
+                .upsert_mailbox(world.account, &folder(list_id, name), 500)
+                .await
+                .unwrap(),
+        );
+    }
+
+    // Every mailbox is listed once, under a name of its own, and no
+    // name contains the hierarchy delimiter.
+    let views = world.backend.mailboxes().await.unwrap();
+    let mut names: Vec<&str> = views.iter().map(|view| view.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "Clients\u{2215}ACME",
+            "INBOX (2)",
+            "Inbox",
+            "Work",
+            "Work (2)"
+        ]
+    );
+
+    // Each listed name selects the mailbox it was listed for.
+    for view in &views {
+        let selected = world
+            .backend
+            .select(&view.name)
+            .await
+            .unwrap()
+            .expect("a listed name selects");
+        assert_eq!(selected.view.id, view.id);
+    }
+    // The two namesakes are different mailboxes, the older one first.
+    let select = |name: &'static str| {
+        let backend = &world.backend;
+        async move {
+            backend
+                .select(name)
+                .await
+                .unwrap()
+                .map(|found| found.view.id)
+        }
+    };
+    assert_eq!(select("Work").await, Some(ids[0]));
+    assert_eq!(select("Work (2)").await, Some(ids[1]));
+    // INBOX in any casing is the Inbox, never the custom namesake.
+    assert_eq!(select("INBOX").await, Some(world.inbox));
+    assert_eq!(select("inbox").await, Some(world.inbox));
+    assert_eq!(select("INBOX (2)").await, Some(ids[3]));
+    assert_eq!(select("Clients/ACME").await, None);
+
+    // By id the snapshot never depends on the name.
+    let snapshot = world
+        .backend
+        .snapshot(ids[1])
+        .await
+        .unwrap()
+        .expect("the mailbox exists");
+    assert_eq!(snapshot.view.name, "Work (2)");
+    assert!(world
+        .backend
+        .snapshot(MailboxId(9_999))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        world.backend.uidvalidity(MailboxId(9_999)).await.unwrap(),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -870,28 +1021,66 @@ async fn search_covers_index_keys() {
         search(backend, inbox, &["OR", "SEEN", "SUBJECT", "offer"]).await,
         vec![2, 3]
     );
+
+    // Groups, NOT, and OR keep their structure: NOT negates the whole
+    // group, and OR takes the group as one of its two keys.
+    assert_eq!(
+        search_line(backend, inbox, "NOT (SEEN SUBJECT lunch)").await,
+        vec![1, 3]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "OR (UNSEEN SUBJECT quarterly) SEEN").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "(UNSEEN (OR SUBJECT offer SUBJECT lunch))").await,
+        vec![3]
+    );
+    // Negations of flags the bridge never sets match everything, so a
+    // client's habitual UNDELETED prefix changes nothing.
+    assert_eq!(
+        search_line(backend, inbox, "UNDELETED UNANSWERED SUBJECT offer").await,
+        vec![3]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "CHARSET UTF-8 SUBJECT \"quarterly\"").await,
+        vec![1]
+    );
+    // SENT* keys compare the sent date, which is the received time
+    // until a row is enriched; BCC reads the stored (empty) field.
+    assert_eq!(
+        search_line(backend, inbox, "SENTSINCE 15-Nov-2023").await,
+        vec![2]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "SENTON 14-Nov-2023").await,
+        vec![1]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "SENTBEFORE 14-Nov-2023").await,
+        vec![3]
+    );
+    assert_eq!(
+        search_line(backend, inbox, "BCC example").await,
+        Vec::<u32>::new()
+    );
+
     // Search never enriches: it reads only the stored index.
     assert_eq!(world.source.content_calls(), 0);
 
-    // Body/text search needs a body cache the bridge deliberately keeps
-    // out of the store; keywords, NEW/OLD (\Recent-based, no faithful
-    // reduction), and unknown keys answer the same fixed unsupported
-    // string.
-    for criteria in [
-        ["BODY", "x"],
-        ["TEXT", "x"],
-        ["KEYWORD", "flag"],
-        ["NEW", ""],
-        ["OLD", ""],
-        ["BOGUS", ""],
-    ] {
-        let owned: Vec<String> = criteria.iter().map(|c| c.to_string()).collect();
-        let error = backend.search(inbox, &owned).await.unwrap_err();
-        assert!(
-            matches!(error, Error::Unsupported(message) if message == "search key not supported"),
-            "criteria {criteria:?} must answer the fixed unsupported string"
-        );
-    }
+    // Only the searching session's view is searched, and numbers
+    // resolve against it: with uid 1 not (yet) part of the view, `1`
+    // is uid 2 and uid 1 never matches.
+    let keys = parse_search(&[ImapArg::Atom("1".into())]).unwrap_or_else(|_| panic!());
+    assert_eq!(
+        backend.search(inbox, &keys, &[2, 3]).await.unwrap(),
+        vec![2]
+    );
+    let keys = parse_search(&[ImapArg::Atom("ALL".into())]).unwrap_or_else(|_| panic!());
+    assert_eq!(
+        backend.search(inbox, &keys, &[2, 3]).await.unwrap(),
+        vec![2, 3]
+    );
 }
 
 /// Seed one row shaped like the M2-era zero-date population: marked
@@ -925,7 +1114,7 @@ async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
     let uid_body = seed_stale_row(&world.store, world.inbox, "e3").await;
     let content = world.source.content.clone().unwrap();
     let expected_bytes = MimeRenderer.render(&content).unwrap();
-    let expected_structure = bodystructure(&content);
+    let expected_structure = bodystructure(&content, &expected_bytes);
 
     // BODYSTRUCTURE heals through the enricher even though the
     // structure was stored: one content load, the sent date lands, and
@@ -997,8 +1186,8 @@ async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
         .expect("row exists");
     assert_eq!(stored.header.sent_at_ms, 1_700_000_000_000);
 
-    // BODY[] heals too — one enrich load plus the by-design render —
-    // and only the render is repeated afterwards.
+    // BODY[] heals too, and the enrichment and the by-design render
+    // share one content load; later fetches load once each.
     let items = parse_fetch_items("(BODY[])").unwrap();
     let response = world
         .backend
@@ -1006,8 +1195,11 @@ async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
         .await
         .unwrap()
         .expect("row exists");
-    assert_eq!(world.source.content_calls(), 4);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(world.source.content_calls(), 3);
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
     let stored = world
         .store
         .message_by_uid(world.inbox, uid_body)
@@ -1023,6 +1215,46 @@ async fn fetch_heals_rows_marked_complete_with_a_zero_sent_date() {
         .await
         .unwrap()
         .expect("row exists");
-    assert_eq!(world.source.content_calls(), 5);
-    assert_eq!(response.body.as_deref(), Some(expected_bytes.as_slice()));
+    assert_eq!(world.source.content_calls(), 4);
+    assert_eq!(
+        response.bodies.first().map(Vec::as_slice),
+        Some(expected_bytes.as_slice())
+    );
+}
+
+#[tokio::test]
+async fn one_fetch_returns_every_body_item_from_a_single_content_load() {
+    let world = world().await;
+    let uid = world
+        .store
+        .assign_uid(
+            world.inbox,
+            &partial_header("e1", "list subject", 1_700_000_000_000, true),
+        )
+        .await
+        .unwrap();
+    let rendered = MimeRenderer.render(&full_content()).unwrap();
+
+    // A still-partial row asked for its size, its structure, and two
+    // sections at once: one download serves the enrichment and both
+    // sections, and every body item gets its own answer, in order.
+    let items = parse_fetch_items(
+        "(RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER] BODY.PEEK[TEXT] RFC822.HEADER)",
+    )
+    .unwrap();
+    let response = world
+        .backend
+        .fetch(world.inbox, uid, &items)
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(world.source.content_calls(), 1);
+    assert_eq!(response.rfc822_size, Some(rendered.len() as u64));
+    assert!(response.bodystructure.is_some());
+    assert_eq!(response.bodies.len(), 3);
+    let (header, text) = (&response.bodies[0], &response.bodies[1]);
+    assert!(header.ends_with(b"\r\n\r\n"));
+    assert!(!text.is_empty());
+    assert_eq!([header.as_slice(), text.as_slice()].concat(), rendered);
+    assert_eq!(&response.bodies[2], header);
 }

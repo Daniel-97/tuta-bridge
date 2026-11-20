@@ -1,6 +1,7 @@
 use secrecy::SecretString;
 
 use crate::adapters::imap::codec::FetchItem;
+use crate::adapters::imap::search::SearchKey;
 use crate::domain::{MailboxId, Result};
 
 /// One mailbox as `LIST`/`LSUB` answer it.
@@ -15,24 +16,45 @@ pub struct MailboxView {
     pub special_use: &'static str,
 }
 
-/// The snapshot `SELECT` reports for one mailbox.
+/// The state of one mailbox at one moment: what `SELECT` reports, and
+/// what a selected session compares its own view against.
 pub struct SelectedMailbox {
     pub view: MailboxView,
     pub uidvalidity: u32,
     pub uidnext: u32,
-    pub exists: usize,
-    pub unseen: usize,
+    /// `(uid, unread)` of every message, in ascending UID order: a
+    /// message's position, plus one, is its message sequence number.
+    pub messages: Vec<(u32, bool)>,
+}
+
+impl SelectedMailbox {
+    /// How many messages are unread — the STATUS `UNSEEN` count.
+    pub fn unseen(&self) -> usize {
+        self.messages.iter().filter(|(_, unread)| *unread).count()
+    }
+
+    /// The message number of the first unread message — the SELECT
+    /// `[UNSEEN n]` response code (RFC 3501 §7.1), unlike STATUS, which
+    /// reports a count. `None` when every message is read.
+    pub fn first_unseen(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .position(|(_, unread)| *unread)
+            .map(|index| index + 1)
+    }
 }
 
 /// One FETCH response, built from the requested item list.
 ///
-/// `envelope`, `bodystructure`, `rfc822_size`, and `body` stay `None`
-/// when the request did not ask for them. The port models a single body
-/// per response: with several body items in one request the last one
-/// wins — real clients request one body section per FETCH. The strings
-/// are already IMAP-encoded (literals framed as `{n}\r\n<bytes>` where
-/// needed), so the session writes them verbatim. No `Debug`: envelopes
-/// and bodies are personal data that must never reach a log line.
+/// `envelope`, `bodystructure`, and `rfc822_size` stay `None` when the
+/// request did not ask for them. `bodies` holds one entry per body
+/// item of the request (`BODY[...]`, `BODY.PEEK[...]`, `RFC822`,
+/// `RFC822.HEADER`, `RFC822.TEXT`), in request order: the whole
+/// section, before any partial `<offset.count>` cut, which is the
+/// session's job. The strings are already IMAP-encoded (literals framed
+/// as `{n}\r\n<bytes>` where needed), so the session writes them
+/// verbatim. No `Debug`: envelopes and bodies are personal data that
+/// must never reach a log line.
 pub struct FetchResponse {
     pub uid: u32,
     pub flags: String,
@@ -40,7 +62,7 @@ pub struct FetchResponse {
     pub envelope: Option<String>,
     pub bodystructure: Option<String>,
     pub rfc822_size: Option<u64>,
-    pub body: Option<Vec<u8>>,
+    pub bodies: Vec<Vec<u8>>,
 }
 
 /// The read-only backend seam a session talks to.
@@ -57,6 +79,21 @@ pub trait ImapBackend: Send + Sync {
     async fn mailboxes(&self) -> Result<Vec<MailboxView>>;
     /// Resolve one mailbox by name: exact, plus `INBOX` case-insensitively.
     async fn select(&self, name: &str) -> Result<Option<SelectedMailbox>>;
+    /// The current state of the mailbox with this id, or `None` once it
+    /// no longer exists. A selected session addresses its mailbox this
+    /// way — never by name again, so a renamed or same-named mailbox can
+    /// not be mistaken for it.
+    async fn snapshot(&self, mailbox: MailboxId) -> Result<Option<SelectedMailbox>>;
+    /// The current UIDVALIDITY of the mailbox with this id, or `None`
+    /// once it no longer exists: the check a selected session runs
+    /// before every command, so implementations should answer it
+    /// without reading messages.
+    async fn uidvalidity(&self, mailbox: MailboxId) -> Result<Option<u32>> {
+        Ok(self
+            .snapshot(mailbox)
+            .await?
+            .map(|snapshot| snapshot.uidvalidity))
+    }
     /// Fetch one stored message by UID, or `None` when the mailbox has no
     /// such row.
     async fn fetch(
@@ -65,7 +102,45 @@ pub trait ImapBackend: Send + Sync {
         uid: u32,
         items: &[FetchItem],
     ) -> Result<Option<FetchResponse>>;
-    /// Evaluate SEARCH criteria over the stored index; the returned
-    /// numbers are UIDs.
-    async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>>;
+    /// Evaluate SEARCH keys — every one must match — over the stored
+    /// index; the returned numbers are UIDs, ascending.
+    ///
+    /// `view` is the searching session's uid list in message-number
+    /// order: only its messages are candidates, and sequence-number
+    /// keys and `*` resolve against it, never against the live store.
+    async fn search(
+        &self,
+        mailbox: MailboxId,
+        keys: &[SearchKey],
+        view: &[u32],
+    ) -> Result<Vec<u32>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selected(messages: Vec<(u32, bool)>) -> SelectedMailbox {
+        SelectedMailbox {
+            view: MailboxView {
+                id: MailboxId(1),
+                name: "Inbox".into(),
+                special_use: "",
+            },
+            uidvalidity: 7,
+            uidnext: 9,
+            messages,
+        }
+    }
+
+    #[test]
+    fn select_reports_the_first_unseen_number_and_status_the_count() {
+        let mailbox = selected(vec![(1, false), (3, true), (4, false), (8, true)]);
+        assert_eq!(mailbox.first_unseen(), Some(2));
+        assert_eq!(mailbox.unseen(), 2);
+
+        let all_read = selected(vec![(1, false), (2, false)]);
+        assert_eq!(all_read.first_unseen(), None);
+        assert_eq!(all_read.unseen(), 0);
+    }
 }

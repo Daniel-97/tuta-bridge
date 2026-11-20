@@ -109,9 +109,23 @@ pub fn parse_frame(text: &str) -> Result<EventFrame> {
     }
 }
 
+/// Message of the error for an `entityUpdate` frame that does not parse.
+const INVALID_EVENT_MESSAGE: &str = "invalid event message";
+
+/// Whether `error` reports an `entityUpdate` frame that could not be
+/// parsed, as opposed to a lost connection.
+///
+/// Both end the stream as network errors, but they need different
+/// handling: a reconnect fixes a lost connection, while the server
+/// replays an unparseable frame unchanged on every reconnect, so the
+/// watch loop has to count these and move past the frame.
+pub fn is_invalid_event(error: &Error) -> bool {
+    matches!(error, Error::Network(message) if message == INVALID_EVENT_MESSAGE)
+}
+
 fn parse_entity_update(payload: &str) -> Result<EventFrame> {
-    let data: RawWebsocketEntityData = serde_json::from_str(payload)
-        .map_err(|_| Error::Network("invalid event message".into()))?;
+    let data: RawWebsocketEntityData =
+        serde_json::from_str(payload).map_err(|_| Error::Network(INVALID_EVENT_MESSAGE.into()))?;
     let events = data
         .entity_updates
         .into_iter()
@@ -219,6 +233,14 @@ mod tests {
             panic!("expected an error")
         };
         assert_eq!(error.to_string(), "network error: invalid event message");
+        // The watch loop tells it apart from a lost connection.
+        assert!(is_invalid_event(&error));
+        assert!(!is_invalid_event(&Error::Network(
+            "event stream disconnected".into()
+        )));
+        assert!(!is_invalid_event(&Error::Storage(
+            "invalid event message".into()
+        )));
     }
 
     #[test]

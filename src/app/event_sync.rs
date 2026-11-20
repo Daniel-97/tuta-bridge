@@ -5,10 +5,12 @@
 //! mail events of each element into one authoritative action, and persists
 //! the resulting [`StateChange`]s together with the batch id in a single
 //! [`StateStore::apply_batch`] call, so a replayed batch is a no-op and the
-//! batch marker never advances past unapplied changes. All lookups are
+//! batch marker never advances past unapplied changes: a batch with a
+//! failed lookup is not persisted at all. All lookups are
 //! metadata-only, and the report carries counters and local mailbox ids:
 //! subjects, addresses, and entity ids never appear in it.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -26,10 +28,12 @@ use crate::ports::state_store::StateStore;
 /// persist several (one upsert per placement plus a guard that drops stale
 /// placements). `skipped` counts the events left untouched, so
 /// `changes + skipped` always equals the number of events in the batch.
-/// `lookup_failures` counts the skipped events whose entity lookup failed
-/// with an error — unreadable entities and unhandled events stay out of
-/// it — because a long run of them desyncs the index and the watch loop
-/// heals that with a resync. `touched_mailboxes` lists every mailbox whose
+/// `lookup_failures` counts the events whose entity lookup failed with an
+/// error — unreadable entities and unhandled events stay out of it. A
+/// report with a nonzero count describes a batch that was not applied:
+/// nothing was persisted, the batch marker did not move, every event
+/// counts as skipped, and the watch loop retries the batch.
+/// `touched_mailboxes` lists every mailbox whose
 /// rows the batch changed, deduplicated, so idling sessions can learn
 /// their cached view is stale. All fields carry counters or mailbox ids
 /// only: entity data never appears in a report.
@@ -83,19 +87,23 @@ impl EventProcessor {
     /// Apply one event batch and persist it atomically.
     ///
     /// Mail sets are upserted as folders as soon as their event is seen,
-    /// so one batch can create a folder and file mail into it. Mail events
-    /// are coalesced per element id — a `Mail` create/update replaces the
-    /// element's action with the lookup's authoritative placements, a
-    /// `Mail` delete sets `Delete`, and a `MailSetEntry` create/update adds
-    /// a single placement. A batch can therefore still emit both a removal
-    /// and an upsert for one mail — a `Mail` delete followed by a late
-    /// entry create — and the delete wins because `apply_batch` applies
-    /// removals after upserts and entry ids never collide with mail ids,
-    /// so the two actions never overwrite each other. Unreadable or
-    /// failed lookups are skipped and keep the stored rows; failed ones
-    /// are counted in [`EventReport::lookup_failures`]. Afterwards
-    /// every action becomes state changes and `apply_batch` runs exactly
-    /// once, even when nothing changed, so the batch id always advances.
+    /// so one batch can create a folder and file mail into it. `Mail`
+    /// events are coalesced per mail — a create/update replaces the
+    /// mail's action with the lookup's authoritative placements, a
+    /// delete sets `Delete`. `MailSetEntry` creates/updates are kept per
+    /// entry and each adds one placement; they never join a mail's
+    /// action, because an entry event carries the entry's id, not the
+    /// mail's. A batch can therefore emit both a removal and an upsert
+    /// for one mail — a `Mail` delete next to an entry create — and the
+    /// delete wins because `apply_batch` applies removals after upserts.
+    /// Unreadable entities are skipped and keep their stored rows.
+    ///
+    /// When every lookup answered, the actions become state changes and
+    /// `apply_batch` runs exactly once, even when nothing changed, so
+    /// the batch id advances. When any lookup failed with an error the
+    /// batch is not applied at all: nothing is written, the batch id
+    /// stays where it was, and the report carries the failure count so
+    /// the caller can retry the same batch.
     pub async fn apply(
         &self,
         account_id: i64,
@@ -104,7 +112,10 @@ impl EventProcessor {
         batch: &EventBatch,
     ) -> Result<EventReport> {
         let mut changes: Vec<StateChange> = Vec::new();
+        // Mail actions keyed by the mail's element id.
         let mut actions: HashMap<String, MailAction> = HashMap::new();
+        // Entry placements keyed by the entry's own `(list, element)` id.
+        let mut entries: HashMap<(&str, &str), MailPlacement> = HashMap::new();
         let mut applied = 0;
         let mut skipped = 0;
         let mut lookup_failures = 0;
@@ -138,11 +149,12 @@ impl EventProcessor {
                     }
                 },
                 MAIL_SET_ENTRY_TYPE_ID => match entry_placement(lookup, event).await {
-                    // An entry event adds one placement; a mail deleted
-                    // in the same batch stays deleted, and a placement
-                    // the element already has changes nothing.
+                    // One placement per entry: a create followed by
+                    // an update of the same entry adds nothing new.
                     LookupOutcome::Found(placement) => {
-                        if add_placement(&mut actions, &event.element_id, placement) {
+                        let key = (event.list_id.as_str(), event.element_id.as_str());
+                        if let Entry::Vacant(slot) = entries.entry(key) {
+                            slot.insert(placement);
                             applied += 1;
                         } else {
                             skipped += 1;
@@ -158,10 +170,31 @@ impl EventProcessor {
             }
         }
 
+        // A failed lookup means an event's effect is unknown. Persisting
+        // the rest would move the batch marker past that event and lose
+        // it for good, so nothing is written and the caller retries the
+        // whole batch.
+        if lookup_failures > 0 {
+            return Ok(EventReport {
+                changes: 0,
+                skipped: batch.events.len(),
+                lookup_failures,
+                touched_mailboxes: Vec::new(),
+            });
+        }
+
         changes.extend(
             actions
                 .into_iter()
                 .flat_map(|(element_id, action)| action_changes(element_id, action)),
+        );
+        changes.extend(
+            entries
+                .into_values()
+                .map(|placement| StateChange::UpsertHeader {
+                    mailbox_list_id: placement.mailbox_list_id,
+                    header: placement.header,
+                }),
         );
 
         let outcome = self
@@ -178,11 +211,26 @@ impl EventProcessor {
     }
 }
 
+/// Whether `batch` reports a deleted mail set.
+///
+/// A delete event names the set, but the index knows folders by their
+/// entries list, which a deleted set can no longer be asked for. The
+/// processor therefore skips the event and the watch loop uses this to
+/// reconcile the stored folders against the server's list instead.
+pub fn deletes_folder(batch: &EventBatch) -> bool {
+    batch.events.iter().any(|event| {
+        event.application == TUTANOTA_APP
+            && event.type_id == MAIL_SET_TYPE_ID
+            && event.operation == EntityOperation::Delete
+    })
+}
+
 /// Resolve a mail-set event into a folder upsert.
 ///
 /// A set the bridge does not store (for example the virtual "All" set)
-/// answers `Ok(None)` and is skipped, as is every failed load. Folder
-/// deletion is left to `sync`, which reconciles the full folder list.
+/// answers `Ok(None)` and is skipped, as is every failed load. A deleted
+/// set is skipped too: its folder is removed by reconciling the full
+/// folder list (see [`deletes_folder`]).
 async fn mail_set_change(
     lookup: &dyn EventLookup,
     uidvalidity: u32,
@@ -248,50 +296,14 @@ async fn entry_placement(
     }
 }
 
-/// Record one entry placement for `element_id`.
-///
-/// The placement joins the element's existing placements, deduplicated by
-/// `mailbox_list_id`; a missing entry starts one. Returns `false` when no
-/// placement was added — the element's mail was deleted in the same batch
-/// or the mailbox already has a placement — in which case the event
-/// counts as skipped.
-fn add_placement(
-    actions: &mut HashMap<String, MailAction>,
-    element_id: &str,
-    placement: MailPlacement,
-) -> bool {
-    if let Some(MailAction::Delete) = actions.get(element_id) {
-        // A mail deleted in the same batch stays deleted.
-        return false;
-    }
-    if let Some(MailAction::Placements(placements)) = actions.get_mut(element_id) {
-        // The first placement per mailbox wins, like the lookup's own
-        // dedupe; a repeat adds nothing and counts as skipped.
-        if placements
-            .iter()
-            .any(|stored| stored.mailbox_list_id == placement.mailbox_list_id)
-        {
-            return false;
-        }
-        placements.push(placement);
-        return true;
-    }
-    // No action yet: this entry starts one.
-    actions.insert(
-        element_id.to_string(),
-        MailAction::Placements(vec![placement]),
-    );
-    true
-}
-
 /// Turn one coalesced action into its state changes.
 ///
 /// A deleted mail, or one the lookup reports without any placement, loses
 /// every stored row. A placed mail is upserted once per placement and
 /// every placement outside the reported mailboxes is removed. One action
-/// never mixes the two outcomes; a removal and an upsert for the same
-/// mail from different actions (a delete plus a late entry create) is
-/// settled by `apply_batch`, which runs removals after upserts.
+/// never mixes the two outcomes; a removal here and an entry's upsert of
+/// the same mail (a delete next to an entry create) are settled by
+/// `apply_batch`, which runs removals after upserts.
 fn action_changes(element_id: String, action: MailAction) -> Vec<StateChange> {
     match action {
         MailAction::Delete => vec![StateChange::RemoveHeaderEverywhere { element_id }],

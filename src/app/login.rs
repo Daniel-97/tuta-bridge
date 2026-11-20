@@ -30,6 +30,12 @@ impl LoginUseCase {
     }
 
     pub async fn execute(&self, email: Option<String>) -> Result<AccountInfo> {
+        // 0. Load the configuration first: an unreadable config must fail
+        //    the login before a server session or a keyring entry exists,
+        //    not after, when both would be left behind.
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| crate::domain::Error::Config(e.to_string()))?;
+
         // 1. Get mail address (prompt or argument), then normalize.
         let mail = match email {
             Some(e) => e,
@@ -59,8 +65,23 @@ impl LoginUseCase {
             encrypted_passphrase_key: new.encrypted_passphrase_key,
         };
 
-        // 6. Resume the session and read account info.
-        let session = self.factory.resume(&credentials).await?;
+        // 6. Resume the session and read account info. If the fresh session
+        //    cannot be resumed nothing can close it later, so remove it
+        //    best-effort (warn only) and return the resume error.
+        let session = match self.factory.resume(&credentials).await {
+            Ok(session) => session,
+            Err(e) => {
+                if self
+                    .factory
+                    .discard(&credentials.access_token)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("server session close failed");
+                }
+                return Err(e);
+            }
+        };
         let info = session.account();
 
         // 7. Persist credentials in the secret store. On failure, close the
@@ -76,8 +97,6 @@ impl LoginUseCase {
         // 8. Update config with the active account. On failure, clean up the
         //    stored credentials, close the session best-effort, then return the
         //    config error.
-        let mut config = Config::load(&self.config_path)
-            .map_err(|e| crate::domain::Error::Config(e.to_string()))?;
         config.active_account = Some(mail);
         if let Err(e) = config
             .save(&self.config_path)

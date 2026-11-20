@@ -11,17 +11,27 @@
 //! Two disciplines shape the flow:
 //!
 //! * **Snapshot validity** (the Proton Bridge lesson): a `Selected`
-//!   session compares its UIDVALIDITY with the store's before every
-//!   command that could act on it and, on mismatch, sends one fixed
-//!   untagged BYE and closes — the client must reconnect. NOOP drains
-//!   the mailbox-change broadcast, so polling clients see `* <n>`
-//!   EXISTS updates without IDLE, and a lagged receiver treats
-//!   "everything may have changed" literally. IDLE (RFC 2177) pushes
-//!   the same drain live: it answers `+ idling`, flushes whatever
-//!   queued at the boundary so no update is lost, and waits on the
-//!   command reader and the watcher at once — `DONE` ends it with the
-//!   tagged OK, LOGOUT behaves as always, and any other command
-//!   answers BAD and returns to normal dispatch.
+//!   session holds its own view of the mailbox — the mailbox id, its
+//!   UIDVALIDITY, and the `(uid, unread)` list whose positions are the
+//!   message sequence numbers the client knows. Before every command
+//!   that could act on it the session compares the UIDVALIDITY with the
+//!   store's and, on a mismatch or a vanished mailbox, sends one fixed
+//!   untagged BYE and closes — the client must reconnect. FETCH and
+//!   SEARCH resolve numbers against the session's view, never the live
+//!   store, so a number always names the message the client means.
+//!
+//! * **Announced changes**: the view moves only where RFC 3501 lets a
+//!   server announce it — NOOP, CHECK, and IDLE, never during FETCH,
+//!   STORE, or SEARCH (§7.4.1). There the session compares its view
+//!   with the store and sends `* <n> EXPUNGE` for every message that
+//!   left (highest number first), `* <n> EXISTS` when any arrived, and
+//!   `* <n> FETCH (FLAGS (...))` for every read-state change. IDLE
+//!   (RFC 2177) pushes the same comparison live: it answers `+ idling`,
+//!   compares at once so nothing is lost at the boundary, and waits on
+//!   the command reader and the mailbox-change broadcast together —
+//!   `DONE` ends it with the tagged OK, LOGOUT behaves as always, and
+//!   any other command answers BAD and returns to normal dispatch. A
+//!   lagged receiver treats "everything may have changed" literally.
 //!
 //! * **Log hygiene**: the session logs with `tracing::debug!` only, with
 //!   tag, command, and count fields — the tag only after the same
@@ -30,7 +40,11 @@
 //!   credentials, and argument vectors never reach a log line, and no
 //!   `Debug` printing exists for the types that carry them.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use secrecy::SecretString;
 use tokio::io::{
@@ -38,10 +52,14 @@ use tokio::io::{
     BufReader, BufWriter,
 };
 use tokio::sync::broadcast;
+use tokio::time::{sleep, sleep_until, timeout_at, Instant, Sleep};
 
-use super::codec::{self, BodySection, FetchItem, ImapArg, Request, SeqSet};
+use super::codec::{self, BodySection, FetchItem, ImapArg, Request};
+use super::render;
+use super::search;
+use crate::domain::MailboxId;
 use crate::domain::{Error, Result};
-use crate::ports::imap_backend::{FetchResponse, ImapBackend, MailboxView};
+use crate::ports::imap_backend::{FetchResponse, ImapBackend};
 use crate::ports::mailbox_events::MailboxChanged;
 
 /// The capability set the greeting, the CAPABILITY responses, and the
@@ -50,9 +68,18 @@ use crate::ports::mailbox_events::MailboxChanged;
 /// LOGIN is always available.
 const CAPABILITIES: &str = "IMAP4rev1 IDLE ID";
 
+/// The text of the connection's own io error.
+const IO_FAILED: &str = "imap connection io failed";
+
 /// A fixed io error: connection failures carry no client data.
 fn io_failed(_: std::io::Error) -> Error {
-    Error::Network("imap connection io failed".into())
+    Error::Network(IO_FAILED.into())
+}
+
+/// Whether `error` is the connection failing rather than a command
+/// failing: nothing more can be said to this client.
+fn connection_failed(error: &Error) -> bool {
+    matches!(error, Error::Network(message) if message == IO_FAILED)
 }
 
 /// Bodies are written through the response writer in chunks of this
@@ -60,10 +87,17 @@ fn io_failed(_: std::io::Error) -> Error {
 /// whole (the backend already holds at most one in memory).
 const BODY_CHUNK: usize = 64 * 1024;
 
-/// A client literal announcement beyond this bound is refused without a
-/// continuation and the session ends: `pending_literal` parses `usize`,
-/// so the guard exists to bound the allocation, not the parse.
+/// The literal bytes one command may carry once the client has logged
+/// in: an announcement that would take the command past it is refused
+/// without a continuation and the session ends. `pending_literal`
+/// parses `usize`, so the guard exists to bound the allocation, not
+/// the parse.
 const MAX_LITERAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// The literal bytes one command may carry before login. The only
+/// literals a client has reason to send then are a user name and a
+/// password.
+const MAX_PRE_AUTH_LITERAL_BYTES: usize = 4 * 1024;
 
 /// A command line beyond this bound is refused, and the read is
 /// bounded with it: lines are scanned window by window and discarded
@@ -71,6 +105,147 @@ const MAX_LITERAL_BYTES: usize = 16 * 1024 * 1024;
 /// whole. Message bodies arrive through literals, never through a
 /// line.
 const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// The untagged BYE a connection that waited too long is closed with.
+const TIMEOUT_BYE: &str = "* BYE idle for too long; closing connection";
+
+/// The time bounds of one connection. Every wait on the client is
+/// bounded, so an unresponsive or hostile peer costs one task for a
+/// limited time and nothing more.
+#[derive(Clone)]
+pub struct SessionLimits {
+    /// How long a connection may stay unauthenticated, measured from
+    /// the greeting — the whole phase, not each command, so trickling
+    /// bytes buys nothing.
+    pub pre_auth_timeout: Duration,
+    /// How long an authenticated session may wait for its next command,
+    /// and how long one IDLE may run. RFC 3501 §5.4 requires at least
+    /// 30 minutes of inactivity before an autologout, and RFC 2177 has
+    /// clients re-issue IDLE at least every 29 minutes for that reason.
+    pub idle_timeout: Duration,
+    /// How long one write may make no progress: a client that stops
+    /// reading its socket ends the session instead of pinning it.
+    pub write_timeout: Duration,
+    /// The literal bytes one command may carry before login, all of
+    /// its literals together.
+    pub pre_auth_literal_bytes: usize,
+    /// The same bound once logged in.
+    pub command_literal_bytes: usize,
+    /// How long a failed LOGIN waits before it is answered.
+    pub login_failure_delay: Duration,
+    /// Failed LOGINs after which the connection is closed.
+    pub max_login_attempts: u32,
+    /// Held while a failed LOGIN waits out its delay. Sessions cloned
+    /// from the same limits share it, so the delays of one listener's
+    /// connections run one after the other: opening more connections
+    /// does not buy more password guesses per second.
+    pub login_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self {
+            pre_auth_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(30 * 60),
+            write_timeout: Duration::from_secs(60),
+            pre_auth_literal_bytes: MAX_PRE_AUTH_LITERAL_BYTES,
+            command_literal_bytes: MAX_LITERAL_BYTES,
+            login_failure_delay: Duration::from_secs(3),
+            max_login_attempts: 3,
+            login_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+/// A writer whose every operation fails once it has made no progress
+/// for `limit`: the peer is not reading, and the session ends on the
+/// io error.
+struct StallGuard<W> {
+    inner: W,
+    limit: Duration,
+    /// Armed while an operation is pending; reset on every progress.
+    stalled: Option<Pin<Box<Sleep>>>,
+}
+
+impl<W> StallGuard<W> {
+    fn new(inner: W, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            stalled: None,
+        }
+    }
+
+    /// Fold the stall timer into one poll result: progress disarms it,
+    /// a pending operation arms it (once) and fails when it fires.
+    fn guard<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        polled: Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        if polled.is_ready() {
+            self.stalled = None;
+            return polled;
+        }
+        let limit = self.limit;
+        let timer = self.stalled.get_or_insert_with(|| Box::pin(sleep(limit)));
+        match timer.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                self.stalled = None;
+                Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for StallGuard<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.guard(cx, polled)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        self.guard(cx, polled)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.guard(cx, polled)
+    }
+}
+
+/// The most rendered bytes a session keeps between the chunks of a
+/// partial fetch — the same figure that bounds a client literal.
+const MAX_PARTIAL_CACHE_BYTES: usize = MAX_LITERAL_BYTES;
+
+/// How long those bytes are kept after they were rendered.
+const PARTIAL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The sections of the one message a session is being asked for in
+/// pieces.
+///
+/// A client that downloads a large message with `BODY[]<offset.count>`
+/// sends one FETCH per chunk, and every one of them would download,
+/// decrypt, and render the whole message again. The session therefore
+/// keeps the sections of the last message fetched that way — in memory
+/// only, one message at most, bounded in size and age, and gone with
+/// the session or its selected mailbox. Whole-body fetches never read
+/// or fill it, and nothing is ever written to disk.
+struct PartialCache {
+    mailbox: MailboxId,
+    uid: u32,
+    rendered_at: Instant,
+    sections: Vec<(BodySection, Vec<u8>)>,
+}
+
+/// The untagged BYE a session that hit an internal error ends with.
+const INTERNAL_BYE: &str = "* BYE internal error; reconnect";
 
 /// The untagged BYE a stale snapshot sends before closing.
 const RESYNC_BYE: &str = "* BYE mailbox state was resynced; reconnect";
@@ -84,10 +259,19 @@ enum State {
     NotAuthenticated,
     Authenticated,
     Selected {
-        view: MailboxView,
-        exists: usize,
-        unseen: usize,
+        /// The mailbox, addressed by id from here on: its name is
+        /// never resolved again.
+        mailbox: MailboxId,
+        /// Opened with EXAMINE rather than SELECT. Every write is
+        /// refused today whichever it was; the flag is recorded so a
+        /// write-capable server can refuse them on an EXAMINEd mailbox.
+        #[allow(dead_code)]
+        read_only: bool,
         uidvalidity: u32,
+        /// The session's view: `(uid, unread)` in ascending UID order.
+        /// Position + 1 is the message sequence number the client
+        /// knows; it changes only at the announced sync points.
+        messages: Vec<(u32, bool)>,
     },
 }
 
@@ -111,6 +295,10 @@ struct Session {
     state: State,
     backend: Arc<dyn ImapBackend>,
     watch: broadcast::Receiver<MailboxChanged>,
+    limits: SessionLimits,
+    /// Failed LOGINs on this connection so far.
+    failed_logins: u32,
+    partial_cache: Option<PartialCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,29 +306,57 @@ struct Session {
 // ---------------------------------------------------------------------------
 
 /// Serve one IMAP session over `stream` until the client logs out, the
-/// snapshot goes stale, or the stream ends.
+/// snapshot goes stale, a time bound of `limits` runs out, or the
+/// stream ends.
 pub async fn run_session<S>(
     stream: S,
     backend: Arc<dyn ImapBackend>,
     watch: broadcast::Receiver<MailboxChanged>,
+    limits: SessionLimits,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, writer) = split(stream);
     let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
+    let mut writer = BufWriter::new(StallGuard::new(writer, limits.write_timeout));
+    let pre_auth_deadline = Instant::now() + limits.pre_auth_timeout;
     let mut session = Session {
         state: State::NotAuthenticated,
         backend,
         watch,
+        limits,
+        failed_logins: 0,
+        partial_cache: None,
     };
 
     write_line(&mut writer, &greeting()).await?;
     writer.flush().await.map_err(io_failed)?;
 
     loop {
-        match read_request(&mut reader, &mut writer).await? {
+        // Every wait for a command is bounded: the whole
+        // unauthenticated phase by one deadline, each later command by
+        // the inactivity timeout.
+        // So is the memory a command may claim, with far less
+        // granted to a client that has not logged in.
+        let (deadline, literal_budget) = if session.state.authenticated() {
+            (
+                Instant::now() + session.limits.idle_timeout,
+                session.limits.command_literal_bytes,
+            )
+        } else {
+            (pre_auth_deadline, session.limits.pre_auth_literal_bytes)
+        };
+        let reading = read_request(&mut reader, &mut writer, literal_budget);
+        let incoming = match timeout_at(deadline, reading).await {
+            Ok(incoming) => incoming?,
+            Err(_) => {
+                tracing::debug!("connection timed out waiting for a command");
+                write_line(&mut writer, TIMEOUT_BYE).await?;
+                break;
+            }
+        };
+        match incoming {
             Incoming::Eof => break,
             Incoming::Invalid(tag) => {
                 write_line(&mut writer, &format!("{tag} BAD invalid command")).await?;
@@ -150,7 +366,23 @@ where
                 break;
             }
             Incoming::Request(request) => {
-                let flow = session.dispatch(&mut reader, &mut writer, request).await?;
+                let flow = match session.dispatch(&mut reader, &mut writer, request).await {
+                    Ok(flow) => flow,
+                    Err(error) if connection_failed(&error) => return Err(error),
+                    // A failure outside any command's own NO — the
+                    // store could not be read while validating the
+                    // snapshot or announcing changes. The session can
+                    // no longer vouch for its view, so it ends, but
+                    // the client is told to reconnect rather than
+                    // left with a dropped connection.
+                    Err(error) => {
+                        tracing::warn!("imap session ended on an internal error");
+                        let _ = write_line(&mut writer, INTERNAL_BYE).await;
+                        let _ = writer.flush().await;
+                        let _ = writer.shutdown().await;
+                        return Err(error);
+                    }
+                };
                 if matches!(flow, Flow::Close) {
                     break;
                 }
@@ -184,39 +416,63 @@ enum Incoming {
     Eof,
 }
 
-/// Read one full command: the line, every announced literal (continuation
-/// `+ `, exact byte count, continuation line), and nothing else.
+/// Read one full command: its first line, and for every announced
+/// literal the continuation `+ `, the exact byte count, and the line
+/// that follows. The whole command is tokenized once it is complete.
 ///
 /// A line beyond [`MAX_LINE_BYTES`] is refused exactly as it always
 /// was, but never buffered whole: the bounded read scans the stream
 /// window by window and discards a line once it crosses the cap. A
-/// literal that never arrives is an EOF: the client is gone. A tail
-/// line that fails to parse answers BAD with the command's own tag.
-async fn read_request<R, W>(reader: &mut R, writer: &mut W) -> Result<Incoming>
+/// literal that never arrives is an EOF: the client is gone. A line
+/// that can never be part of a valid command answers BAD before any
+/// continuation is sent, with the command's own tag.
+///
+/// `literal_budget` bounds the memory a multi-line command may claim,
+/// not each literal: every line that announces a literal is charged
+/// with its own length plus the announced byte count — at least one
+/// byte, so a chain of `{0}` literals is charged too. An announcement
+/// that would exceed what is left is refused before its continuation,
+/// so the command held in memory never exceeds the budget plus its one
+/// final line, which [`MAX_LINE_BYTES`] bounds.
+async fn read_request<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    mut literal_budget: usize,
+) -> Result<Incoming>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut bytes = Vec::new();
-    let mut line = match read_line(reader, &mut bytes).await? {
-        Some(LineRead::Line(line)) => line,
-        // An over-cap line: the fixed refusal, with the connection
-        // left at the start of the next line.
-        Some(LineRead::TooLong) => return Ok(Incoming::Invalid("*".into())),
-        None => return Ok(Incoming::Eof),
-    };
-    let mut request = match codec::parse_line(&line) {
-        Ok(request) => request,
-        Err(_) => return Ok(Incoming::Invalid(bad_tag(&line))),
-    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut literals: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let line = match read_line(reader, &mut bytes).await? {
+            Some(LineRead::Line(line)) => line,
+            // An over-cap line: the fixed refusal, with the connection
+            // left at the start of the next line.
+            Some(LineRead::TooLong) => return Ok(Incoming::Invalid(command_tag(&lines))),
+            None => return Ok(Incoming::Eof),
+        };
+        let pending = codec::pending_literal(&line);
+        let line_bytes = line.len();
+        lines.push(line);
+        let count = match pending {
+            Ok(Some(count)) => count,
+            Ok(None) => break,
+            Err(_) => return Ok(Incoming::Invalid(command_tag(&lines))),
+        };
 
-    // A client literal: answer the continuation, read the announced
-    // bytes exactly, fill the placeholder, and parse the rest of the
-    // line — which may announce the next literal.
-    while let Some(count) = codec::pending_literal(&line) {
-        if count > MAX_LITERAL_BYTES {
-            return Ok(Incoming::LiteralTooLarge(request.tag.clone()));
-        }
+        // A client literal: answer the continuation and read the
+        // announced bytes exactly; the rest of the command follows on
+        // the next line, which may announce another literal. The line
+        // just kept and the literal are both held until the command
+        // ends, so both are charged — an empty literal included.
+        let charge = line_bytes.saturating_add(count.max(1));
+        literal_budget = match literal_budget.checked_sub(charge) {
+            Some(left) => left,
+            None => return Ok(Incoming::LiteralTooLarge(command_tag(&lines))),
+        };
         write_line(writer, "+ ").await?;
         writer.flush().await.map_err(io_failed)?;
 
@@ -224,25 +480,20 @@ where
         if reader.read_exact(&mut data).await.is_err() {
             return Ok(Incoming::Eof);
         }
-        // The marker is always the last argument so far; fill it.
-        for arg in request.args.iter_mut().rev() {
-            if let ImapArg::Literal(slot) = arg {
-                *slot = data;
-                break;
-            }
-        }
-
-        // The rest of the line follows the literal bytes.
-        line = match read_line(reader, &mut bytes).await? {
-            Some(LineRead::Line(line)) => line,
-            Some(LineRead::TooLong) => return Ok(Incoming::Invalid(request.tag.clone())),
-            None => return Ok(Incoming::Eof),
-        };
-        if codec::parse_continuation(&line, &mut request.args).is_err() {
-            return Ok(Incoming::Invalid(request.tag.clone()));
-        }
+        literals.push(data);
     }
-    Ok(Incoming::Request(request))
+    match codec::parse_command(&lines, literals) {
+        Ok(request) => Ok(Incoming::Request(request)),
+        Err(_) => Ok(Incoming::Invalid(command_tag(&lines))),
+    }
+}
+
+/// The tag a refused command is answered with: the first token of its
+/// first line when that is safe to echo, `*` otherwise.
+fn command_tag(lines: &[String]) -> String {
+    lines
+        .first()
+        .map_or_else(|| "*".to_string(), |line| bad_tag(line))
 }
 
 /// What one bounded line read produced.
@@ -420,6 +671,55 @@ fn bad_tag(line: &str) -> String {
 /// client bytes.
 const INVALID_LOG_TAG: &str = "<invalid>";
 
+/// Every command the session dispatches on, as the log may name it.
+const KNOWN_COMMANDS: &[&str] = &[
+    "CAPABILITY",
+    "NOOP",
+    "ID",
+    "LOGOUT",
+    "LOGIN",
+    "SELECT",
+    "EXAMINE",
+    "LIST",
+    "LSUB",
+    "STATUS",
+    "FETCH",
+    "UID FETCH",
+    "SEARCH",
+    "UID SEARCH",
+    "CHECK",
+    "CLOSE",
+    "IDLE",
+    "STORE",
+    "APPEND",
+    "EXPUNGE",
+    "COPY",
+    "MOVE",
+    "CREATE",
+    "DELETE",
+    "RENAME",
+    "SUBSCRIBE",
+    "UNSUBSCRIBE",
+    "UID STORE",
+    "UID COPY",
+];
+
+/// The placeholder logged for a command the session does not know.
+const UNKNOWN_LOG_COMMAND: &str = "<unknown>";
+
+/// The command as it may appear in a log line: its fixed name when the
+/// session knows it, a fixed placeholder otherwise. The command token
+/// is client input like any other — a client that pipelines a literal
+/// the server refused has its next line, credentials included, parsed
+/// as a command — so it is never logged as received.
+fn log_command(verb: &str) -> &'static str {
+    KNOWN_COMMANDS
+        .iter()
+        .copied()
+        .find(|known| *known == verb)
+        .unwrap_or(UNKNOWN_LOG_COMMAND)
+}
+
 /// The tag as it may appear in a log line: itself when it passes
 /// [`tag_is_safe`], a fixed placeholder otherwise. The wire never
 /// changes — this is the log field only.
@@ -472,10 +772,12 @@ impl Session {
     {
         let Request { tag, command, args } = request;
         let command = command.to_ascii_uppercase();
+        let verb = normalize(&command, &args);
         // The logged tag passes the same printable-ASCII gate a BAD
-        // response applies; a tag that fails it logs a fixed
+        // response applies, and the command is logged only when it is
+        // one the session knows; anything else logs a fixed
         // placeholder, so raw client bytes never reach a log line.
-        tracing::debug!(tag = %log_tag(&tag), command = %command, "imap command");
+        tracing::debug!(tag = %log_tag(&tag), command = log_command(&verb), "imap command");
 
         // Snapshot validity: a Selected session never acts on a stale
         // view. SELECT/EXAMINE replace it, CLOSE drops it, LOGOUT ends
@@ -488,7 +790,6 @@ impl Session {
             return Ok(Flow::Close);
         }
 
-        let verb = normalize(&command, &args);
         // IDLE is served here rather than in dispatch_command because
         // its DONE loop reads from the connection.
         if verb == "IDLE" {
@@ -505,6 +806,9 @@ impl Session {
         let flow = self.dispatch_command(writer, &tag, &verb, &args).await;
         match flow {
             Ok(flow) => Ok(flow),
+            // A dead or stalled connection is not answered: a second
+            // write would only wait out the same timeout again.
+            Err(error) if connection_failed(&error) => Err(error),
             Err(error) => {
                 let text = match &error {
                     Error::Unsupported(message) => message.clone(),
@@ -529,11 +833,8 @@ impl Session {
                 write_line(writer, &format!("{tag} OK CAPABILITY completed")).await?;
             }
             "NOOP" => {
-                if self.state.selected() {
-                    let flow = self.flush_notifications(writer).await?;
-                    if matches!(flow, Flow::Close) {
-                        return Ok(flow);
-                    }
+                if matches!(self.announce_changes(writer).await?, Flow::Close) {
+                    return Ok(Flow::Close);
                 }
                 write_line(writer, &format!("{tag} OK NOOP completed")).await?;
             }
@@ -549,7 +850,7 @@ impl Session {
             }
             "LOGIN" => {
                 if matches!(self.state, State::NotAuthenticated) {
-                    self.handle_login(writer, tag, args).await?;
+                    return self.handle_login(writer, tag, args).await;
                 } else {
                     write_line(
                         writer,
@@ -634,6 +935,9 @@ impl Session {
             }
             "CHECK" => {
                 if self.state.selected() {
+                    if matches!(self.announce_changes(writer).await?, Flow::Close) {
+                        return Ok(Flow::Close);
+                    }
                     write_line(writer, &format!("{tag} OK CHECK completed")).await?;
                 } else {
                     write_line(
@@ -646,6 +950,7 @@ impl Session {
             "CLOSE" => {
                 if self.state.selected() {
                     self.state = State::Authenticated;
+                    self.partial_cache = None;
                     write_line(writer, &format!("{tag} OK CLOSE completed")).await?;
                 } else {
                     write_line(
@@ -686,10 +991,10 @@ impl Session {
         writer: &mut W,
         tag: &str,
         args: &[ImapArg],
-    ) -> Result<()> {
+    ) -> Result<Flow> {
         if args.len() != 2 {
             write_line(writer, &format!("{tag} BAD invalid LOGIN")).await?;
-            return Ok(());
+            return Ok(Flow::Continue);
         }
         let user = arg_string(&args[0]);
         let password = SecretString::new(arg_string(&args[1]).into_boxed_str());
@@ -700,10 +1005,25 @@ impl Session {
                 &format!("{tag} OK [CAPABILITY {CAPABILITIES}] LOGIN completed"),
             )
             .await?;
-        } else {
-            write_line(writer, &format!("{tag} NO authentication failed")).await?;
+            return Ok(Flow::Continue);
         }
-        Ok(())
+
+        // A failed login: logged with its count and nothing the client
+        // sent, answered only after a delay that all connections of the
+        // listener wait out one at a time, and tolerated a few times
+        // per connection.
+        self.failed_logins += 1;
+        tracing::warn!(attempt = self.failed_logins, "imap login failed");
+        {
+            let _gate = self.limits.login_gate.lock().await;
+            sleep(self.limits.login_failure_delay).await;
+        }
+        write_line(writer, &format!("{tag} NO authentication failed")).await?;
+        if self.failed_logins >= self.limits.max_login_attempts {
+            write_line(writer, "* BYE too many failed logins").await?;
+            return Ok(Flow::Close);
+        }
+        Ok(Flow::Continue)
     }
 
     // -- SELECT / EXAMINE -------------------------------------------------
@@ -734,17 +1054,18 @@ impl Session {
             .await?;
             return Ok(());
         };
-        let name = arg_string(name_arg);
+        let name = mailbox_name(name_arg);
         let Some(selected) = self.backend.select(&name).await? else {
             write_line(writer, &format!("{tag} NO no such mailbox")).await?;
             return Ok(());
         };
 
         write_line(writer, "* FLAGS (\\Seen)").await?;
-        write_line(writer, &format!("* {} EXISTS", selected.exists)).await?;
+        let (exists, first_unseen) = (selected.messages.len(), selected.first_unseen());
+        write_line(writer, &format!("* {exists} EXISTS")).await?;
         write_line(writer, "* 0 RECENT").await?;
-        if selected.unseen > 0 {
-            write_line(writer, &format!("* OK [UNSEEN {}]", selected.unseen)).await?;
+        if let Some(first_unseen) = first_unseen {
+            write_line(writer, &format!("* OK [UNSEEN {first_unseen}]")).await?;
         }
         write_line(writer, "* OK [PERMANENTFLAGS ()] Read-only mailbox").await?;
         write_line(
@@ -755,15 +1076,20 @@ impl Session {
         write_line(writer, &format!("* OK [UIDNEXT {}]", selected.uidnext)).await?;
 
         tracing::debug!(
-            exists = selected.exists,
-            unseen = selected.unseen,
+            exists,
+            unseen = selected.unseen(),
+            read_only = examine,
             "mailbox selected"
         );
+        // Notifications queued before this view was taken are already
+        // part of it, and bytes kept for the previous mailbox go.
+        self.drain_notifications();
+        self.partial_cache = None;
         self.state = State::Selected {
-            view: selected.view,
-            exists: selected.exists,
-            unseen: selected.unseen,
+            mailbox: selected.view.id,
+            read_only: examine,
             uidvalidity: selected.uidvalidity,
+            messages: selected.messages,
         };
         let (code, verb) = if examine {
             ("READ-ONLY", "EXAMINE")
@@ -788,13 +1114,21 @@ impl Session {
             write_line(writer, &format!("{tag} BAD invalid {verb}")).await?;
             return Ok(());
         }
-        // The reference is the root in this flat store; only the pattern
-        // decides what lists.
-        let pattern = arg_string(&args[1]);
-        let views = self.backend.mailboxes().await?;
         let keyword = if lsub { "LSUB" } else { "LIST" };
+        let (reference, pattern) = (mailbox_name(&args[0]), mailbox_name(&args[1]));
+        if pattern.is_empty() {
+            // RFC 3501 §6.3.8: an empty pattern asks for the hierarchy
+            // delimiter and the root of the reference, nothing else.
+            write_line(writer, &format!("* {keyword} (\\Noselect) \"/\" \"\"")).await?;
+            write_line(writer, &format!("{tag} OK {keyword} completed")).await?;
+            return Ok(());
+        }
+        // The reference is a prefix of the names the pattern is
+        // matched against.
+        let pattern = format!("{reference}{pattern}");
+        let views = self.backend.mailboxes().await?;
         for view in &views {
-            if !pattern_matches(&pattern, &view.name) {
+            if !list_matches(&pattern, &view.name) {
                 continue;
             }
             write_line(
@@ -802,7 +1136,7 @@ impl Session {
                 &format!(
                     "* {keyword} ({}) \"/\" {}",
                     view.special_use,
-                    qs(&view.name)
+                    wire_mailbox(&view.name)
                 ),
             )
             .await?;
@@ -826,15 +1160,19 @@ impl Session {
                 return Ok(());
             }
         };
-        let items = match items_arg {
-            ImapArg::Raw(inner) => inner
-                .split_whitespace()
-                .map(|item| item.to_ascii_uppercase())
-                .collect::<Vec<String>>(),
-            _ => {
-                write_line(writer, &format!("{tag} BAD invalid STATUS")).await?;
-                return Ok(());
-            }
+        let items: Option<Vec<String>> = match items_arg {
+            ImapArg::List(list) => list
+                .iter()
+                .map(|item| match item {
+                    ImapArg::Atom(item) => Some(item.to_ascii_uppercase()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        };
+        let Some(items) = items else {
+            write_line(writer, &format!("{tag} BAD invalid STATUS")).await?;
+            return Ok(());
         };
         for item in &items {
             if !matches!(
@@ -845,7 +1183,7 @@ impl Session {
                 return Ok(());
             }
         }
-        let name = arg_string(name_arg);
+        let name = mailbox_name(name_arg);
         let Some(selected) = self.backend.select(&name).await? else {
             write_line(writer, &format!("{tag} NO no such mailbox")).await?;
             return Ok(());
@@ -854,11 +1192,11 @@ impl Session {
             .iter()
             .filter_map(|item| {
                 let value = match item.as_str() {
-                    "MESSAGES" => selected.exists.to_string(),
+                    "MESSAGES" => selected.messages.len().to_string(),
                     "RECENT" => "0".to_string(),
                     "UIDNEXT" => selected.uidnext.to_string(),
                     "UIDVALIDITY" => selected.uidvalidity.to_string(),
-                    "UNSEEN" => selected.unseen.to_string(),
+                    "UNSEEN" => selected.unseen().to_string(),
                     _ => return None,
                 };
                 Some(format!("{item} {value}"))
@@ -866,7 +1204,11 @@ impl Session {
             .collect();
         write_line(
             writer,
-            &format!("* STATUS {} ({})", qs(&selected.view.name), pairs.join(" ")),
+            &format!(
+                "* STATUS {} ({})",
+                wire_mailbox(&selected.view.name),
+                pairs.join(" ")
+            ),
         )
         .await?;
         write_line(writer, &format!("{tag} OK STATUS completed")).await?;
@@ -893,7 +1235,7 @@ impl Session {
                 return Ok(());
             }
         };
-        let mut items = match codec::parse_fetch_items(&join_args(&args[1.min(args.len())..])) {
+        let mut items = match codec::parse_fetch_items(&args[1.min(args.len())..]) {
             Ok(items) => items,
             Err(_) => {
                 write_line(writer, &format!("{tag} BAD invalid fetch items")).await?;
@@ -906,41 +1248,39 @@ impl Session {
             items.push(FetchItem::Uid);
         }
 
-        let mailbox = match &self.state {
-            State::Selected { view, .. } => view.id,
-            _ => {
-                write_line(
-                    writer,
-                    &format!("{tag} BAD command not valid in this state"),
-                )
-                .await?;
-                return Ok(());
-            }
+        // The session's view is the message order the client knows:
+        // position + 1 is the message sequence number, and the last
+        // uid is the `*` of a UID set.
+        let Some((mailbox, uids)) = self.selected_view() else {
+            write_line(
+                writer,
+                &format!("{tag} BAD command not valid in this state"),
+            )
+            .await?;
+            return Ok(());
         };
-        // The uid list is the mailbox's message order: position + 1 is
-        // the message sequence number, and the last uid is the `*`.
-        let uids = self.backend.search(mailbox, &[String::from("ALL")]).await?;
         let max_uid = uids.last().copied().unwrap_or(0);
 
         for (index, uid) in uids.iter().enumerate() {
             let msn = u32::try_from(index + 1).unwrap_or(u32::MAX);
             let selected = if uid_command {
-                number_selected(&set, *uid, max_uid)
+                set.contains(*uid, max_uid)
             } else {
-                number_selected(&set, msn, u32::try_from(uids.len()).unwrap_or(u32::MAX))
+                set.contains(msn, u32::try_from(uids.len()).unwrap_or(u32::MAX))
             };
             if !selected {
                 continue;
             }
-            // An expunged uid answers nothing (the Proton Bridge
-            // lesson for mid-session expunges) and so does a uid whose
+            // A uid the store no longer has answers nothing — its
+            // EXPUNGE waits for the next sync point, since none may be
+            // sent during a FETCH — and so does a uid whose
             // details cannot be loaded: one poisoned row must not
             // abort the whole `UID FETCH 1:*` — no FETCH line for it,
             // the rest of the loop continues, and the row disappears
             // on the next sync or event. An Unsupported refusal is a
             // verdict about the request itself, not about one row: it
             // fails every uid identically and stays fatal.
-            let mut response = match self.backend.fetch(mailbox, *uid, &items).await {
+            let mut response = match self.fetch_one(mailbox, *uid, &items).await {
                 Ok(Some(response)) => response,
                 Ok(None) => continue,
                 Err(error @ Error::Unsupported(_)) => return Err(error),
@@ -964,6 +1304,100 @@ impl Session {
         Ok(())
     }
 
+    /// Fetch one message with its bodies cut to what was asked for.
+    ///
+    /// A request made only of partial body items is a chunked
+    /// download: its sections are kept in the session's
+    /// [`PartialCache`], and the following chunks of the same message
+    /// are cut from there, asking the backend for the metadata items
+    /// only. Everything else goes to the backend whole.
+    async fn fetch_one(
+        &mut self,
+        mailbox: MailboxId,
+        uid: u32,
+        items: &[FetchItem],
+    ) -> Result<Option<FetchResponse>> {
+        // The (section, partial) of every body item when all of them
+        // are partial; `None` for any other request.
+        let chunks: Option<Vec<(&BodySection, (u32, u32))>> = items
+            .iter()
+            .filter(|item| item.is_body())
+            .map(|item| match item {
+                FetchItem::Body {
+                    section,
+                    partial: Some(partial),
+                    ..
+                } => Some((section, *partial)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .filter(|chunks| !chunks.is_empty());
+
+        if self
+            .partial_cache
+            .as_ref()
+            .is_some_and(|cache| cache.rendered_at.elapsed() > PARTIAL_CACHE_TTL)
+        {
+            self.partial_cache = None;
+        }
+
+        // A later chunk of the message already rendered.
+        if let (Some(chunks), Some(cache)) = (&chunks, &self.partial_cache) {
+            let cut: Option<Vec<Vec<u8>>> = (cache.mailbox == mailbox && cache.uid == uid)
+                .then(|| {
+                    chunks
+                        .iter()
+                        .map(|(section, partial)| {
+                            cache
+                                .sections
+                                .iter()
+                                .find(|(cached, _)| cached == *section)
+                                .map(|(_, bytes)| {
+                                    bytes[partial_range(bytes.len(), Some(*partial))].to_vec()
+                                })
+                        })
+                        .collect()
+                })
+                .flatten();
+            if let Some(bodies) = cut {
+                let metadata: Vec<FetchItem> = items
+                    .iter()
+                    .filter(|item| !item.is_body())
+                    .cloned()
+                    .collect();
+                let Some(mut response) = self.backend.fetch(mailbox, uid, &metadata).await? else {
+                    self.partial_cache = None;
+                    return Ok(None);
+                };
+                response.bodies = bodies;
+                return Ok(Some(response));
+            }
+        }
+
+        let Some(mut response) = self.backend.fetch(mailbox, uid, items).await? else {
+            return Ok(None);
+        };
+        if let Some(chunks) = &chunks {
+            // The first chunk: keep the sections for the next ones,
+            // unless they are more than the session may hold.
+            let total: usize = response.bodies.iter().map(Vec::len).sum();
+            self.partial_cache = (total <= MAX_PARTIAL_CACHE_BYTES
+                && response.bodies.len() == chunks.len())
+            .then(|| PartialCache {
+                mailbox,
+                uid,
+                rendered_at: Instant::now(),
+                sections: chunks
+                    .iter()
+                    .zip(&response.bodies)
+                    .map(|((section, _), bytes)| ((*section).clone(), bytes.clone()))
+                    .collect(),
+            });
+        }
+        response.bodies = cut_partials(items, std::mem::take(&mut response.bodies));
+        Ok(Some(response))
+    }
+
     // -- SEARCH ----------------------------------------------------------
 
     async fn handle_search<W: AsyncWrite + Unpin>(
@@ -973,38 +1407,36 @@ impl Session {
         uid_command: bool,
         args: &[ImapArg],
     ) -> Result<()> {
-        let criteria = flatten_criteria(args);
-        if criteria.is_empty() {
+        if args.is_empty() {
             write_line(writer, &format!("{tag} BAD invalid SEARCH")).await?;
             return Ok(());
         }
-        let mailbox = match &self.state {
-            State::Selected { view, .. } => view.id,
-            _ => {
-                write_line(
-                    writer,
-                    &format!("{tag} BAD command not valid in this state"),
-                )
-                .await?;
-                return Ok(());
-            }
+        // A refused key or charset is a tagged NO with its fixed text.
+        let keys = search::parse_search(args)?;
+        let Some((mailbox, uids)) = self.selected_view() else {
+            write_line(
+                writer,
+                &format!("{tag} BAD command not valid in this state"),
+            )
+            .await?;
+            return Ok(());
         };
-        // The backend answers uids; a plain SEARCH reports the positions
-        // those uids occupy.
-        let uids = self.backend.search(mailbox, &[String::from("ALL")]).await?;
-        let matched = self.backend.search(mailbox, &criteria).await?;
-        let numbers: Vec<String> = if uid_command {
-            matched.iter().map(|uid| uid.to_string()).collect()
-        } else {
-            matched
-                .iter()
-                .filter_map(|uid| {
-                    uids.iter()
-                        .position(|known| known == uid)
-                        .map(|position| (position + 1).to_string())
-                })
-                .collect()
-        };
+        // The backend answers uids. Only messages of the session's
+        // view are reported — one the client has not been told about
+        // has no number yet — and a plain SEARCH reports the positions
+        // the uids occupy in that view.
+        let matched = self.backend.search(mailbox, &keys, &uids).await?;
+        let numbers: Vec<String> = matched
+            .iter()
+            .filter_map(|uid| uids.binary_search(uid).ok().map(|position| (position, uid)))
+            .map(|(position, uid)| {
+                if uid_command {
+                    uid.to_string()
+                } else {
+                    (position + 1).to_string()
+                }
+            })
+            .collect();
         let joined = numbers.join(" ");
         if joined.is_empty() {
             write_line(writer, "* SEARCH").await?;
@@ -1018,101 +1450,87 @@ impl Session {
 
     // -- Snapshot maintenance ----------------------------------------------
 
+    /// The selected mailbox and the uids of the session's view, in
+    /// message-number order; `None` outside the `Selected` state.
+    fn selected_view(&self) -> Option<(MailboxId, Vec<u32>)> {
+        match &self.state {
+            State::Selected {
+                mailbox, messages, ..
+            } => Some((*mailbox, messages.iter().map(|(uid, _)| *uid).collect())),
+            _ => None,
+        }
+    }
+
     /// Whether the selected snapshot still matches the store: the same
-    /// mailbox at the same UIDVALIDITY. A resynced or deleted mailbox is
-    /// stale.
+    /// mailbox id at the same UIDVALIDITY. A resynced, renamed, or
+    /// deleted mailbox is stale.
     async fn snapshot_is_current(&self) -> Result<bool> {
-        let (name, session_uidvalidity) = match &self.state {
+        let (mailbox, session_uidvalidity) = match &self.state {
             State::Selected {
-                view, uidvalidity, ..
-            } => (view.name.clone(), *uidvalidity),
-            _ => return Ok(true),
-        };
-        match self.backend.select(&name).await? {
-            Some(current) => Ok(current.uidvalidity == session_uidvalidity),
-            None => Ok(false),
-        }
-    }
-
-    /// Drain pending mailbox notifications. When one concerns the
-    /// selected mailbox — or the receiver lagged, which means everything
-    /// may have changed — the snapshot is re-checked with
-    /// [`Session::refresh_selected_snapshot`].
-    async fn flush_notifications<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<Flow> {
-        let mailbox = match &self.state {
-            State::Selected { view, .. } => view.id,
-            _ => return Ok(Flow::Continue),
-        };
-
-        let mut relevant = false;
-        loop {
-            match self.watch.try_recv() {
-                Ok(MailboxChanged(changed)) => relevant |= changed == mailbox,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => relevant = true,
-                Err(broadcast::error::TryRecvError::Empty)
-                | Err(broadcast::error::TryRecvError::Closed) => break,
-            }
-        }
-        if !relevant {
-            return Ok(Flow::Continue);
-        }
-        self.refresh_selected_snapshot(writer).await
-    }
-
-    /// Re-check the selected snapshot against the store in one
-    /// round-trip: a vanished mailbox or a moved UIDVALIDITY sends the
-    /// resync BYE and ends the session; a changed count is reported as
-    /// `* <n> EXISTS`; the session's counts refresh either way.
-    async fn refresh_selected_snapshot<W: AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-    ) -> Result<Flow> {
-        let (name, previous_exists, session_uidvalidity) = match &self.state {
-            State::Selected {
-                view,
-                exists,
+                mailbox,
                 uidvalidity,
                 ..
-            } => (view.name.clone(), *exists, *uidvalidity),
+            } => (*mailbox, *uidvalidity),
+            _ => return Ok(true),
+        };
+        Ok(self.backend.uidvalidity(mailbox).await? == Some(session_uidvalidity))
+    }
+
+    /// Empty the mailbox-change queue. The session compares its whole
+    /// view at every sync point, so the notifications themselves carry
+    /// nothing it still needs; draining only keeps the receiver from
+    /// lagging.
+    fn drain_notifications(&mut self) {
+        while !matches!(
+            self.watch.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed)
+        ) {}
+    }
+
+    /// One sync point: compare the session's view with the store and
+    /// announce every difference. A vanished mailbox or a moved
+    /// UIDVALIDITY sends the resync BYE and ends the session; otherwise
+    /// the client is told what left, whether anything arrived, and
+    /// which read states changed, and the view becomes the store's.
+    /// Outside the `Selected` state there is nothing to announce.
+    async fn announce_changes<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<Flow> {
+        let (mailbox, session_uidvalidity) = match &self.state {
+            State::Selected {
+                mailbox,
+                uidvalidity,
+                ..
+            } => (*mailbox, *uidvalidity),
             _ => return Ok(Flow::Continue),
         };
+        self.drain_notifications();
 
-        let Some(current) = self.backend.select(&name).await? else {
-            write_line(writer, RESYNC_BYE).await?;
-            return Ok(Flow::Close);
+        let current = match self.backend.snapshot(mailbox).await? {
+            Some(current) if current.uidvalidity == session_uidvalidity => current,
+            _ => {
+                write_line(writer, RESYNC_BYE).await?;
+                return Ok(Flow::Close);
+            }
         };
-        if current.uidvalidity != session_uidvalidity {
-            write_line(writer, RESYNC_BYE).await?;
-            return Ok(Flow::Close);
+        if let State::Selected { messages, .. } = &mut self.state {
+            let announcements = reconcile(messages, &current.messages);
+            tracing::debug!(
+                exists = messages.len(),
+                announced = announcements.len(),
+                "mailbox compared"
+            );
+            for line in announcements {
+                write_line(writer, &line).await?;
+            }
         }
-        if current.exists != previous_exists {
-            write_line(writer, &format!("* {} EXISTS", current.exists)).await?;
-        }
-        if let State::Selected {
-            exists,
-            unseen,
-            uidvalidity,
-            ..
-        } = &mut self.state
-        {
-            *exists = current.exists;
-            *unseen = current.unseen;
-            *uidvalidity = current.uidvalidity;
-        }
-        tracing::debug!(
-            exists = current.exists,
-            unseen = current.unseen,
-            "mailbox refreshed"
-        );
         Ok(Flow::Continue)
     }
 
     // -- IDLE -------------------------------------------------------------
 
     /// Serve IDLE (RFC 2177) in the `Selected` state: answer `+ idling`,
-    /// flush the notifications that queued while the session was not
-    /// idling — never lose an update at the IDLE boundary — then wait on
-    /// the command reader and the watcher at once. `DONE` ends IDLE with
+    /// announce what changed while the session was not idling — never
+    /// lose an update at the IDLE boundary — then wait on the command
+    /// reader and the watcher at once. `DONE` ends IDLE with
     /// the tagged OK; LOGOUT behaves as it always does; any other
     /// command answers BAD and returns to normal dispatch. A change for
     /// the selected mailbox re-checks the snapshot; changes for other
@@ -1124,16 +1542,16 @@ impl Session {
         W: AsyncWrite + Unpin,
     {
         let mailbox = match &self.state {
-            State::Selected { view, .. } => view.id,
+            State::Selected { mailbox, .. } => *mailbox,
             _ => return Ok(Flow::Continue),
         };
 
         write_line(writer, "+ idling").await?;
         writer.flush().await.map_err(io_failed)?;
 
-        // The boundary flush: a change that queued while the session
-        // was not idling is reported before the first wait.
-        let flow = self.flush_notifications(writer).await?;
+        // The boundary comparison: a change that happened while the
+        // session was not idling is reported before the first wait.
+        let flow = self.announce_changes(writer).await?;
         writer.flush().await.map_err(io_failed)?;
         if matches!(flow, Flow::Close) {
             return Ok(Flow::Close);
@@ -1145,8 +1563,18 @@ impl Session {
         // Whether the watcher can still fire; once every sender is gone
         // only the command reader is left to wait on.
         let mut watching = true;
+        // One IDLE runs for the inactivity timeout at most, however
+        // many updates it carries: RFC 2177 has clients re-issue IDLE
+        // at least every 29 minutes so that this never fires on a live
+        // one.
+        let deadline = Instant::now() + self.limits.idle_timeout;
         loop {
             tokio::select! {
+                () = sleep_until(deadline) => {
+                    tracing::debug!("connection timed out in idle");
+                    write_line(writer, TIMEOUT_BYE).await?;
+                    return Ok(Flow::Close);
+                }
                 changed = self.watch.recv(), if watching => {
                     match changed {
                         Ok(MailboxChanged(changed)) if changed == mailbox => {
@@ -1211,7 +1639,7 @@ impl Session {
     /// connection, so the response — or the BYE that ends it — must not
     /// sit in the writer's buffer.
     async fn idle_recheck<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<Flow> {
-        let flow = self.refresh_selected_snapshot(writer).await?;
+        let flow = self.announce_changes(writer).await?;
         writer.flush().await.map_err(io_failed)?;
         Ok(flow)
     }
@@ -1232,86 +1660,72 @@ fn normalize(command: &str, args: &[ImapArg]) -> String {
     }
 }
 
-/// Whether `n` falls inside the set, with the star semantics resolved
-/// against `max` (the largest number in use, in whatever space the
-/// caller works — positions or uids):
-///
-/// * a lone `*` (`(0, None)`) selects exactly the last number;
-/// * `x:*` selects `x..max`, and an `x` beyond `max` still selects the
-///   last number, so mbsync's `UID FETCH <max+1>:*` sees the newest mail;
-/// * finite ranges select what they name, nothing when past the end.
-fn number_selected(set: &SeqSet, n: u32, max: u32) -> bool {
-    set.ranges().iter().any(|&(start, stop)| match stop {
-        Some(stop) => start <= n && n <= stop,
-        None if start == 0 => n == max,
-        None => start <= n || n == max,
-    })
-}
-
-/// One argument as plain text: atoms and quoted strings as themselves, a
-/// literal as its bytes, a parenthesized group as its inner text.
+/// One argument as plain text: atoms and quoted strings as themselves,
+/// a literal as its bytes. A list has no text and reads as empty.
 fn arg_string(arg: &ImapArg) -> String {
     match arg {
         ImapArg::Atom(atom) => atom.clone(),
         ImapArg::Quoted(value) => value.clone(),
         ImapArg::Literal(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        ImapArg::Raw(inner) => inner.clone(),
+        ImapArg::List(_) => String::new(),
     }
 }
 
-/// The FETCH item list as one string: the arguments after the sequence
-/// set, joined with spaces so a parenthesized list stays one group.
-fn join_args(args: &[ImapArg]) -> String {
-    args.iter()
-        .map(arg_string)
-        .collect::<Vec<String>>()
-        .join(" ")
+/// A mailbox name argument as the name it stands for. Mailbox names
+/// travel in modified UTF-7; an argument that is not valid modified
+/// UTF-7 is taken as written, so a client that sends the name raw
+/// still reaches its mailbox.
+fn mailbox_name(arg: &ImapArg) -> String {
+    let wire = arg_string(arg);
+    codec::decode_mailbox_name(&wire).unwrap_or(wire)
 }
 
-/// SEARCH criteria as backend tokens: atoms, quoted values, and literal
-/// bytes pass through as themselves; a parenthesized group splits into
-/// its tokens, keeping quoted values with spaces whole.
-fn flatten_criteria(args: &[ImapArg]) -> Vec<String> {
-    let mut criteria = Vec::new();
-    for arg in args {
-        match arg {
-            ImapArg::Raw(inner) => criteria.extend(split_raw(inner)),
-            other => criteria.push(arg_string(other)),
-        }
-    }
-    criteria
+/// A mailbox name for the wire: modified UTF-7, quoted.
+fn wire_mailbox(name: &str) -> String {
+    qs(&codec::encode_mailbox_name(name))
 }
 
-/// Whitespace-split a parenthesized group's inner text, honoring double
-/// quotes around values with spaces (the quotes are stripped, like
-/// top-level quoted arguments).
-fn split_raw(inner: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for c in inner.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            c if c.is_whitespace() && !quoted => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
+/// Whether a LIST pattern selects the mailbox listed as `name`. The
+/// mailbox whose name is `INBOX` in some casing is also matched as
+/// `INBOX` case-insensitively, the way SELECT resolves it.
+fn list_matches(pattern: &str, name: &str) -> bool {
+    wildcard_match(pattern, name, false)
+        || (name.eq_ignore_ascii_case("INBOX") && wildcard_match(pattern, "INBOX", true))
+}
+
+/// RFC 3501 §6.3.8 wildcard matching: `*` matches any run of
+/// characters, `%` any run without the hierarchy delimiter `/`, and
+/// everything else stands for itself (ASCII case-insensitively when
+/// `fold` is set). Linear in pattern length times name length.
+fn wildcard_match(pattern: &str, name: &str, fold: bool) -> bool {
+    let name: Vec<char> = name.chars().collect();
+    // reach[i]: the pattern consumed so far can match `name[..i]`.
+    let mut reach = vec![false; name.len() + 1];
+    reach[0] = true;
+    for wanted in pattern.chars() {
+        let mut next = vec![false; name.len() + 1];
+        match wanted {
+            '*' | '%' => {
+                let mut open = false;
+                for at in 0..=name.len() {
+                    if at > 0 && wanted == '%' && name[at - 1] == '/' {
+                        open = false;
+                    }
+                    open |= reach[at];
+                    next[at] = open;
                 }
             }
-            c => current.push(c),
+            _ => {
+                for at in 0..name.len() {
+                    let same =
+                        wanted == name[at] || (fold && wanted.eq_ignore_ascii_case(&name[at]));
+                    next[at + 1] = reach[at] && same;
+                }
+            }
         }
+        reach = next;
     }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/// One-level LIST matching: a pattern containing a wildcard (`*` or `%`)
-/// matches every mailbox — the store is flat, so the two forms agree —
-/// and anything else must equal the name exactly. The reference argument
-/// is the root and is not consulted.
-fn pattern_matches(pattern: &str, name: &str) -> bool {
-    pattern.contains('*') || pattern.contains('%') || pattern == name
+    reach[name.len()]
 }
 
 /// Encode one value for the wire: a quoted string when [`codec::
@@ -1339,6 +1753,88 @@ fn body_section_name(section: &BodySection) -> String {
     }
 }
 
+/// Bring the session's view to the store's `current` state and return
+/// the untagged responses that tell the client, in the order they
+/// must be sent.
+///
+/// * Every message that left is one `* <n> EXPUNGE`, highest number
+///   first, so no announcement renumbers a message still to be named.
+/// * Messages are only ever added at the end: a uid above the view's
+///   highest is new, and any number of them is one `* <n> EXISTS` — sent
+///   after the expunges, so a change that leaves the count unchanged
+///   (one out, one in) is still two visible events.
+/// * A changed read state of a message the client already knew is one
+///   `* <n> FETCH (FLAGS (...))`.
+fn reconcile(view: &mut Vec<(u32, bool)>, current: &[(u32, bool)]) -> Vec<String> {
+    let mut announcements = Vec::new();
+    let position = |uid: u32| current.binary_search_by_key(&uid, |(known, _)| *known);
+
+    for index in (0..view.len()).rev() {
+        if position(view[index].0).is_err() {
+            view.remove(index);
+            announcements.push(format!("* {} EXPUNGE", index + 1));
+        }
+    }
+
+    for (index, (uid, unread)) in view.iter_mut().enumerate() {
+        if let Ok(at) = position(*uid) {
+            if current[at].1 != *unread {
+                *unread = current[at].1;
+                announcements.push(format!(
+                    "* {} FETCH (FLAGS ({}))",
+                    index + 1,
+                    render::flags(*unread)
+                ));
+            }
+        }
+    }
+
+    let highest = view.last().map_or(0, |(uid, _)| *uid);
+    let known = view.len();
+    view.extend(current.iter().filter(|(uid, _)| *uid > highest));
+    if view.len() != known {
+        // New messages are announced before the flag updates of old
+        // ones would matter to them; EXISTS follows the expunges.
+        let exists = format!("* {} EXISTS", view.len());
+        let after_expunges = announcements
+            .iter()
+            .position(|line| !line.ends_with("EXPUNGE"))
+            .unwrap_or(announcements.len());
+        announcements.insert(after_expunges, exists);
+    }
+    announcements
+}
+
+/// The octets a partial fetch `<offset.count>` selects from a section
+/// of `len` octets. An offset at or beyond the end selects nothing,
+/// and a count that runs past the end is cut there (RFC 3501 §6.4.5).
+fn partial_range(len: usize, partial: Option<(u32, u32)>) -> std::ops::Range<usize> {
+    let Some((offset, count)) = partial else {
+        return 0..len;
+    };
+    let start = usize::try_from(offset).map_or(len, |offset| offset.min(len));
+    let end = usize::try_from(count).map_or(len, |count| start.saturating_add(count).min(len));
+    start..end
+}
+
+/// Cut every body to the partial range its item asks for. `bodies`
+/// holds one whole section per body item of `items`, in order.
+fn cut_partials(items: &[FetchItem], bodies: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    items
+        .iter()
+        .filter(|item| item.is_body())
+        .zip(bodies)
+        .map(|(item, mut body)| {
+            if let FetchItem::Body { partial, .. } = item {
+                let range = partial_range(body.len(), *partial);
+                body.truncate(range.end);
+                body.drain(..range.start);
+            }
+            body
+        })
+        .collect()
+}
+
 /// One rendered fragment of a FETCH response: wire text, or body bytes
 /// that stream as a server-sent literal.
 enum Piece {
@@ -1351,44 +1847,42 @@ enum Piece {
 /// Items render in request order; the handler has already appended
 /// `FetchItem::Uid` for a UID command when the client did not list it.
 /// ENVELOPE and BODYSTRUCTURE use the backend's strings verbatim (they
-/// already carry their own literal framing). The body — at most one per
-/// response, per the port model — is taken out of the response and
-/// rendered at the last body item as `{n}\r\n` framing followed by the
-/// raw bytes: the client never round-trips a continuation, and only one
-/// copy of the message is ever in memory. Items the backend left
-/// unfilled are skipped, which the real backend never produces.
+/// already carry their own literal framing). Every body item takes the
+/// next of the response's bodies — already cut to the item's partial
+/// range — and renders it as `{n}\r\n` framing followed by the raw
+/// bytes: the client never round-trips a
+/// continuation, and the bytes move out of the response instead of
+/// being copied. Items the backend left unfilled are skipped, which the
+/// real backend never produces.
 fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> Vec<Piece> {
     let mut pieces: Vec<Piece> = Vec::new();
     let mut text = format!("* {msn} FETCH (");
-    let body_at = items.iter().rposition(|item| {
-        matches!(
-            item,
-            FetchItem::Body { .. }
-                | FetchItem::Rfc822
-                | FetchItem::Rfc822Header
-                | FetchItem::Rfc822Text
-        )
-    });
+    let mut bodies = std::mem::take(&mut response.bodies).into_iter();
 
-    for (index, item) in items.iter().enumerate() {
-        let body_name = match item {
-            FetchItem::Body { section, .. } if body_at == Some(index) => {
-                Some(format!("BODY[{}]", body_section_name(section)))
+    for item in items {
+        let name = match item {
+            FetchItem::Body {
+                section, partial, ..
+            } => {
+                // RFC 3501 §7.4.2: a partial answer names its origin
+                // octet, `BODY[]<0>`, and never the requested count.
+                let origin = partial.map_or_else(String::new, |(offset, _)| format!("<{offset}>"));
+                format!("BODY[{}]{origin}", body_section_name(section))
             }
-            FetchItem::Rfc822 if body_at == Some(index) => Some("RFC822".to_string()),
-            FetchItem::Rfc822Header if body_at == Some(index) => Some("RFC822.HEADER".to_string()),
-            FetchItem::Rfc822Text if body_at == Some(index) => Some("RFC822.TEXT".to_string()),
+            FetchItem::Rfc822 => "RFC822".to_string(),
+            FetchItem::Rfc822Header => "RFC822.HEADER".to_string(),
+            FetchItem::Rfc822Text => "RFC822.TEXT".to_string(),
             FetchItem::Flags => {
                 text.push_str(&format!("FLAGS ({}) ", response.flags));
-                None
+                continue;
             }
             FetchItem::Uid => {
                 text.push_str(&format!("UID {} ", response.uid));
-                None
+                continue;
             }
             FetchItem::InternalDate => {
                 text.push_str(&format!("INTERNALDATE {} ", response.internal_date));
-                None
+                continue;
             }
             FetchItem::Envelope => {
                 if let Some(envelope) = response.envelope.as_ref() {
@@ -1396,7 +1890,7 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
                     text.push_str(envelope);
                     text.push(' ');
                 }
-                None
+                continue;
             }
             FetchItem::BodyStructure => {
                 if let Some(bodystructure) = response.bodystructure.as_ref() {
@@ -1404,20 +1898,26 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
                     text.push_str(bodystructure);
                     text.push(' ');
                 }
-                None
+                continue;
+            }
+            // A bare BODY is answered as BODY, without the extension
+            // data BODYSTRUCTURE carries (RFC 3501 §7.4.2).
+            FetchItem::BodyBasic => {
+                if let Some(bodystructure) = response.bodystructure.as_ref() {
+                    text.push_str("BODY ");
+                    text.push_str(&render::body_basic(bodystructure));
+                    text.push(' ');
+                }
+                continue;
             }
             FetchItem::Rfc822Size => {
                 if let Some(size) = response.rfc822_size {
                     text.push_str(&format!("RFC822.SIZE {size} "));
                 }
-                None
+                continue;
             }
-            _ => None,
         };
-        let Some(name) = body_name else {
-            continue;
-        };
-        let Some(body) = response.body.take() else {
+        let Some(body) = bodies.next() else {
             continue;
         };
         pieces.push(Piece::Text(std::mem::take(&mut text)));
@@ -1442,16 +1942,7 @@ fn render_fetch(msn: u32, response: &mut FetchResponse, items: &[FetchItem]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{parse_fetch_items, parse_seq_set};
     use super::*;
-
-    /// Every number in `1..=max` the set selects — the resolution the
-    /// handlers perform per message, spelled out for assertions.
-    fn numbers_selected(set: &SeqSet, max: u32) -> Vec<u32> {
-        (1..=max)
-            .filter(|n| number_selected(set, *n, max))
-            .collect()
-    }
 
     /// The rendered pieces as one comparable wire string.
     fn wire_of(pieces: Vec<Piece>) -> String {
@@ -1463,6 +1954,13 @@ mod tests {
             }
         }
         wire
+    }
+
+    /// The FETCH items of `raw`, parsed the way the handler parses
+    /// them: tokenized as a command first.
+    fn parse_fetch_items(raw: &str) -> Result<Vec<FetchItem>> {
+        let request = codec::parse_line(&format!("a FETCH 1 {raw}"))?;
+        codec::parse_fetch_items(&request.args[1..])
     }
 
     /// The item list a UID command carries: the client's items plus the
@@ -1484,39 +1982,15 @@ mod tests {
             envelope: Some("(NIL \"Hi\" NIL NIL NIL NIL NIL NIL NIL NIL)".into()),
             bodystructure: Some("(\"STRUCTURE\")".into()),
             rfc822_size: Some(1234),
-            body: Some(b"hello\r\nworld".to_vec()),
+            bodies: vec![b"hello\r\nworld".to_vec()],
         }
-    }
-
-    #[test]
-    fn star_resolution_follows_rfc_3501() {
-        // A lone `*` selects exactly the last message.
-        let lone = parse_seq_set("*").unwrap();
-        assert_eq!(numbers_selected(&lone, 5), vec![5]);
-        // `1:*` is every message.
-        let all = parse_seq_set("1:*").unwrap();
-        assert_eq!(numbers_selected(&all, 5), vec![1, 2, 3, 4, 5]);
-        // `x:*` runs to the end …
-        let from_four = parse_seq_set("4:*").unwrap();
-        assert_eq!(numbers_selected(&from_four, 5), vec![4, 5]);
-        // … and an `x` beyond the end still selects the last message, so
-        // mbsync's `UID FETCH <max+1>:*` never misses the newest mail.
-        let mbsync = parse_seq_set("6:*").unwrap();
-        assert_eq!(numbers_selected(&mbsync, 5), vec![5]);
-        // Finite ranges clamp to the mailbox and select nothing past it.
-        let early = parse_seq_set("2:4").unwrap();
-        assert_eq!(numbers_selected(&early, 5), vec![2, 3, 4]);
-        let over = parse_seq_set("9:100").unwrap();
-        assert!(numbers_selected(&over, 5).is_empty());
-        // An empty mailbox selects nothing at all.
-        assert!(numbers_selected(&lone, 0).is_empty());
     }
 
     #[test]
     fn fetch_responses_render_with_inline_literals() {
         // UID auto-appends after the body literal. The body moves into
-        // the response stream — peak memory is one copy per message —
-        // so the response is left without one.
+        // the response stream instead of being copied, so the response
+        // is left without one.
         let mut response = sample_response();
         let items = uid_items(&parse_fetch_items("(FLAGS BODY[])").unwrap());
         let wire = wire_of(render_fetch(3, &mut response, &items));
@@ -1524,7 +1998,7 @@ mod tests {
             wire,
             "* 3 FETCH (FLAGS (\\Seen) BODY[] {12}\r\nhello\r\nworld UID 5)\r\n"
         );
-        assert!(response.body.is_none());
+        assert!(response.bodies.is_empty());
 
         // An explicit UID renders at its requested position; the RFC822
         // aliases frame their body the same way.
@@ -1533,8 +2007,7 @@ mod tests {
         let wire = wire_of(render_fetch(3, &mut response, &items));
         assert_eq!(wire, "* 3 FETCH (UID 5 RFC822 {12}\r\nhello\r\nworld)\r\n");
 
-        // Without a body item nothing frames a literal — and the body
-        // the request never read stays in the response.
+        // Without a body item nothing frames a literal.
         let mut response = sample_response();
         let items =
             parse_fetch_items("(FLAGS ENVELOPE BODYSTRUCTURE RFC822.SIZE INTERNALDATE)").unwrap();
@@ -1547,29 +2020,161 @@ mod tests {
               RFC822.SIZE 1234 \
               INTERNALDATE \"14-Nov-2023 22:13:20 +0000\")\r\n"
         );
-        assert!(response.body.is_some());
     }
 
     #[test]
-    fn list_matching_is_flat() {
-        assert!(pattern_matches("*", "Inbox"));
-        assert!(pattern_matches("%", "Inbox"));
-        assert!(pattern_matches("Inbo*", "Archive"));
-        assert!(pattern_matches("Inbox", "Inbox"));
-        assert!(!pattern_matches("Inbox", "Archive"));
-    }
-
-    #[test]
-    fn criteria_flatten_groups_and_keep_quoted_values() {
-        let criteria = flatten_criteria(&[
-            ImapArg::Atom("UNSEEN".into()),
-            ImapArg::Raw("OR FROM \"a b\" TO c".into()),
-            ImapArg::Literal(b"lit".to_vec()),
-        ]);
-        assert_eq!(
-            criteria,
-            vec!["UNSEEN", "OR", "FROM", "a b", "TO", "c", "lit"]
+    fn bare_body_is_named_body_and_drops_extension_data() {
+        let mut response = sample_response();
+        response.bodystructure = Some(
+            "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 5 1) \
+              \"MIXED\" (\"BOUNDARY\" \"b\"))"
+                .into(),
         );
+        let items = parse_fetch_items("(BODY BODYSTRUCTURE)").unwrap();
+        let wire = wire_of(render_fetch(1, &mut response, &items));
+        assert_eq!(
+            wire,
+            "* 1 FETCH (BODY ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 5 1) \"MIXED\") \
+              BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 5 1) \
+              \"MIXED\" (\"BOUNDARY\" \"b\")))\r\n"
+        );
+    }
+
+    #[test]
+    fn every_body_item_renders_its_own_literal() {
+        // Several body items in one FETCH: each takes the next body,
+        // under its own name, in request order.
+        let mut response = sample_response();
+        response.bodies = vec![b"H: 1\r\n\r\n".to_vec(), b"text".to_vec()];
+        let items = parse_fetch_items("(BODY.PEEK[HEADER] FLAGS BODY.PEEK[TEXT]<0.2>)").unwrap();
+        response.bodies = cut_partials(&items, std::mem::take(&mut response.bodies));
+        let wire = wire_of(render_fetch(3, &mut response, &items));
+        assert_eq!(
+            wire,
+            "* 3 FETCH (BODY[HEADER] {8}\r\nH: 1\r\n\r\n FLAGS (\\Seen) \
+              BODY[TEXT]<0> {2}\r\nte)\r\n"
+        );
+    }
+
+    #[test]
+    fn partial_fetches_render_their_origin_and_slice() {
+        // The item name carries `<origin>`, the literal the requested
+        // octets only: "hello\r\nworld" is 12 octets.
+        let render = |raw: &str| {
+            let mut response = sample_response();
+            let items = parse_fetch_items(raw).unwrap();
+            response.bodies = cut_partials(&items, std::mem::take(&mut response.bodies));
+            wire_of(render_fetch(3, &mut response, &items))
+        };
+        assert_eq!(
+            render("BODY.PEEK[]<0.5>"),
+            "* 3 FETCH (BODY[]<0> {5}\r\nhello)\r\n"
+        );
+        assert_eq!(
+            render("BODY[]<7.100>"),
+            "* 3 FETCH (BODY[]<7> {5}\r\nworld)\r\n"
+        );
+        // At or past the end the answer is an empty string, still named.
+        assert_eq!(render("BODY[]<12.4>"), "* 3 FETCH (BODY[]<12> {0}\r\n)\r\n");
+        assert_eq!(render("BODY[]<99.4>"), "* 3 FETCH (BODY[]<99> {0}\r\n)\r\n");
+        assert_eq!(
+            render("(UID BODY[TEXT]<1.3>)"),
+            "* 3 FETCH (UID 5 BODY[TEXT]<1> {3}\r\nell)\r\n"
+        );
+    }
+
+    #[test]
+    fn reconcile_announces_expunges_then_exists_then_flags() {
+        let seen = false;
+        let unread = true;
+
+        // Nothing changed: nothing is said.
+        let mut view = vec![(1, seen), (3, unread)];
+        assert!(reconcile(&mut view, &[(1, seen), (3, unread)]).is_empty());
+
+        // Arrivals are one EXISTS with the new count.
+        let mut view = vec![(1, seen), (3, unread)];
+        assert_eq!(
+            reconcile(
+                &mut view,
+                &[(1, seen), (3, unread), (4, unread), (5, unread)]
+            ),
+            vec!["* 4 EXISTS"]
+        );
+        assert_eq!(view.len(), 4);
+
+        // Departures are one EXPUNGE each, highest number first, so
+        // every number is still valid when it is sent.
+        let mut view = vec![(1, seen), (3, seen), (5, seen), (7, seen)];
+        assert_eq!(
+            reconcile(&mut view, &[(3, seen), (5, seen)]),
+            vec!["* 4 EXPUNGE", "* 1 EXPUNGE"]
+        );
+        assert_eq!(view, vec![(3, seen), (5, seen)]);
+
+        // One out, one in: the count is unchanged and both events are
+        // still reported, the EXPUNGE first.
+        let mut view = vec![(1, seen), (3, seen)];
+        assert_eq!(
+            reconcile(&mut view, &[(3, seen), (4, unread)]),
+            vec!["* 1 EXPUNGE", "* 2 EXISTS"]
+        );
+        assert_eq!(view, vec![(3, seen), (4, unread)]);
+
+        // Read-state changes name the message by its number after the
+        // expunges; a new message's flags are not announced.
+        let mut view = vec![(1, seen), (3, unread), (5, seen)];
+        assert_eq!(
+            reconcile(&mut view, &[(3, seen), (5, unread), (6, unread)]),
+            vec![
+                "* 1 EXPUNGE",
+                "* 3 EXISTS",
+                "* 1 FETCH (FLAGS (\\Seen))",
+                "* 2 FETCH (FLAGS ())",
+            ]
+        );
+
+        // The mailbox emptied, then filled again.
+        let mut view = vec![(1, seen)];
+        assert_eq!(reconcile(&mut view, &[]), vec!["* 1 EXPUNGE"]);
+        assert_eq!(reconcile(&mut view, &[(9, unread)]), vec!["* 1 EXISTS"]);
+    }
+
+    #[test]
+    fn list_patterns_match_with_real_wildcards() {
+        // Without a wildcard the name must be exact.
+        assert!(list_matches("Archive", "Archive"));
+        assert!(!list_matches("archive", "Archive"));
+        assert!(!list_matches("Arch", "Archive"));
+        // `*` and `%` match runs, anywhere in the pattern.
+        assert!(list_matches("*", "Archive"));
+        assert!(list_matches("%", "Archive"));
+        assert!(list_matches("*", ""));
+        assert!(list_matches("Arch*", "Archive"));
+        assert!(list_matches("*ive", "Archive"));
+        assert!(list_matches("A%e", "Archive"));
+        assert!(list_matches("A*c*e", "Archive"));
+        assert!(list_matches("Archive*", "Archive"));
+        assert!(!list_matches("Inbo*", "Archive"));
+        assert!(!list_matches("*x", "Archive"));
+        assert!(!list_matches("Archive/%", "Archive"));
+        // `%` stops at the hierarchy delimiter, `*` does not.
+        assert!(wildcard_match("a/%", "a/b", false));
+        assert!(!wildcard_match("%", "a/b", false));
+        assert!(!wildcard_match("a/%", "a/b/c", false));
+        assert!(wildcard_match("a/*", "a/b/c", false));
+        assert!(wildcard_match("%/%", "a/b", false));
+        // INBOX is case-insensitive, under whatever casing it is listed.
+        assert!(list_matches("INBOX", "Inbox"));
+        assert!(list_matches("inbox", "Inbox"));
+        assert!(list_matches("Inbox", "Inbox"));
+        assert!(list_matches("in%", "Inbox"));
+        assert!(list_matches("INB*", "INBOX"));
+        assert!(!list_matches("INBOX", "Inbox (2)"));
+        assert!(!list_matches("INBOX", "Archive"));
+        // Many wildcards stay cheap.
+        let pattern = "*a".repeat(200);
+        assert!(!list_matches(&pattern, &"a".repeat(150)));
     }
 
     #[test]
@@ -1594,6 +2199,22 @@ mod tests {
         assert_eq!(log_tag("\u{7f}weird\u{1b}"), INVALID_LOG_TAG);
         assert_eq!(log_tag("{5}"), INVALID_LOG_TAG);
         assert_eq!(log_tag("a[b]"), INVALID_LOG_TAG);
+    }
+
+    #[test]
+    fn logged_commands_are_fixed_names_never_client_bytes() {
+        assert_eq!(log_command("LOGIN"), "LOGIN");
+        assert_eq!(log_command("UID FETCH"), "UID FETCH");
+        // A credential line parsed as a command, control characters, a
+        // UID sub-command the session does not serve: all placeholders.
+        assert_eq!(log_command("HUNTER2"), UNKNOWN_LOG_COMMAND);
+        assert_eq!(log_command("NOOP\u{1b}[31m"), UNKNOWN_LOG_COMMAND);
+        assert_eq!(log_command("UID HUNTER2"), UNKNOWN_LOG_COMMAND);
+        assert_eq!(log_command(""), UNKNOWN_LOG_COMMAND);
+        // Every dispatched verb is known to the log, the UID forms
+        // through `normalize` like the dispatcher sees them.
+        let uid = normalize("UID", &[ImapArg::Atom("fetch".into())]);
+        assert_eq!(log_command(&uid), "UID FETCH");
     }
 
     #[test]

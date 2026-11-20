@@ -8,28 +8,31 @@
 //! commands; dispatch on the command (plus the `UID` sub-command atom)
 //! belongs to the session.
 
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::Engine as _;
+
 use crate::domain::{Error, Result};
 
-/// One argument of a parsed client command line.
+/// One argument of a parsed client command.
 ///
-/// Balanced parenthesized groups (FETCH item lists, `ID` parameters, SEARCH
-/// keys) are captured as [`ImapArg::Raw`]: the inner text without the outer
-/// parentheses, tracked by scanning depth. Later consumers slice that
-/// string with the structure they know.
+/// Parenthesized lists nest: FETCH item lists, `ID` parameters, STATUS
+/// items, and SEARCH groups all arrive as [`ImapArg::List`], so no
+/// consumer ever re-splits a string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImapArg {
-    /// Whitespace-delimited atom (`FETCH`, `1:*`, `INBOX`, …).
+    /// An atom (`FETCH`, `1:*`, `INBOX`, …). A bracketed section stays
+    /// inside its atom whole, spaces and parentheses included:
+    /// `BODY.PEEK[HEADER.FIELDS (DATE FROM)]` is one atom.
     Atom(String),
     /// Quoted string with `\\` and `\"` escapes already resolved.
     Quoted(String),
-    /// Literal placeholder: a trailing `{n}` marker parses as empty bytes;
-    /// the session reads the announced data and fills them in.
+    /// The bytes of a client literal.
     Literal(Vec<u8>),
-    /// Balanced parenthesized group, inner text verbatim.
-    Raw(String),
+    /// A parenthesized list.
+    List(Vec<ImapArg>),
 }
 
-/// A parsed client command line.
+/// A parsed client command.
 // No `Debug`: a casual `{:?}` would dump arguments (subjects, credentials)
 // into logs; the session logs tags, commands, and counts only.
 pub struct Request {
@@ -42,121 +45,174 @@ fn invalid_command() -> Error {
     Error::Unsupported("invalid command".into())
 }
 
-/// Tokenize one client line into tag, command, and arguments.
-///
-/// Extra whitespace between tokens is tolerated. A trailing `{n}` literal
-/// marker becomes an empty [`ImapArg::Literal`] placeholder (the size is
-/// surfaced separately by [`pending_literal`]); anywhere else a literal
-/// marker is a parse error. The codec never interprets the command.
+/// Lists nested deeper than this are refused instead of recursed into.
+const MAX_LIST_DEPTH: usize = 32;
+
+/// Tokenize a command that fits on one line (no client literal).
 pub fn parse_line(line: &str) -> Result<Request> {
-    let mut rest = line.trim_start();
-    let (tag, tail) = split_atom(rest);
+    parse_command(&[line], Vec::new())
+}
+
+/// Tokenize one whole client command into tag, command, and arguments.
+///
+/// `lines` are the command's lines in order: every line but the last
+/// ends in a `{n}` literal marker, and `literals` holds the announced
+/// bytes in the same order (the session reads them; see
+/// [`pending_literal`]). A literal may sit anywhere an argument may,
+/// inside a list included. The codec never interprets the command.
+pub fn parse_command<S: AsRef<str>>(lines: &[S], literals: Vec<Vec<u8>>) -> Result<Request> {
+    let (first, continuations) = lines.split_first().ok_or_else(invalid_command)?;
+    let (tag, tail) = split_word(first.as_ref().trim_start());
     if tag.is_empty() {
         return Err(invalid_command());
     }
-
-    rest = tail.trim_start();
-    let (command, tail) = split_atom(rest);
+    let (command, tail) = split_word(tail.trim_start());
     if command.is_empty() {
         return Err(invalid_command());
     }
 
-    let mut args = Vec::new();
-    parse_args(tail, &mut args)?;
+    let mut tokenizer = Tokenizer {
+        stack: vec![Vec::new()],
+        literals: literals.into_iter(),
+    };
+    tokenizer.line(tail)?;
+    for line in continuations {
+        tokenizer.line(line.as_ref())?;
+    }
     Ok(Request {
         tag: tag.to_string(),
         command: command.to_string(),
-        args,
+        args: tokenizer.finish()?,
     })
 }
 
-/// Parse the continuation line that follows a client literal: the
-/// arguments after the announced bytes, with no tag or command.
-///
-/// The session reads the `{n}` bytes itself, fills the placeholder the
-/// marker produced, and then hands the rest of the line here. A trailing
-/// `{n}` marker appends another empty [`ImapArg::Literal`] placeholder
-/// for the session to fill, so chained literals keep working with no
-/// session-side reimplementation of the tokenizer.
-pub fn parse_continuation(line: &str, args: &mut Vec<ImapArg>) -> Result<()> {
-    parse_args(line, args)
+/// Tokenize a run of arguments with no tag, command, or literal: the
+/// text inside a `BODY[...]` section.
+fn parse_arguments(text: &str) -> Result<Vec<ImapArg>> {
+    let mut tokenizer = Tokenizer {
+        stack: vec![Vec::new()],
+        literals: Vec::new().into_iter(),
+    };
+    tokenizer.line(text)?;
+    tokenizer.finish()
 }
 
-/// Parse argument tokens off `rest`, filling `args`.
-fn parse_args(rest: &str, args: &mut Vec<ImapArg>) -> Result<()> {
-    let mut rest = rest.trim_start();
-    while !rest.is_empty() {
-        match rest.as_bytes()[0] {
-            b'(' => {
-                let (inner, tail) = split_group(rest)?;
-                args.push(ImapArg::Raw(inner.to_string()));
-                rest = tail.trim_start();
-            }
-            b'"' => {
-                let (value, tail) = split_quoted(rest)?;
-                args.push(ImapArg::Quoted(value));
-                rest = tail.trim_start();
-            }
-            b'{' => {
-                // A literal marker must end the line: `{n}` then nothing.
-                let close = rest.find('}').ok_or_else(invalid_command)?;
-                let digits = &rest[1..close];
-                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(invalid_command());
-                }
-                if !rest[close + 1..].trim().is_empty() {
-                    return Err(invalid_command());
-                }
-                args.push(ImapArg::Literal(Vec::new()));
-                rest = "";
-            }
-            _ => {
-                let (atom, tail) = split_atom(rest);
-                args.push(ImapArg::Atom(atom.to_string()));
-                rest = tail.trim_start();
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Split off the first whitespace-delimited atom, returning the remainder
-/// starting at the delimiter.
-fn split_atom(rest: &str) -> (&str, &str) {
+/// Split off the first whitespace-delimited word, returning the
+/// remainder starting at the delimiter.
+fn split_word(rest: &str) -> (&str, &str) {
     match rest.find(char::is_whitespace) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
     }
 }
 
-/// Split off a balanced parenthesized group; `rest` starts with `(`.
-///
-/// Scanning tracks depth only, as the controller ruling prescribes, so
-/// nested groups stay inside one capture.
-fn split_group(rest: &str) -> Result<(&str, &str)> {
-    let mut depth = 0usize;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok((&rest[1..i], &rest[i + 1..]));
-                }
-            }
-            _ => {}
-        }
-    }
-    Err(invalid_command())
+/// The argument tokenizer: a stack of open lists, the innermost last.
+struct Tokenizer {
+    stack: Vec<Vec<ImapArg>>,
+    literals: std::vec::IntoIter<Vec<u8>>,
 }
 
-/// Split off a quoted string; `rest` starts with `"`.
+impl Tokenizer {
+    fn push(&mut self, arg: ImapArg) {
+        if let Some(open) = self.stack.last_mut() {
+            open.push(arg);
+        }
+    }
+
+    /// Consume one line of arguments. Open lists carry over to the
+    /// next line, which is how a literal sits inside a list.
+    fn line(&mut self, line: &str) -> Result<()> {
+        let bytes = line.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            match bytes[at] {
+                byte if byte.is_ascii_whitespace() => at += 1,
+                b'(' => {
+                    if self.stack.len() > MAX_LIST_DEPTH {
+                        return Err(invalid_command());
+                    }
+                    self.stack.push(Vec::new());
+                    at += 1;
+                }
+                b')' => {
+                    let list = self.stack.pop().ok_or_else(invalid_command)?;
+                    if self.stack.is_empty() {
+                        return Err(invalid_command());
+                    }
+                    self.push(ImapArg::List(list));
+                    at += 1;
+                }
+                b'"' => {
+                    let (value, next) = read_quoted(line, at)?;
+                    self.push(ImapArg::Quoted(value));
+                    at = next;
+                }
+                b'{' => {
+                    // A literal marker ends its line: `{n}` then nothing.
+                    let announced = literal_marker(&line[at..])?;
+                    let data = self.literals.next().ok_or_else(invalid_command)?;
+                    if data.len() != announced {
+                        return Err(invalid_command());
+                    }
+                    self.push(ImapArg::Literal(data));
+                    at = bytes.len();
+                }
+                _ => {
+                    let next = atom_end(line, at)?;
+                    self.push(ImapArg::Atom(line[at..next].to_string()));
+                    at = next;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The top-level arguments, once every list is closed and every
+    /// literal has found its marker.
+    fn finish(mut self) -> Result<Vec<ImapArg>> {
+        if self.stack.len() != 1 || self.literals.next().is_some() {
+            return Err(invalid_command());
+        }
+        Ok(self.stack.pop().unwrap_or_default())
+    }
+}
+
+/// The end of the atom starting at `start`: whitespace or a parenthesis
+/// outside any `[...]` section. Inside a section everything belongs to
+/// the atom, and quoted strings are skipped whole so a `]` or `)` in
+/// one never ends the section.
+fn atom_end(line: &str, start: usize) -> Result<usize> {
+    let bytes = line.as_bytes();
+    let mut depth = 0usize;
+    let mut at = start;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b'"' if depth > 0 => {
+                at = read_quoted(line, at)?.1;
+                continue;
+            }
+            b'(' | b')' if depth == 0 => break,
+            byte if byte.is_ascii_whitespace() && depth == 0 => break,
+            _ => {}
+        }
+        at += 1;
+    }
+    if depth > 0 {
+        return Err(invalid_command());
+    }
+    Ok(at)
+}
+
+/// Read the quoted string whose opening quote is at `start`, returning
+/// its value and the index after the closing quote.
 ///
 /// Only `\\` and `\"` escapes are valid; CR/LF never enter a quoted value.
-fn split_quoted(rest: &str) -> Result<(String, &str)> {
+fn read_quoted(line: &str, start: usize) -> Result<(String, usize)> {
     let mut value = String::new();
     let mut escaped = false;
-    for (i, c) in rest.char_indices().skip(1) {
+    for (offset, c) in line[start + 1..].char_indices() {
         if escaped {
             if !matches!(c, '\\' | '"') {
                 return Err(invalid_command());
@@ -167,7 +223,7 @@ fn split_quoted(rest: &str) -> Result<(String, &str)> {
         }
         match c {
             '\\' => escaped = true,
-            '"' => return Ok((value, &rest[i + 1..])),
+            '"' => return Ok((value, start + 1 + offset + 1)),
             '\r' | '\n' => return Err(invalid_command()),
             _ => value.push(c),
         }
@@ -176,57 +232,98 @@ fn split_quoted(rest: &str) -> Result<(String, &str)> {
     Err(invalid_command())
 }
 
-/// The byte count of a trailing `{n}` literal marker, if the line carries
-/// one. The session answers `+ ` and reads that many bytes. Synchronizing
-/// literals only: `{n+}` is not supported and surfaces as `None`.
-pub fn pending_literal(line: &str) -> Option<usize> {
-    let trimmed = line.trim_end();
-    let token = match trimmed.rfind(char::is_whitespace) {
-        Some(i) => &trimmed[i + 1..],
-        None => trimmed,
-    };
-    let inner = token.strip_prefix('{')?.strip_suffix('}')?;
-    if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+/// The byte count of a `{n}` marker that is the whole of `text` apart
+/// from trailing whitespace. Synchronizing literals only: `{n+}` is
+/// refused like any other malformed marker.
+fn literal_marker(text: &str) -> Result<usize> {
+    let digits = text
+        .trim_end()
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .ok_or_else(invalid_command)?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid_command());
     }
-    inner.parse().ok()
+    digits.parse().map_err(|_| invalid_command())
+}
+
+/// The byte count of the literal this line announces, if it ends in a
+/// `{n}` marker. The session answers `+ ` and reads that many bytes
+/// before the command's next line.
+///
+/// The scan knows quoted strings, so `"x {5}"` announces nothing; a
+/// line that cannot be part of a valid command — an unterminated
+/// quoted string, a marker that is malformed or not the last token —
+/// is an error the session answers without ever sending a continuation.
+pub fn pending_literal(line: &str) -> Result<Option<usize>> {
+    let bytes = line.as_bytes();
+    let mut token_start = true;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => {
+                at = read_quoted(line, at)?.1;
+                token_start = false;
+                continue;
+            }
+            b'{' if token_start => return literal_marker(&line[at..]).map(Some),
+            b'(' => token_start = true,
+            byte => token_start = byte.is_ascii_whitespace(),
+        }
+        at += 1;
+    }
+    Ok(None)
+}
+
+/// One end of a sequence-set range: a concrete number or `*`, the
+/// largest number in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqBound {
+    Number(u32),
+    Star,
+}
+
+impl SeqBound {
+    fn resolve(self, max: u32) -> u32 {
+        match self {
+            SeqBound::Number(n) => n,
+            SeqBound::Star => max,
+        }
+    }
 }
 
 /// A parsed IMAP sequence set.
 ///
-/// `ranges` holds `(start, stop)` pairs where a `None` stop is the
-/// unbounded upper end produced by `*`. A pure codec cannot know the
-/// mailbox size, so the session resolves each range against it:
-/// `(x, Some(y))` selects the numbers both ends clamp to, `(x, None)`
-/// selects `x..max`, and `(0, None)` — produced only by a lone `*`
-/// (or `*:*`), never by a concrete start — selects exactly the last
-/// message, per RFC 3501 §6.4.8. The ALL set `1:*` is `(1, None)`.
-#[derive(Debug, Clone)]
+/// A pure codec cannot know the mailbox size, so `*` stays symbolic and
+/// [`SeqSet::contains`] resolves it against the largest number in use,
+/// in whatever space the caller works (message numbers or UIDs). `*` is
+/// an ordinary endpoint (RFC 3501 §9 `seq-number`): `2,*` names two
+/// messages, and a range is the span between its two ends whichever
+/// way round they were written.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeqSet {
-    ranges: Vec<(u32, Option<u32>)>,
+    ranges: Vec<(SeqBound, SeqBound)>,
 }
 
 impl SeqSet {
     /// The ALL set: every number from 1 up — the semantics of `1:*`.
     pub fn all() -> Self {
         Self {
-            ranges: vec![(1, None)],
+            ranges: vec![(SeqBound::Number(1), SeqBound::Star)],
         }
     }
 
-    /// The raw `(start, stop)` pairs, for a consumer that must resolve
-    /// star semantics against a concrete maximum instead of testing
-    /// membership with [`SeqSet::contains`].
-    pub fn ranges(&self) -> &[(u32, Option<u32>)] {
-        &self.ranges
-    }
-
-    /// True when `n` falls inside any range (a `None` stop is unbounded).
-    pub fn contains(&self, n: u32) -> bool {
-        self.ranges.iter().any(|&(start, stop)| match stop {
-            Some(stop) => start <= n && n <= stop,
-            None => n >= start,
-        })
+    /// True when `n` falls inside any range once `*` is resolved to
+    /// `max`. `7:*` with a `max` of 5 is the range `5:7`, so a
+    /// `<max+1>:*` probe still names the last message; in an empty
+    /// mailbox (`max` 0) nothing is contained.
+    pub fn contains(&self, n: u32, max: u32) -> bool {
+        n != 0
+            && n <= max
+            && self.ranges.iter().any(|&(first, second)| {
+                let (first, second) = (first.resolve(max), second.resolve(max));
+                first.min(second) <= n && n <= first.max(second)
+            })
     }
 }
 
@@ -234,75 +331,35 @@ fn invalid_sequence_set() -> Error {
     Error::Unsupported("invalid sequence set".into())
 }
 
-fn seq_number(raw: &str) -> Result<u32> {
-    let n: u32 = raw.parse().map_err(|_| invalid_sequence_set())?;
-    if n == 0 {
+fn seq_bound(raw: &str) -> Result<SeqBound> {
+    if raw == "*" {
+        return Ok(SeqBound::Star);
+    }
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(invalid_sequence_set());
     }
-    Ok(n)
+    match raw.parse::<u32>() {
+        Ok(n) if n != 0 => Ok(SeqBound::Number(n)),
+        _ => Err(invalid_sequence_set()),
+    }
 }
 
 /// Parse an IMAP sequence set such as `2,4:6,*`.
 ///
-/// `*` is the unbounded upper end wherever it appears: `4:*` covers every
-/// number from 4 up, and `*:4` is normalized to the same range. A lone `*`
-/// (or `*:*`) anchors at `(0, None)` — a start no concrete number can
-/// produce — so the session can resolve it to exactly the last message,
-/// while `1:*` stays the ALL set. Sequence number `0` and reversed finite
-/// ranges (`5:1`) are rejected with the fixed error
-/// `invalid sequence set`.
+/// Each comma-separated part is one number, `*`, or a range of two of
+/// them. Sequence number `0`, empty parts, and anything that is not a
+/// number are rejected with the fixed error `invalid sequence set`.
 pub fn parse_seq_set(raw: &str) -> Result<SeqSet> {
-    if raw.trim().is_empty() {
-        return Err(invalid_sequence_set());
-    }
-
-    let mut ranges: Vec<(u32, Option<u32>)> = Vec::new();
-    let mut stars = 0usize;
-    let mut highest: u32 = 0;
+    let mut ranges = Vec::new();
     for part in raw.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            return Err(invalid_sequence_set());
-        }
-        match part.split_once(':') {
+        let range = match part.split_once(':') {
             None => {
-                if part == "*" {
-                    stars += 1;
-                    continue;
-                }
-                let n = seq_number(part)?;
-                ranges.push((n, Some(n)));
-                highest = highest.max(n);
+                let bound = seq_bound(part)?;
+                (bound, bound)
             }
-            Some((raw_start, raw_end)) => match (raw_start.trim(), raw_end.trim()) {
-                ("*", "*") => stars += 1,
-                // `*` is the unbounded upper end wherever it appears.
-                ("*", finite) | (finite, "*") => {
-                    let n = seq_number(finite)?;
-                    ranges.push((n, None));
-                    highest = highest.max(n);
-                }
-                (start, end) => {
-                    let (start, end) = (seq_number(start)?, seq_number(end)?);
-                    if start > end {
-                        return Err(invalid_sequence_set());
-                    }
-                    ranges.push((start, Some(end)));
-                    highest = highest.max(end);
-                }
-            },
-        }
-    }
-    if ranges.is_empty() {
-        // A pure-star set names no concrete number: anchor at zero, the
-        // start no `x:*` range can ever produce.
-        for _ in 0..stars {
-            ranges.push((0, None));
-        }
-    } else {
-        for _ in 0..stars {
-            ranges.push((highest.max(1), None));
-        }
+            Some((first, second)) => (seq_bound(first)?, seq_bound(second)?),
+        };
+        ranges.push(range);
     }
     Ok(SeqSet { ranges })
 }
@@ -329,6 +386,72 @@ pub fn encode_string(value: &str) -> ImapString {
     }
 }
 
+/// Encode a mailbox name in modified UTF-7 (RFC 3501 §5.1.3), the
+/// only form a mailbox name may take on the wire: printable ASCII
+/// stands for itself, `&` is written `&-`, and every other run of
+/// characters is its UTF-16BE bytes in modified base64 between `&`
+/// and `-`.
+pub fn encode_mailbox_name(name: &str) -> String {
+    fn flush(run: &mut Vec<u16>, out: &mut String) {
+        if run.is_empty() {
+            return;
+        }
+        let bytes: Vec<u8> = run.iter().flat_map(|unit| unit.to_be_bytes()).collect();
+        out.push('&');
+        out.push_str(&STANDARD_NO_PAD.encode(bytes).replace('/', ","));
+        out.push('-');
+        run.clear();
+    }
+
+    let mut out = String::new();
+    let mut run: Vec<u16> = Vec::new();
+    for c in name.chars() {
+        if (' '..='~').contains(&c) {
+            flush(&mut run, &mut out);
+            out.push(c);
+            if c == '&' {
+                out.push('-');
+            }
+        } else {
+            let mut units = [0u16; 2];
+            run.extend_from_slice(c.encode_utf16(&mut units));
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// Decode a modified UTF-7 mailbox name, or `None` when it is not
+/// valid modified UTF-7. Characters outside a shifted `&...-` run pass
+/// through untouched, so a name with no `&` decodes to itself.
+pub fn decode_mailbox_name(wire: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = wire;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let shifted = &rest[start + 1..];
+        let end = shifted.find('-')?;
+        if end == 0 {
+            out.push('&');
+        } else {
+            let bytes = STANDARD_NO_PAD
+                .decode(shifted[..end].replace(',', "/"))
+                .ok()?;
+            if bytes.len() % 2 != 0 {
+                return None;
+            }
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            out.push_str(&String::from_utf16(&units).ok()?);
+        }
+        rest = &shifted[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// The section of a `BODY[...]` fetch item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodySection {
@@ -348,8 +471,17 @@ pub enum BodySection {
 /// One item of a FETCH request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchItem {
-    Body { peek: bool, section: BodySection },
+    /// `BODY[section]` or `BODY.PEEK[section]`, optionally limited to
+    /// the `<offset.count>` octets of a partial fetch.
+    Body {
+        peek: bool,
+        section: BodySection,
+        partial: Option<(u32, u32)>,
+    },
+    /// `BODYSTRUCTURE`: the MIME structure with extension data.
     BodyStructure,
+    /// A bare `BODY`: the same structure without extension data.
+    BodyBasic,
     Envelope,
     Flags,
     InternalDate,
@@ -360,25 +492,46 @@ pub enum FetchItem {
     Uid,
 }
 
+impl FetchItem {
+    /// Whether the item answers with message bytes — the items a
+    /// backend returns one body for.
+    pub fn is_body(&self) -> bool {
+        matches!(
+            self,
+            FetchItem::Body { .. }
+                | FetchItem::Rfc822
+                | FetchItem::Rfc822Header
+                | FetchItem::Rfc822Text
+        )
+    }
+}
+
 fn invalid_fetch_items() -> Error {
     Error::Unsupported("invalid fetch items".into())
 }
 
-/// Parse a FETCH item list: either the parenthesized form `(FLAGS UID)` or
-/// a bare item or macro (`ALL`, `FAST`).
+/// Parse the FETCH item arguments (everything after the sequence set):
+/// either one parenthesized list `(FLAGS UID)` or one bare item or
+/// macro (`ALL`, `FAST`, `BODY[HEADER.FIELDS (DATE)]`).
 ///
 /// Macros expand per RFC 3501 — `FAST` → FLAGS INTERNALDATE RFC822.SIZE,
 /// `ALL` → plus ENVELOPE, `FULL` → plus BODY, where a bare `BODY` requests
 /// the non-extensible structure (RFC 3501 §6.4.5) and maps to
-/// [`FetchItem::BodyStructure`]. Item names are case-insensitive.
+/// [`FetchItem::BodyBasic`]. Item names are case-insensitive.
 /// `HEADER.FIELDS.NOT` sections are a v1 limitation and are rejected with
 /// the fixed error `invalid fetch items`.
-pub fn parse_fetch_items(raw: &str) -> Result<Vec<FetchItem>> {
-    let trimmed = raw.trim();
-    let inner = unwrap_group(trimmed).unwrap_or(trimmed);
+pub fn parse_fetch_items(args: &[ImapArg]) -> Result<Vec<FetchItem>> {
+    let tokens: Vec<&ImapArg> = match args {
+        [ImapArg::List(list)] => list.iter().collect(),
+        [single] => vec![single],
+        _ => return Err(invalid_fetch_items()),
+    };
     let mut items = Vec::new();
-    for token in split_fetch_tokens(inner)? {
-        items.extend(expand_fetch_token(&token)?);
+    for token in tokens {
+        let ImapArg::Atom(token) = token else {
+            return Err(invalid_fetch_items());
+        };
+        items.extend(expand_fetch_token(token)?);
     }
     if items.is_empty() {
         return Err(invalid_fetch_items());
@@ -386,73 +539,18 @@ pub fn parse_fetch_items(raw: &str) -> Result<Vec<FetchItem>> {
     Ok(items)
 }
 
-/// When `raw` is exactly one balanced parenthesized group, return its inner
-/// text; otherwise `None`.
-fn unwrap_group(raw: &str) -> Option<&str> {
-    if !raw.starts_with('(') || !raw.ends_with(')') {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (i, c) in raw.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return (i + 1 == raw.len()).then_some(&raw[1..raw.len() - 1]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split a fetch list into item tokens. Bracket sections keep their inner
-/// spaces and parentheses, so `BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)]`
-/// stays one token.
-fn split_fetch_tokens(inner: &str) -> Result<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut brackets = 0usize;
-    for c in inner.chars() {
-        match c {
-            '[' => {
-                brackets += 1;
-                current.push(c);
-            }
-            ']' => {
-                brackets = brackets.saturating_sub(1);
-                current.push(c);
-            }
-            _ if c.is_whitespace() && brackets == 0 => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(c),
-        }
-    }
-    if brackets > 0 {
-        return Err(invalid_fetch_items());
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    Ok(tokens)
-}
-
 /// Expand one fetch token; macros expand to several items.
 fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
-    let (name, section) = match token.find('[') {
+    let (name, section, partial) = match token.find('[') {
         Some(open) => {
             let close = token.rfind(']').ok_or_else(invalid_fetch_items)?;
-            if close != token.len() - 1 || open + 1 > close {
+            if open + 1 > close {
                 return Err(invalid_fetch_items());
             }
-            (&token[..open], Some(&token[open + 1..close]))
+            let partial = parse_partial(&token[close + 1..])?;
+            (&token[..open], Some(&token[open + 1..close]), partial)
         }
-        None => (token, None),
+        None => (token, None, None),
     };
 
     match section {
@@ -468,6 +566,7 @@ fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
             Ok(vec![FetchItem::Body {
                 peek,
                 section: parse_body_section(section)?,
+                partial,
             }])
         }
         None => {
@@ -489,7 +588,7 @@ fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
                     FetchItem::InternalDate,
                     FetchItem::Rfc822Size,
                     FetchItem::Envelope,
-                    FetchItem::BodyStructure,
+                    FetchItem::BodyBasic,
                 ]),
                 "FLAGS" => Ok(vec![FetchItem::Flags]),
                 "UID" => Ok(vec![FetchItem::Uid]),
@@ -500,114 +599,292 @@ fn expand_fetch_token(token: &str) -> Result<Vec<FetchItem>> {
                 "RFC822.SIZE" => Ok(vec![FetchItem::Rfc822Size]),
                 "RFC822.TEXT" => Ok(vec![FetchItem::Rfc822Text]),
                 "BODYSTRUCTURE" => Ok(vec![FetchItem::BodyStructure]),
-                // A bare BODY requests the structure (RFC 3501 §6.4.5).
-                "BODY" => Ok(vec![FetchItem::BodyStructure]),
+                // A bare BODY requests the structure without its
+                // extension data (RFC 3501 §6.4.5).
+                "BODY" => Ok(vec![FetchItem::BodyBasic]),
                 _ => Err(invalid_fetch_items()),
             }
         }
     }
 }
 
+/// Parse what follows the `]` of a body item: nothing, or the
+/// `<offset.count>` of a partial fetch (RFC 3501 §6.4.5; the count is
+/// a non-zero number).
+fn parse_partial(raw: &str) -> Result<Option<(u32, u32)>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let (offset, count) = raw
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .and_then(|inner| inner.split_once('.'))
+        .ok_or_else(invalid_fetch_items)?;
+    let number = |digits: &str| -> Result<u32> {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid_fetch_items());
+        }
+        digits.parse().map_err(|_| invalid_fetch_items())
+    };
+    let (offset, count) = (number(offset)?, number(count)?);
+    if count == 0 {
+        return Err(invalid_fetch_items());
+    }
+    Ok(Some((offset, count)))
+}
+
 /// Parse the text between `BODY[` and `]`.
 fn parse_body_section(section: &str) -> Result<BodySection> {
-    let section = section.trim();
-    if section.is_empty() {
-        return Ok(BodySection::Empty);
-    }
-    if section.eq_ignore_ascii_case("HEADER") {
-        return Ok(BodySection::Header);
-    }
-    if section.eq_ignore_ascii_case("TEXT") {
-        return Ok(BodySection::Text);
-    }
-    if let Some((head, rest)) = section.split_once(char::is_whitespace) {
-        if head.eq_ignore_ascii_case("HEADER.FIELDS") {
-            let inner = unwrap_group(rest.trim()).ok_or_else(invalid_fetch_items)?;
-            let fields: Vec<String> = inner.split_whitespace().map(String::from).collect();
+    let args = parse_arguments(section).map_err(|_| invalid_fetch_items())?;
+    match args.as_slice() {
+        [] => Ok(BodySection::Empty),
+        [ImapArg::Atom(name)] if name.eq_ignore_ascii_case("HEADER") => Ok(BodySection::Header),
+        [ImapArg::Atom(name)] if name.eq_ignore_ascii_case("TEXT") => Ok(BodySection::Text),
+        [ImapArg::Atom(name), ImapArg::List(list)]
+            if name.eq_ignore_ascii_case("HEADER.FIELDS") =>
+        {
+            let mut fields = Vec::new();
+            for field in list {
+                match field {
+                    ImapArg::Atom(field) | ImapArg::Quoted(field) if !field.is_empty() => {
+                        fields.push(field.clone());
+                    }
+                    _ => return Err(invalid_fetch_items()),
+                }
+            }
             if fields.is_empty() {
                 return Err(invalid_fetch_items());
             }
-            return Ok(BodySection::HeaderFields(fields));
+            Ok(BodySection::HeaderFields(fields))
         }
+        [ImapArg::Atom(name), ..] if name.starts_with(|c: char| c.is_ascii_digit()) => {
+            Ok(BodySection::Part(section.trim().to_string()))
+        }
+        _ => Err(invalid_fetch_items()),
     }
-    if section.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        return Ok(BodySection::Part(section.to_string()));
-    }
-    Err(invalid_fetch_items())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn atom(text: &str) -> ImapArg {
+        ImapArg::Atom(text.into())
+    }
+
+    fn quoted(text: &str) -> ImapArg {
+        ImapArg::Quoted(text.into())
+    }
+
+    /// The FETCH items of `a FETCH 1 <raw>`, parsed the way the session
+    /// parses them: tokenized as a command first.
+    fn fetch_items(raw: &str) -> Result<Vec<FetchItem>> {
+        let request = parse_line(&format!("a FETCH 1 {raw}"))?;
+        parse_fetch_items(&request.args[1..])
+    }
+
     #[test]
     fn parses_login_list_select_and_uid_fetch() {
         let request = parse_line("a001 LOGIN \"user@example\" \"pass word\"").unwrap();
         assert_eq!(request.tag, "a001");
         assert_eq!(request.command, "LOGIN");
-        assert_eq!(request.args[0], ImapArg::Quoted("user@example".into()));
-        assert_eq!(request.args[1], ImapArg::Quoted("pass word".into()));
+        assert_eq!(
+            request.args,
+            vec![quoted("user@example"), quoted("pass word")]
+        );
 
         let request = parse_line("a009 LIST \"\" \"*\"").unwrap();
         assert_eq!(request.command, "LIST");
-        assert_eq!(
-            request.args,
-            vec![ImapArg::Quoted(String::new()), ImapArg::Quoted("*".into())]
-        );
+        assert_eq!(request.args, vec![quoted(""), quoted("*")]);
 
         let request = parse_line("a010 SELECT INBOX").unwrap();
         assert_eq!(request.command, "SELECT");
-        assert_eq!(request.args, vec![ImapArg::Atom("INBOX".into())]);
+        assert_eq!(request.args, vec![atom("INBOX")]);
 
         let request =
             parse_line("a002 UID FETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)] UID)")
                 .unwrap();
         assert_eq!(request.command, "UID");
-        assert_eq!(request.args[0], ImapArg::Atom("FETCH".into()));
+        assert_eq!(request.args[0], atom("FETCH"));
         assert_eq!(
             request.args[2],
-            ImapArg::Raw("FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)] UID".into())
+            ImapArg::List(vec![
+                atom("FLAGS"),
+                atom("BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)]"),
+                atom("UID"),
+            ])
         );
-        let items =
-            parse_fetch_items("(FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)] UID)").unwrap();
+        let items = parse_fetch_items(&request.args[2..]).unwrap();
         assert_eq!(items[0], FetchItem::Flags);
         assert!(
-            matches!(items[1], FetchItem::Body { peek: true, section: BodySection::HeaderFields(ref f) } if f == &[String::from("SUBJECT"), String::from("FROM")])
+            matches!(items[1], FetchItem::Body { peek: true, section: BodySection::HeaderFields(ref f), .. } if f == &[String::from("SUBJECT"), String::from("FROM")])
         );
         assert_eq!(items[2], FetchItem::Uid);
     }
 
     #[test]
-    fn tolerates_extra_whitespace_and_captures_groups_raw() {
+    fn tolerates_extra_whitespace_and_nests_lists() {
         let request = parse_line("  a004   ID  (\"name\" \"test\")  ").unwrap();
         assert_eq!(request.tag, "a004");
         assert_eq!(request.command, "ID");
-        assert_eq!(request.args, vec![ImapArg::Raw("\"name\" \"test\"".into())]);
+        assert_eq!(
+            request.args,
+            vec![ImapArg::List(vec![quoted("name"), quoted("test")])]
+        );
+
+        // Lists nest, and a parenthesis ends an atom on either side.
+        let request = parse_line("a SEARCH OR (SEEN (FROM a)) NOT(UNSEEN)").unwrap();
+        assert_eq!(
+            request.args,
+            vec![
+                atom("OR"),
+                ImapArg::List(vec![
+                    atom("SEEN"),
+                    ImapArg::List(vec![atom("FROM"), atom("a")]),
+                ]),
+                atom("NOT"),
+                ImapArg::List(vec![atom("UNSEEN")]),
+            ]
+        );
     }
 
     #[test]
-    fn sequence_sets_cover_ranges_and_star() {
-        let set = parse_seq_set("2,4:6,*").unwrap();
-        assert!(!set.contains(1) && set.contains(2) && !set.contains(3) && set.contains(999_999));
-        assert!(parse_seq_set("0").is_err());
-        assert!(parse_seq_set("5:1").is_err());
+    fn lists_respect_quoted_strings() {
+        // A parenthesis inside a quoted string is text, not structure.
+        let request = parse_line("a SEARCH (SUBJECT \"a)b\" FROM \"(\")").unwrap();
+        assert_eq!(
+            request.args,
+            vec![ImapArg::List(vec![
+                atom("SUBJECT"),
+                quoted("a)b"),
+                atom("FROM"),
+                quoted("("),
+            ])]
+        );
+        // So is a bracket or parenthesis quoted inside a section.
+        let request = parse_line("a FETCH 1 BODY[HEADER.FIELDS (\"a]b\" \"c)d\")]").unwrap();
+        assert_eq!(
+            request.args[1],
+            atom("BODY[HEADER.FIELDS (\"a]b\" \"c)d\")]")
+        );
     }
 
     #[test]
-    fn sequence_sets_anchor_lone_star_and_all_ranges() {
-        let lone = parse_seq_set("*").unwrap();
-        assert!(lone.contains(1) && lone.contains(999_999));
-        let all = SeqSet::all();
-        assert!(all.contains(1) && all.contains(999_999));
-        let ranged = parse_seq_set("4:*").unwrap();
-        assert!(ranged.contains(4) && !ranged.contains(3));
-        let trailing = parse_seq_set("9:10,1,*").unwrap();
-        assert!(trailing.contains(1) && trailing.contains(9) && trailing.contains(999_999));
-        assert!(!trailing.contains(8));
-        let reversed_star = parse_seq_set("*:4").unwrap();
-        assert!(reversed_star.contains(4) && !reversed_star.contains(3));
-        let error = parse_seq_set("0").expect_err("zero must not parse");
-        assert!(matches!(error, Error::Unsupported(message) if message == "invalid sequence set"));
+    fn literals_fill_their_markers_anywhere_in_a_command() {
+        // Chained literals at the top level.
+        let request = parse_command(
+            &["a003 LOGIN {4}", " {7}", ""],
+            vec![b"user".to_vec(), b"hunter2".to_vec()],
+        )
+        .unwrap();
+        assert_eq!(
+            request.args,
+            vec![
+                ImapArg::Literal(b"user".to_vec()),
+                ImapArg::Literal(b"hunter2".to_vec()),
+            ]
+        );
+
+        // A literal inside a list: the list closes on the next line.
+        let request = parse_command(
+            &["a SEARCH (SUBJECT {3}", " SEEN) UNSEEN"],
+            vec![b"a b".to_vec()],
+        )
+        .unwrap();
+        assert_eq!(
+            request.args,
+            vec![
+                ImapArg::List(vec![
+                    atom("SUBJECT"),
+                    ImapArg::Literal(b"a b".to_vec()),
+                    atom("SEEN"),
+                ]),
+                atom("UNSEEN"),
+            ]
+        );
+
+        // Markers and literals must pair up exactly.
+        assert!(parse_command(&["a LOGIN {4}", ""], Vec::new()).is_err());
+        assert!(parse_command(&["a LOGIN x"], vec![b"user".to_vec()]).is_err());
+        assert!(parse_command(&["a LOGIN {5}", ""], vec![b"user".to_vec()]).is_err());
+        assert!(parse_command(&["a LOGIN {4} trailing"], vec![b"user".to_vec()]).is_err());
+    }
+
+    #[test]
+    fn detects_pending_literals() {
+        assert_eq!(pending_literal("a003 LOGIN {5}").unwrap(), Some(5));
+        assert_eq!(pending_literal("a003 LOGIN {5} ").unwrap(), Some(5));
+        assert_eq!(pending_literal(" {7}").unwrap(), Some(7));
+        assert_eq!(pending_literal("a SEARCH (SUBJECT {3}").unwrap(), Some(3));
+        assert_eq!(pending_literal("a003 LOGIN user").unwrap(), None);
+        assert_eq!(pending_literal("").unwrap(), None);
+        // Inside a quoted string a marker is text.
+        assert_eq!(pending_literal("a003 LOGIN \"x{5}\"").unwrap(), None);
+        assert_eq!(pending_literal("a003 LOGIN \"x {5}\"").unwrap(), None);
+        // A line that can never be valid announces nothing: the session
+        // answers BAD without a continuation.
+        assert!(pending_literal("a003 LOGIN {5+}").is_err());
+        assert!(pending_literal("a003 LOGIN {5} trailing").is_err());
+        assert!(pending_literal("a003 LOGIN \"x {5}").is_err());
+        assert!(pending_literal("a003 LOGIN {}").is_err());
+    }
+
+    /// Every number in `1..=max` the set selects.
+    fn selected(raw: &str, max: u32) -> Vec<u32> {
+        let set = parse_seq_set(raw).unwrap();
+        (1..=max).filter(|n| set.contains(*n, max)).collect()
+    }
+
+    #[test]
+    fn sequence_sets_treat_star_as_an_ordinary_endpoint() {
+        // `*` next to concrete numbers names the last message only —
+        // it never widens into a range.
+        assert_eq!(selected("2,4:6,*", 10), vec![2, 4, 5, 6, 10]);
+        assert_eq!(selected("1,*", 5), vec![1, 5]);
+        assert_eq!(selected("*", 5), vec![5]);
+        assert_eq!(selected("*:*", 5), vec![5]);
+        assert_eq!(selected("1:*", 5), vec![1, 2, 3, 4, 5]);
+        assert_eq!(selected("4:*", 5), vec![4, 5]);
+        assert_eq!(selected("*:4", 5), vec![4, 5]);
+        // A start beyond the end still names the last message: the
+        // range is `5:6` once `*` resolves.
+        assert_eq!(selected("6:*", 5), vec![5]);
+        // Finite ranges select what they name, nothing past the end.
+        assert_eq!(selected("2:4", 5), vec![2, 3, 4]);
+        assert!(selected("9:100", 5).is_empty());
+        // An empty mailbox selects nothing at all.
+        assert!(selected("*", 0).is_empty());
+        assert!(selected("1:*", 0).is_empty());
+        assert_eq!(SeqSet::all(), parse_seq_set("1:*").unwrap());
+    }
+
+    #[test]
+    fn sequence_sets_normalise_reversed_ranges() {
+        // RFC 3501 §9: `4:2` and `2:4` are the same set.
+        assert_eq!(selected("5:1", 6), vec![1, 2, 3, 4, 5]);
+        assert_eq!(selected("4:2,6", 6), vec![2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn sequence_sets_reject_malformed_input() {
+        for raw in [
+            "",
+            " ",
+            "0",
+            "1,",
+            ",1",
+            "1:",
+            ":1",
+            "a",
+            "1:2:3",
+            "+1",
+            "4294967296",
+        ] {
+            let error = parse_seq_set(raw).expect_err("malformed set must not parse");
+            assert!(
+                matches!(error, Error::Unsupported(message) if message == "invalid sequence set")
+            );
+        }
     }
 
     #[test]
@@ -629,71 +906,46 @@ mod tests {
     }
 
     #[test]
-    fn detects_pending_literals() {
-        assert_eq!(pending_literal("a003 LOGIN {5}"), Some(5));
-        assert_eq!(pending_literal("a003 LOGIN {5} "), Some(5));
-        assert_eq!(pending_literal("a003 LOGIN {5+}"), None);
-        assert_eq!(pending_literal("a003 LOGIN \"x{5}\""), None);
-        assert_eq!(pending_literal("a003 LOGIN user"), None);
-        // The trailing marker parses as an empty literal placeholder that
-        // the session fills after reading the announced bytes.
-        let request = parse_line("a003 LOGIN {5}").unwrap();
-        assert!(matches!(request.args[0], ImapArg::Literal(ref bytes) if bytes.is_empty()));
-    }
+    fn mailbox_names_round_trip_through_modified_utf7() {
+        // The RFC 3501 §5.1.3 example.
+        let name = "~peter/mail/台北/日本語";
+        let wire = "~peter/mail/&U,BTFw-/&ZeVnLIqe-";
+        assert_eq!(encode_mailbox_name(name), wire);
+        assert_eq!(decode_mailbox_name(wire).as_deref(), Some(name));
 
-    #[test]
-    fn continuation_lines_append_arguments_without_a_tag() {
-        // The bytes after one literal: more arguments, no tag or command.
-        let mut args = Vec::new();
-        parse_continuation(" hunter2", &mut args).unwrap();
-        assert_eq!(args, vec![ImapArg::Atom("hunter2".into())]);
+        for (name, wire) in [
+            ("Inbox", "Inbox"),
+            ("", ""),
+            ("Caffè", "Caff&AOg-"),
+            ("R&D", "R&-D"),
+            ("&", "&-"),
+            ("a\u{2215}b", "a&IhU-b"),
+            // Outside the BMP: a surrogate pair inside one run.
+            ("😀 mail", "&2D3eAA- mail"),
+            ("tab\there", "tab&AAk-here"),
+        ] {
+            assert_eq!(encode_mailbox_name(name), wire, "encoding {name:?}");
+            assert_eq!(
+                decode_mailbox_name(wire).as_deref(),
+                Some(name),
+                "decoding {wire:?}"
+            );
+            assert!(encode_mailbox_name(name).is_ascii());
+        }
 
-        // A quoted value with a space stays one argument.
-        let mut args = Vec::new();
-        parse_continuation(" \"pass word\"", &mut args).unwrap();
-        assert_eq!(args, vec![ImapArg::Quoted("pass word".into())]);
-
-        // A trailing marker appends the next placeholder to fill.
-        let mut args = vec![ImapArg::Literal(b"user".to_vec())];
-        parse_continuation(" {7}", &mut args).unwrap();
-        assert_eq!(args[0], ImapArg::Literal(b"user".to_vec()));
-        assert!(matches!(args[1], ImapArg::Literal(ref bytes) if bytes.is_empty()));
-
-        // An empty continuation line (the literal ended the command) adds
-        // nothing; an unterminated group is a parse error.
-        let mut args = Vec::new();
-        parse_continuation("", &mut args).unwrap();
-        assert!(args.is_empty());
-        assert!(parse_continuation(" (unclosed", &mut Vec::new()).is_err());
-    }
-
-    #[test]
-    fn lone_star_anchors_at_zero_for_the_session_to_clamp() {
-        // A lone `*` (or `*:*`) selects exactly the LAST message, so it
-        // anchors at `(0, None)` — a shape a concrete start can never
-        // produce — and the session resolves it against the mailbox.
-        let lone = parse_seq_set("*").unwrap();
-        assert_eq!(lone.ranges(), &[(0, None)]);
-        let stars = parse_seq_set("*,*:*").unwrap();
-        assert_eq!(stars.ranges(), &[(0, None), (0, None)]);
-
-        // Concrete starts keep their numbers: `1:*` is the ALL set and a
-        // trailing star anchors at the set's highest concrete number.
-        let all = parse_seq_set("1:*").unwrap();
-        assert_eq!(all.ranges(), &[(1, None)]);
-        let trailing = parse_seq_set("9:10,1,*").unwrap();
-        assert_eq!(
-            trailing.ranges(),
-            &[(9, Some(10)), (1, Some(1)), (10, None)]
-        );
-        let reversed = parse_seq_set("*:4").unwrap();
-        assert_eq!(reversed.ranges(), &[(4, None)]);
+        // Not modified UTF-7: an unterminated shift, bad base64, an odd
+        // byte count, a lone surrogate.
+        for wire in ["R&D", "a&AOg", "&!!!-", "&AOg", "&AA-", "&2D0-"] {
+            assert_eq!(decode_mailbox_name(wire), None, "{wire:?} must not decode");
+        }
+        // Raw UTF-8 with no shift passes through.
+        assert_eq!(decode_mailbox_name("Caffè").as_deref(), Some("Caffè"));
     }
 
     #[test]
     fn expands_fetch_macros() {
         assert_eq!(
-            parse_fetch_items("FAST").unwrap(),
+            fetch_items("FAST").unwrap(),
             vec![
                 FetchItem::Flags,
                 FetchItem::InternalDate,
@@ -701,7 +953,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            parse_fetch_items("ALL").unwrap(),
+            fetch_items("ALL").unwrap(),
             vec![
                 FetchItem::Flags,
                 FetchItem::InternalDate,
@@ -710,13 +962,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            parse_fetch_items("(full)").unwrap(),
+            fetch_items("(full)").unwrap(),
             vec![
                 FetchItem::Flags,
                 FetchItem::InternalDate,
                 FetchItem::Rfc822Size,
                 FetchItem::Envelope,
-                FetchItem::BodyStructure,
+                FetchItem::BodyBasic,
             ]
         );
     }
@@ -724,50 +976,126 @@ mod tests {
     #[test]
     fn parses_body_sections() {
         let items =
-            parse_fetch_items("(BODY[] BODY[HEADER] BODY[TEXT] BODY.PEEK[] BODY[1.2] BODY)")
-                .unwrap();
+            fetch_items("(BODY[] BODY[HEADER] BODY[TEXT] BODY.PEEK[] BODY[1.2] BODY)").unwrap();
         assert_eq!(
             items,
             vec![
                 FetchItem::Body {
                     peek: false,
-                    section: BodySection::Empty
+                    section: BodySection::Empty,
+                    partial: None,
                 },
                 FetchItem::Body {
                     peek: false,
-                    section: BodySection::Header
+                    section: BodySection::Header,
+                    partial: None,
                 },
                 FetchItem::Body {
                     peek: false,
-                    section: BodySection::Text
+                    section: BodySection::Text,
+                    partial: None,
                 },
                 FetchItem::Body {
                     peek: true,
-                    section: BodySection::Empty
+                    section: BodySection::Empty,
+                    partial: None,
                 },
                 FetchItem::Body {
                     peek: false,
-                    section: BodySection::Part("1.2".into())
+                    section: BodySection::Part("1.2".into()),
+                    partial: None,
                 },
-                FetchItem::BodyStructure,
+                FetchItem::BodyBasic,
             ]
         );
     }
 
     #[test]
+    fn header_field_sections_parse_bare_or_in_a_list() {
+        let wanted = vec![FetchItem::Body {
+            peek: false,
+            section: BodySection::HeaderFields(vec!["DATE".into(), "FROM".into()]),
+            partial: None,
+        }];
+        // The unparenthesized form is one item, not three tokens.
+        assert_eq!(
+            fetch_items("BODY[HEADER.FIELDS (DATE FROM)]").unwrap(),
+            wanted
+        );
+        assert_eq!(
+            fetch_items("(BODY[HEADER.FIELDS (DATE FROM)])").unwrap(),
+            wanted
+        );
+        // Quoted field names are the names themselves.
+        assert_eq!(
+            fetch_items("body[header.fields (\"DATE\" FROM)]").unwrap(),
+            wanted
+        );
+        assert!(fetch_items("BODY[HEADER.FIELDS ()]").is_err());
+        assert!(fetch_items("BODY[HEADER.FIELDS DATE]").is_err());
+        assert!(fetch_items("BODY[HEADER.FIELDS.NOT (DATE)]").is_err());
+    }
+
+    #[test]
+    fn parses_partial_fetches() {
+        assert_eq!(
+            fetch_items("(BODY.PEEK[]<0.65536> BODY[TEXT]<10.5>)").unwrap(),
+            vec![
+                FetchItem::Body {
+                    peek: true,
+                    section: BodySection::Empty,
+                    partial: Some((0, 65536)),
+                },
+                FetchItem::Body {
+                    peek: false,
+                    section: BodySection::Text,
+                    partial: Some((10, 5)),
+                },
+            ]
+        );
+        assert!(matches!(
+            fetch_items("BODY[HEADER.FIELDS (DATE)]<0.1>").unwrap()[0],
+            FetchItem::Body {
+                partial: Some((0, 1)),
+                ..
+            }
+        ));
+        for raw in [
+            "BODY[]<0>",
+            "BODY[]<0.0>",
+            "BODY[]<.5>",
+            "BODY[]<0.5",
+            "BODY[]0.5>",
+            "BODY[]<a.5>",
+            "BODY[]<0.5>x",
+            "BODY[]<0.99999999999>",
+            "RFC822<0.5>",
+        ] {
+            assert!(fetch_items(raw).is_err(), "{raw} must not parse");
+        }
+    }
+
+    #[test]
     fn item_names_are_case_insensitive() {
         assert_eq!(
-            parse_fetch_items("(flags uid)").unwrap(),
+            fetch_items("(flags uid)").unwrap(),
             vec![FetchItem::Flags, FetchItem::Uid]
+        );
+        assert_eq!(
+            fetch_items("(bodystructure body)").unwrap(),
+            vec![FetchItem::BodyStructure, FetchItem::BodyBasic]
         );
     }
 
     #[test]
     fn rejects_malformed_fetch_lists() {
-        assert!(parse_fetch_items("(FLAGS").is_err());
-        assert!(parse_fetch_items("BOGUS").is_err());
-        assert!(parse_fetch_items("(BODY[HEADER").is_err());
-        let error = parse_fetch_items("BOGUS").expect_err("bogus item must not parse");
+        assert!(fetch_items("(FLAGS").is_err());
+        assert!(fetch_items("BOGUS").is_err());
+        assert!(fetch_items("(BODY[HEADER").is_err());
+        assert!(fetch_items("FLAGS UID").is_err());
+        assert!(fetch_items("(FLAGS (UID))").is_err());
+        assert!(fetch_items("()").is_err());
+        let error = fetch_items("BOGUS").expect_err("bogus item must not parse");
         assert!(matches!(error, Error::Unsupported(message) if message == "invalid fetch items"));
     }
 
@@ -778,7 +1106,11 @@ mod tests {
         assert!(parse_line("a001").is_err());
         assert!(parse_line("a001 LOGIN \"unterminated").is_err());
         assert!(parse_line("a001 LOGIN (unclosed").is_err());
+        assert!(parse_line("a001 LOGIN unopened)").is_err());
         assert!(parse_line("a001 LOGIN {5} trailing").is_err());
+        assert!(parse_line("a001 FETCH 1 BODY[unclosed").is_err());
+        let deep = format!("a SEARCH {}ALL{}", "(".repeat(64), ")".repeat(64));
+        assert!(parse_line(&deep).is_err());
         // `Request` deliberately has no `Debug`, so the outcome is
         // discarded without `expect_err`.
         let error = parse_line("").err().expect("empty line must not parse");

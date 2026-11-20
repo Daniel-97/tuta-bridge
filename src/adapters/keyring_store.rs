@@ -78,8 +78,23 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "requires a running Secret Service; run manually"]
+    fn default_store_is_the_keychain_not_mock() {
+        // Without the `apple-native` feature keyring silently falls back
+        // to its in-memory mock store, which forgets everything on exit.
+        let entry = keyring::Entry::new("tuta-bridge-test", "backend-check").unwrap();
+        assert!(
+            entry
+                .get_credential()
+                .downcast_ref::<keyring::macos::MacCredential>()
+                .is_some(),
+            "default keyring backend must be the macOS Keychain, not mock"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the system keyring; run manually"]
     fn keyring_roundtrip() {
         let store = KeyringCredentialStore::new("tuta-bridge-test");
         let account = AccountId("test@example.invalid".into());

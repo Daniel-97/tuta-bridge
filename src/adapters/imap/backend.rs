@@ -16,14 +16,15 @@
 use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
-use time::Date;
+use tokio::sync::Mutex;
 
-use super::codec::{parse_seq_set, BodySection, FetchItem, SeqSet};
+use super::codec::{BodySection, FetchItem};
 use super::render;
+use super::search::SearchKey;
 use crate::app::enrich::EnvelopeEnricher;
 use crate::domain::{
-    Address, Error, FolderKind, MailboxId, MessageHeader, MessageSummary, Result, StoredMailbox,
-    StoredMessage,
+    Address, Error, Folder, FolderKind, MailboxId, MessageContent, MessageHeader, MessagePage,
+    MessageSummary, Result, StoredMailbox, StoredMessage,
 };
 use crate::ports::imap_backend::{FetchResponse, ImapBackend, MailboxView, SelectedMailbox};
 use crate::ports::local_password::LocalPasswordStore;
@@ -88,16 +89,71 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Resolve one requested mailbox name against a stored mailbox.
+/// What a `/` inside a folder name is listed as: DIVISION SLASH, which
+/// looks the same and is not the hierarchy delimiter.
+const SOLIDUS_STAND_IN: &str = "\u{2215}";
+
+/// `INBOX` in any casing: the one mailbox name RFC 3501 compares
+/// case-insensitively.
+fn is_inbox_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("INBOX")
+}
+
+/// The name each stored mailbox is listed and selected under, in the
+/// order given. The store is flat and Tuta lets folder names repeat, so
+/// the stored name is not always usable as it is:
 ///
-/// `INBOX` is case-insensitive and resolves the folder whose *kind* is
-/// Inbox (its display name may be localized); every other name matches
-/// exactly.
-fn name_matches(requested: &str, mailbox: &StoredMailbox) -> bool {
-    if requested.eq_ignore_ascii_case("INBOX") {
-        return mailbox.kind == FolderKind::Inbox;
+/// * the Inbox-kind folder keeps its name when that is `INBOX` in some
+///   casing and is listed as `INBOX` otherwise, so it is always the
+///   mailbox `INBOX` names;
+/// * a `/` in a name becomes [`SOLIDUS_STAND_IN`], so the delimiter
+///   never invents a hierarchy that does not exist;
+/// * names are unique: of several mailboxes with the same name the
+///   first keeps it and the others get ` (2)`, ` (3)`, … — system
+///   folders first, then lowest mailbox id, so the outcome does not
+///   depend on listing order. Any casing of `INBOX` counts as the
+///   Inbox's name.
+///
+/// The suffix is the smallest that is free, which keeps both
+/// mailboxes reachable; if the first of two namesakes is deleted the
+/// second takes over the plain name and its clients see a rename.
+fn imap_names(mailboxes: &[StoredMailbox]) -> Vec<String> {
+    let rank = |kind: &FolderKind| match kind {
+        FolderKind::Inbox => 0,
+        FolderKind::Custom => 2,
+        _ => 1,
+    };
+    let mut order: Vec<usize> = (0..mailboxes.len()).collect();
+    order.sort_by_key(|&index| (rank(&mailboxes[index].kind), mailboxes[index].id.0));
+
+    let same = |a: &str, b: &str| a == b || (is_inbox_name(a) && is_inbox_name(b));
+    let mut names = vec![String::new(); mailboxes.len()];
+    let mut taken: Vec<String> = Vec::new();
+    for index in order {
+        let mailbox = &mailboxes[index];
+        let base = if mailbox.kind != FolderKind::Inbox {
+            mailbox.name.replace('/', SOLIDUS_STAND_IN)
+        } else if is_inbox_name(&mailbox.name) {
+            mailbox.name.clone()
+        } else {
+            "INBOX".to_string()
+        };
+        let mut name = base.clone();
+        let mut copy = 2usize;
+        while taken.iter().any(|other| same(other, &name)) {
+            name = format!("{base} ({copy})");
+            copy += 1;
+        }
+        taken.push(name.clone());
+        names[index] = name;
     }
-    requested == mailbox.name
+    names
+}
+
+/// Whether `requested` names the mailbox listed as `listed`: exactly,
+/// or as `INBOX` in any casing.
+fn name_matches(requested: &str, listed: &str) -> bool {
+    requested == listed || (is_inbox_name(requested) && is_inbox_name(listed))
 }
 
 /// The summary every content load derives from a stored header — the
@@ -210,193 +266,6 @@ fn slice_body_section(rendered: &[u8], section: &BodySection) -> Result<Vec<u8>>
 // SEARCH
 // ---------------------------------------------------------------------------
 
-/// One parsed SEARCH criterion.
-enum SearchKey {
-    All,
-    Unseen,
-    Seen,
-    /// `UID <set>`.
-    Uid(SeqSet),
-    /// A bare sequence set: message numbers, 1-based positions.
-    Sequence(SeqSet),
-    /// `SINCE <date>`: received on or after the UTC day start.
-    Since(i64),
-    /// `BEFORE <date>`: received strictly before the UTC day start.
-    Before(i64),
-    /// `ON <date>`: received within the UTC day `[start, end)`.
-    On(i64, i64),
-    /// `SUBJECT/FROM/TO/CC/HEADER <field> <value>`: case-insensitive
-    /// substring match over the stored (partial or enriched) header
-    /// field.
-    Header {
-        field: String,
-        value: String,
-    },
-    /// `LARGER <n>`: stored RFC 822 size strictly larger than `n`.
-    Larger(u64),
-    /// `SMALLER <n>`: stored RFC 822 size strictly smaller than `n`.
-    Smaller(u64),
-    Not(Box<SearchKey>),
-    Or(Box<SearchKey>, Box<SearchKey>),
-}
-
-fn invalid_search_criteria() -> Error {
-    Error::Unsupported("invalid search criteria".into())
-}
-
-fn unsupported_search_key() -> Error {
-    Error::Unsupported("search key not supported".into())
-}
-
-fn invalid_search_date() -> Error {
-    Error::Unsupported("invalid search date".into())
-}
-
-/// Consume the next criterion token or fail with the fixed message.
-fn next_token<'a>(criteria: &'a [String], cursor: &mut usize) -> Result<&'a str> {
-    match criteria.get(*cursor) {
-        Some(token) => {
-            *cursor += 1;
-            Ok(token.as_str())
-        }
-        None => Err(invalid_search_criteria()),
-    }
-}
-
-/// Parse an IMAP date `dd-Mmm-yyyy`.
-///
-/// RFC 3501 spells the month `Nov`, but clients send any casing; the
-/// fixed `time` format matches the month case-sensitively by default,
-/// so the component parses with `case_sensitive=false`, which accepts
-/// `nov`, `NOV`, and `Nov` alike. RFC 3501 date-days carry one or two
-/// digits; the one-digit form retries zero-padded.
-fn parse_search_date(raw: &str) -> Result<Date> {
-    let format =
-        time::macros::format_description!("[day]-[month repr:short case_sensitive:false]-[year]");
-    let trimmed = raw.trim();
-    if let Ok(date) = Date::parse(trimmed, &format) {
-        return Ok(date);
-    }
-    let padded = match trimmed.split_once('-') {
-        Some((day, rest)) if day.len() == 1 && day.bytes().all(|b| b.is_ascii_digit()) => {
-            format!("0{day}-{rest}")
-        }
-        _ => return Err(invalid_search_date()),
-    };
-    Date::parse(&padded, &format).map_err(|_| invalid_search_date())
-}
-
-/// UTC milliseconds at the start of the given day.
-fn day_start_ms(date: Date) -> i64 {
-    date.midnight()
-        .assume_utc()
-        .unix_timestamp()
-        .saturating_mul(1000)
-}
-
-/// UTC milliseconds at the start of the day after `date`.
-fn next_day_start_ms(date: Date) -> i64 {
-    match date.next_day() {
-        Some(next) => day_start_ms(next),
-        None => i64::MAX,
-    }
-}
-
-/// Parse one key at `cursor`, consuming its argument tokens.
-fn parse_search_key(criteria: &[String], cursor: &mut usize, depth: usize) -> Result<SearchKey> {
-    if depth > MAX_SEARCH_KEY_DEPTH {
-        return Err(invalid_search_criteria());
-    }
-    let token = next_token(criteria, cursor)?;
-    match token.to_ascii_uppercase().as_str() {
-        "ALL" => Ok(SearchKey::All),
-        "UNSEEN" => Ok(SearchKey::Unseen),
-        "SEEN" => Ok(SearchKey::Seen),
-        "UID" => Ok(SearchKey::Uid(parse_seq_set(next_token(
-            criteria, cursor,
-        )?)?)),
-        "SINCE" => Ok(SearchKey::Since(day_start_ms(parse_search_date(
-            next_token(criteria, cursor)?,
-        )?))),
-        "BEFORE" => Ok(SearchKey::Before(day_start_ms(parse_search_date(
-            next_token(criteria, cursor)?,
-        )?))),
-        "ON" => {
-            let date = parse_search_date(next_token(criteria, cursor)?)?;
-            Ok(SearchKey::On(day_start_ms(date), next_day_start_ms(date)))
-        }
-        "SUBJECT" => Ok(SearchKey::Header {
-            field: "Subject".into(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "FROM" => Ok(SearchKey::Header {
-            field: "From".into(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "TO" => Ok(SearchKey::Header {
-            field: "To".into(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "CC" => Ok(SearchKey::Header {
-            field: "Cc".into(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "HEADER" => Ok(SearchKey::Header {
-            field: next_token(criteria, cursor)?.to_string(),
-            value: next_token(criteria, cursor)?.to_string(),
-        }),
-        "LARGER" => Ok(SearchKey::Larger(
-            next_token(criteria, cursor)?
-                .parse()
-                .map_err(|_| invalid_search_criteria())?,
-        )),
-        "SMALLER" => Ok(SearchKey::Smaller(
-            next_token(criteria, cursor)?
-                .parse()
-                .map_err(|_| invalid_search_criteria())?,
-        )),
-        "NOT" => Ok(SearchKey::Not(Box::new(parse_search_key(
-            criteria,
-            cursor,
-            depth + 1,
-        )?))),
-        "OR" => {
-            let first = parse_search_key(criteria, cursor, depth + 1)?;
-            let second = parse_search_key(criteria, cursor, depth + 1)?;
-            Ok(SearchKey::Or(Box::new(first), Box::new(second)))
-        }
-        // Body/text search needs decrypted bodies in the store, which the
-        // bridge deliberately never keeps. Keyword and remaining flag
-        // keys have no Tuta equivalent — NEW/OLD are \Recent-based, and
-        // their only faithful reductions (nothing / everything) would be
-        // a lie, so they are refused like the rest.
-        "BODY" | "TEXT" | "KEYWORD" | "UNKEYWORD" | "ANSWERED" | "DELETED" | "DRAFT"
-        | "FLAGGED" | "RECENT" | "NEW" | "OLD" => Err(unsupported_search_key()),
-        _ => match parse_seq_set(token) {
-            // A bare sequence set (SEARCH 1:2) selects message numbers.
-            Ok(set) => Ok(SearchKey::Sequence(set)),
-            Err(_) => Err(unsupported_search_key()),
-        },
-    }
-}
-
-/// Deepest NOT/OR nesting accepted; deeper trees fail with the fixed
-/// criteria error instead of recursing without bound.
-const MAX_SEARCH_KEY_DEPTH: usize = 16;
-
-/// Parse the full criterion list into the keys every message must match.
-fn parse_search_criteria(criteria: &[String]) -> Result<Vec<SearchKey>> {
-    if criteria.is_empty() {
-        return Err(invalid_search_criteria());
-    }
-    let mut cursor = 0;
-    let mut keys = Vec::new();
-    while cursor < criteria.len() {
-        keys.push(parse_search_key(criteria, &mut cursor, 0)?);
-    }
-    Ok(keys)
-}
-
 /// One address as searchable text: name and address both match.
 fn address_text(address: &Address) -> String {
     match &address.name {
@@ -451,29 +320,19 @@ fn stored_header_value(header: &MessageHeader, field: &str) -> Option<String> {
     }
 }
 
-/// Whether `n` falls inside the set, with the star semantics of
-/// RFC 3501 §6.4.8 resolved against `max` — the largest number in
-/// use in the caller's space (positions or uids):
-///
-/// * a lone `*` (`(0, None)`) selects exactly the last number;
-/// * `x:*` selects `x..max`, and an `x` beyond `max` still selects
-///   the last number, so a `UID <max+1>:*` probe never misses the
-///   newest mail;
-/// * finite ranges select what they name.
-///
-/// This mirrors the resolution the session applies on the FETCH
-/// path, kept backend-side on purpose: a shared helper would couple
-/// the two modules for a refinement that does not need it yet.
-fn number_in_set(set: &SeqSet, n: u32, max: u32) -> bool {
-    set.ranges().iter().any(|&(start, stop)| match stop {
-        Some(stop) => start <= n && n <= stop,
-        None if start == 0 => n == max,
-        None => start <= n || n == max,
-    })
+/// The time the `SENT*` keys compare: the `Date:` header once the row
+/// is enriched, the received time until then — the same fallback the
+/// stored sent date itself uses for undated mail.
+fn sent_ms(header: &MessageHeader) -> i64 {
+    if header.sent_at_ms > 0 {
+        header.sent_at_ms
+    } else {
+        header.received_at_ms
+    }
 }
 
 /// Evaluate one key against a stored message; `msn` is the message's
-/// 1-based position in the mailbox, `len` the mailbox's message
+/// number in the searching session's view, `len` that view's message
 /// count, and `max_uid` its highest uid — the ends star ranges
 /// resolve against in each space.
 fn search_key_matches(
@@ -487,12 +346,18 @@ fn search_key_matches(
         SearchKey::All => true,
         SearchKey::Unseen => message.header.unread,
         SearchKey::Seen => !message.header.unread,
-        SearchKey::Uid(set) => number_in_set(set, message.uid, max_uid),
-        SearchKey::Sequence(set) => number_in_set(set, msn, len),
+        SearchKey::Uid(set) => set.contains(message.uid, max_uid),
+        SearchKey::Sequence(set) => set.contains(msn, len),
         SearchKey::Since(start) => message.header.received_at_ms >= *start,
         SearchKey::Before(start) => message.header.received_at_ms < *start,
         SearchKey::On(start, end) => {
             message.header.received_at_ms >= *start && message.header.received_at_ms < *end
+        }
+        SearchKey::SentSince(start) => sent_ms(&message.header) >= *start,
+        SearchKey::SentBefore(start) => sent_ms(&message.header) < *start,
+        SearchKey::SentOn(start, end) => {
+            let sent = sent_ms(&message.header);
+            sent >= *start && sent < *end
         }
         SearchKey::Header { field, value } => {
             match stored_header_value(&message.header, field) {
@@ -510,6 +375,9 @@ fn search_key_matches(
             search_key_matches(first, msn, len, max_uid, message)
                 || search_key_matches(second, msn, len, max_uid, message)
         }
+        SearchKey::And(keys) => keys
+            .iter()
+            .all(|key| search_key_matches(key, msn, len, max_uid, message)),
     }
 }
 
@@ -517,45 +385,88 @@ fn search_key_matches(
 // Backend
 // ---------------------------------------------------------------------------
 
-impl TutaImapBackend {
-    /// Render one body section for `stored`, loading content exactly
-    /// once.
-    ///
-    /// Non-peek renders persist a still-missing `rfc822_size` (the
-    /// length is known the moment the bytes exist); PEEK renders but
-    /// never persists anything. Part sections are refused before any
-    /// load.
-    async fn body_section(
-        &self,
-        mailbox: MailboxId,
-        stored: &mut StoredMessage,
-        peek: bool,
-        section: &BodySection,
-    ) -> Result<Vec<u8>> {
-        if matches!(section, BodySection::Part(_)) {
-            return Err(unsupported_part_section());
+/// A [`MailSource`] view that loads one message's content at most
+/// once: the enricher and the body renderer of a single FETCH share
+/// it, so a request needing both costs one download, not two.
+struct OnceSource<'a> {
+    inner: &'a dyn MailSource,
+    loaded: Mutex<Option<MessageContent>>,
+}
+
+impl<'a> OnceSource<'a> {
+    fn new(inner: &'a dyn MailSource) -> Self {
+        Self {
+            inner,
+            loaded: Mutex::new(None),
         }
-
-        let content = self.source.content(&summary_of(stored)).await?;
-        let rendered = self.renderer.render(&content)?;
-
-        if !peek && stored.rfc822_size.is_none() {
-            let size = u64::try_from(rendered.len())
-                .map_err(|_| Error::Storage("message size out of range".into()))?;
-            self.store
-                .update_metadata(mailbox, stored.uid, &stored.header, Some(size))
-                .await?;
-            stored.rfc822_size = Some(size);
-        }
-
-        slice_body_section(&rendered, section)
     }
 
-    /// Enrich `stored` once, returning the enriched snapshot.
-    async fn enrich(&self, mailbox: MailboxId, stored: &StoredMessage) -> Result<StoredMessage> {
-        self.enricher
-            .enrich(mailbox, stored, self.source.as_ref())
-            .await
+    /// The content, handed over for good: the copy an earlier load
+    /// kept, or a first load.
+    async fn take(&self, message: &MessageSummary) -> Result<MessageContent> {
+        match self.loaded.lock().await.take() {
+            Some(content) => Ok(content),
+            None => self.inner.content(message).await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MailSource for OnceSource<'_> {
+    async fn folders(&self) -> Result<Vec<Folder>> {
+        self.inner.folders().await
+    }
+
+    async fn messages(&self, folder: &Folder, limit: usize) -> Result<Vec<MessageSummary>> {
+        self.inner.messages(folder, limit).await
+    }
+
+    async fn content(&self, message: &MessageSummary) -> Result<MessageContent> {
+        let mut loaded = self.loaded.lock().await;
+        if let Some(content) = loaded.as_ref() {
+            return Ok(content.clone());
+        }
+        let content = self.inner.content(message).await?;
+        *loaded = Some(content.clone());
+        Ok(content)
+    }
+
+    async fn headers_page(
+        &self,
+        folder: &Folder,
+        start: Option<&str>,
+        limit: usize,
+    ) -> Result<MessagePage> {
+        self.inner.headers_page(folder, start, limit).await
+    }
+}
+
+/// One mailbox as LIST answers it, under its listed name.
+fn view_of(mailbox: &StoredMailbox, name: String) -> MailboxView {
+    MailboxView {
+        id: mailbox.id,
+        name,
+        special_use: render::special_use(&mailbox.kind),
+    }
+}
+
+impl TutaImapBackend {
+    /// Every stored mailbox with the name it is listed under.
+    async fn listed(&self) -> Result<Vec<(StoredMailbox, String)>> {
+        let mailboxes = self.store.mailboxes(self.account_id).await?;
+        let names = imap_names(&mailboxes);
+        Ok(mailboxes.into_iter().zip(names).collect())
+    }
+
+    /// The current state of one stored mailbox. The message list is the
+    /// store's cheap `(uid, unread)` read: no header is loaded.
+    async fn opened(&self, found: &StoredMailbox, listed: String) -> Result<SelectedMailbox> {
+        Ok(SelectedMailbox {
+            view: view_of(found, listed),
+            uidvalidity: found.uidvalidity,
+            uidnext: found.next_uid,
+            messages: self.store.message_uids(found.id).await?,
+        })
     }
 }
 
@@ -595,39 +506,45 @@ impl ImapBackend for TutaImapBackend {
 
     async fn mailboxes(&self) -> Result<Vec<MailboxView>> {
         Ok(self
-            .store
-            .mailboxes(self.account_id)
+            .listed()
             .await?
             .into_iter()
-            .map(|mailbox| MailboxView {
-                id: mailbox.id,
-                name: mailbox.name,
-                special_use: render::special_use(&mailbox.kind),
-            })
+            .map(|(mailbox, name)| view_of(&mailbox, name))
             .collect())
     }
 
     async fn select(&self, name: &str) -> Result<Option<SelectedMailbox>> {
-        let mailboxes = self.store.mailboxes(self.account_id).await?;
-        let Some(found) = mailboxes.iter().find(|mailbox| name_matches(name, mailbox)) else {
-            return Ok(None);
-        };
-        let view = MailboxView {
-            id: found.id,
-            name: found.name.clone(),
-            special_use: render::special_use(&found.kind),
-        };
-        let messages = self.store.messages(found.id).await?;
-        Ok(Some(SelectedMailbox {
-            view,
-            uidvalidity: found.uidvalidity,
-            uidnext: found.next_uid,
-            exists: messages.len(),
-            unseen: messages
-                .iter()
-                .filter(|message| message.header.unread)
-                .count(),
-        }))
+        match self
+            .listed()
+            .await?
+            .into_iter()
+            .find(|(_, listed)| name_matches(name, listed))
+        {
+            Some((found, listed)) => Ok(Some(self.opened(&found, listed).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn snapshot(&self, mailbox: MailboxId) -> Result<Option<SelectedMailbox>> {
+        match self
+            .listed()
+            .await?
+            .into_iter()
+            .find(|(stored, _)| stored.id == mailbox)
+        {
+            Some((found, listed)) => Ok(Some(self.opened(&found, listed).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn uidvalidity(&self, mailbox: MailboxId) -> Result<Option<u32>> {
+        Ok(self
+            .store
+            .mailboxes(self.account_id)
+            .await?
+            .iter()
+            .find(|stored| stored.id == mailbox)
+            .map(|stored| stored.uidvalidity))
     }
 
     async fn fetch(
@@ -640,98 +557,128 @@ impl ImapBackend for TutaImapBackend {
             return Ok(None);
         };
 
-        // UID, FLAGS, and INTERNALDATE come free from the stored header.
-        let mut response = FetchResponse {
+        // Numeric part sections are refused before any load: a verdict
+        // about the request, not about this message.
+        if items.iter().any(|item| {
+            matches!(
+                item,
+                FetchItem::Body {
+                    section: BodySection::Part(_),
+                    ..
+                }
+            )
+        }) {
+            return Err(unsupported_part_section());
+        }
+
+        let wants_body = items.iter().any(FetchItem::is_body);
+        let wants_structure = items
+            .iter()
+            .any(|item| matches!(item, FetchItem::BodyStructure | FetchItem::BodyBasic));
+        let wants_size = items.contains(&FetchItem::Rfc822Size);
+
+        // One content load serves the whole request: the enricher and
+        // the body renderer read through the same once-only source.
+        let source = OnceSource::new(self.source.as_ref());
+
+        // The structure and the size answer from the store; a missing
+        // one costs exactly one enrichment, already persisted. A stale
+        // row — marked complete, zero sent date — heals through the
+        // same enrichment before anything is rendered from it.
+        if (wants_structure && stored.mime_structure.is_none())
+            || (wants_size && stored.rfc822_size.is_none())
+            || ((wants_structure || wants_size || wants_body) && stale_complete(&stored))
+        {
+            stored = self.enricher.enrich(mailbox, &stored, &source).await?;
+        }
+
+        // Bodies always re-render — there is no stored body — but once
+        // per request, however many sections it asks for.
+        let mut bodies = Vec::new();
+        if wants_body {
+            let content = source.take(&summary_of(&stored)).await?;
+            let rendered = self.renderer.render(&content)?;
+            drop(content);
+
+            // RFC822 and RFC822.TEXT are the non-peek equivalents of
+            // BODY[]/BODY[TEXT] (RFC 3501 §6.4.5). RFC822.HEADER is
+            // functionally equivalent to BODY.PEEK[HEADER] — §6.4.5
+            // says so outright, and §7.4.2's "Equivalent to
+            // BODY[HEADER]" is response-data naming whose own note
+            // says \Seen is not set — so it never persists anything.
+            let non_peek = items.iter().any(|item| {
+                matches!(
+                    item,
+                    FetchItem::Body { peek: false, .. } | FetchItem::Rfc822 | FetchItem::Rfc822Text
+                )
+            });
+            // A non-peek render persists a still-missing size (the
+            // length is known the moment the bytes exist); PEEK renders
+            // but never persists anything.
+            if non_peek && stored.rfc822_size.is_none() {
+                let size = u64::try_from(rendered.len())
+                    .map_err(|_| Error::Storage("message size out of range".into()))?;
+                self.store
+                    .update_metadata(mailbox, stored.uid, &stored.header, Some(size))
+                    .await?;
+                stored.rfc822_size = Some(size);
+            }
+
+            for item in items {
+                let section = match item {
+                    FetchItem::Body { section, .. } => section,
+                    FetchItem::Rfc822 => &BodySection::Empty,
+                    FetchItem::Rfc822Text => &BodySection::Text,
+                    FetchItem::Rfc822Header => &BodySection::Header,
+                    _ => continue,
+                };
+                bodies.push(slice_body_section(&rendered, section)?);
+            }
+        }
+
+        // UID, FLAGS, and INTERNALDATE come free from the stored
+        // header, and the envelope renders from it as-is — partial or
+        // complete — never a network load.
+        Ok(Some(FetchResponse {
             uid: stored.uid,
             flags: render::flags(stored.header.unread),
             internal_date: render::internal_date(stored.header.received_at_ms),
-            envelope: None,
-            bodystructure: None,
-            rfc822_size: None,
-            body: None,
-        };
-
-        for item in items {
-            match item {
-                FetchItem::Uid | FetchItem::Flags | FetchItem::InternalDate => {}
-                // The envelope renders from the stored header as-is —
-                // partial or complete — and never a network load.
-                FetchItem::Envelope => {
-                    response.envelope = Some(render::envelope(&stored.header));
-                }
-                // The structure answers from the store; a missing one
-                // costs exactly one enrichment, already persisted. A
-                // stale row — marked complete, zero sent date — heals
-                // through the same enrichment, exactly once.
-                FetchItem::BodyStructure => {
-                    if stored.mime_structure.is_none() || stale_complete(&stored) {
-                        stored = self.enrich(mailbox, &stored).await?;
-                    }
-                    response.bodystructure = stored.mime_structure.clone();
-                }
-                // The size answers from the store; a missing one costs
-                // exactly one enrichment, without re-rendering here. A
-                // stale row heals the same way.
-                FetchItem::Rfc822Size => {
-                    if stored.rfc822_size.is_none() || stale_complete(&stored) {
-                        stored = self.enrich(mailbox, &stored).await?;
-                    }
-                    response.rfc822_size = stored.rfc822_size;
-                }
-                FetchItem::Body { peek, section } => {
-                    // A stale row heals before the by-design re-render;
-                    // partial rows keep the body-only path.
-                    if stale_complete(&stored) {
-                        stored = self.enrich(mailbox, &stored).await?;
-                    }
-                    let bytes = self
-                        .body_section(mailbox, &mut stored, *peek, section)
-                        .await?;
-                    response.body = Some(bytes);
-                }
-                // RFC822 and RFC822.TEXT are the non-peek equivalents of
-                // BODY[]/BODY[TEXT] (RFC 3501 §6.4.5). RFC822.HEADER is
-                // functionally equivalent to BODY.PEEK[HEADER] — §6.4.5
-                // says so outright, and §7.4.2's "Equivalent to
-                // BODY[HEADER]" is response-data naming whose own note
-                // says \Seen is not set — so it renders and slices but
-                // never persists.
-                FetchItem::Rfc822 | FetchItem::Rfc822Text | FetchItem::Rfc822Header => {
-                    let (peek, section) = match item {
-                        FetchItem::Rfc822 => (false, BodySection::Empty),
-                        FetchItem::Rfc822Text => (false, BodySection::Text),
-                        _ => (true, BodySection::Header),
-                    };
-                    let bytes = self
-                        .body_section(mailbox, &mut stored, peek, &section)
-                        .await?;
-                    response.body = Some(bytes);
-                }
-            }
-        }
-        Ok(Some(response))
+            envelope: items
+                .contains(&FetchItem::Envelope)
+                .then(|| render::envelope(&stored.header)),
+            bodystructure: if wants_structure {
+                stored.mime_structure.clone()
+            } else {
+                None
+            },
+            rfc822_size: if wants_size { stored.rfc822_size } else { None },
+            bodies,
+        }))
     }
 
-    async fn search(&self, mailbox: MailboxId, criteria: &[String]) -> Result<Vec<u32>> {
-        let keys = parse_search_criteria(criteria)?;
+    async fn search(
+        &self,
+        mailbox: MailboxId,
+        keys: &[SearchKey],
+        view: &[u32],
+    ) -> Result<Vec<u32>> {
         let messages = self.store.messages(mailbox).await?;
-        // Star ranges resolve against the ends actually in use: the
-        // message count in MSN space, the highest uid in UID space.
-        let len = u32::try_from(messages.len()).unwrap_or(u32::MAX);
-        let max_uid = messages
-            .iter()
-            .map(|message| message.uid)
-            .max()
-            .unwrap_or(0);
+        // Numbers and star ranges resolve against the session's view:
+        // its message count in number space, its highest uid in UID
+        // space. A stored message outside the view is not a candidate.
+        let len = u32::try_from(view.len()).unwrap_or(u32::MAX);
+        let max_uid = view.last().copied().unwrap_or(0);
         Ok(messages
             .iter()
-            .enumerate()
-            .filter(|(index, message)| {
-                let msn = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            .filter(|message| {
+                let Ok(position) = view.binary_search(&message.uid) else {
+                    return false;
+                };
+                let msn = u32::try_from(position + 1).unwrap_or(u32::MAX);
                 keys.iter()
                     .all(|key| search_key_matches(key, msn, len, max_uid, message))
             })
-            .map(|(_, message)| message.uid)
+            .map(|message| message.uid)
             .collect())
     }
 }
@@ -783,19 +730,65 @@ mod tests {
         assert!(constant_time_eq_ignore_ascii_case(&[0xC4], &[0xC4]));
     }
 
+    fn stored(id: i64, name: &str, kind: FolderKind) -> StoredMailbox {
+        StoredMailbox {
+            id: MailboxId(id),
+            account_id: 1,
+            list_id: format!("list-{id}"),
+            name: name.into(),
+            kind,
+            uidvalidity: 1,
+            next_uid: 1,
+        }
+    }
+
     #[test]
-    fn search_star_ranges_resolve_against_the_mailbox_ends() {
-        // A lone `*` selects exactly the last number, never every
-        // number.
-        let lone = parse_seq_set("*").unwrap();
-        assert!(number_in_set(&lone, 5, 5) && !number_in_set(&lone, 4, 5));
-        // `x:*` runs to the end, and an `x` beyond the end still
-        // selects the last number: the `<max+1>:*` probe mbsync sends.
-        let mbsync = parse_seq_set("6:*").unwrap();
-        assert!(number_in_set(&mbsync, 5, 5) && !number_in_set(&mbsync, 4, 5));
-        // Finite ranges select what they name.
-        let finite = parse_seq_set("2:4").unwrap();
-        assert!(number_in_set(&finite, 3, 5) && !number_in_set(&finite, 5, 5));
+    fn listed_names_are_unique_flat_and_keep_inbox_special() {
+        // Plain names pass through, in the order given.
+        let names = imap_names(&[
+            stored(1, "Inbox", FolderKind::Inbox),
+            stored(2, "Archive", FolderKind::Archive),
+            stored(3, "Work", FolderKind::Custom),
+        ]);
+        assert_eq!(names, ["Inbox", "Archive", "Work"]);
+
+        // A slash never reaches the wire as the hierarchy delimiter.
+        let names = imap_names(&[stored(3, "Clients/ACME", FolderKind::Custom)]);
+        assert_eq!(names, ["Clients\u{2215}ACME"]);
+
+        // Namesakes: the lowest id keeps the name whatever the listing
+        // order, a system folder beats a custom one, and a suffix that
+        // is itself taken is skipped.
+        let names = imap_names(&[
+            stored(9, "Work", FolderKind::Custom),
+            stored(4, "Work", FolderKind::Custom),
+            stored(5, "Work (2)", FolderKind::Custom),
+            stored(2, "Archive", FolderKind::Custom),
+            stored(7, "Archive", FolderKind::Archive),
+        ]);
+        assert_eq!(
+            names,
+            ["Work (3)", "Work", "Work (2)", "Archive (2)", "Archive"]
+        );
+
+        // Only the Inbox-kind folder answers to INBOX: a custom folder
+        // called "inbox" is a namesake, and a localized Inbox is listed
+        // under the name every client knows.
+        let names = imap_names(&[
+            stored(3, "inbox", FolderKind::Custom),
+            stored(8, "Inbox", FolderKind::Inbox),
+        ]);
+        assert_eq!(names, ["inbox (2)", "Inbox"]);
+        let names = imap_names(&[
+            stored(1, "Posteingang", FolderKind::Inbox),
+            stored(2, "INBOX", FolderKind::Custom),
+        ]);
+        assert_eq!(names, ["INBOX", "INBOX (2)"]);
+
+        assert!(name_matches("inbox", "Inbox"));
+        assert!(name_matches("Work (2)", "Work (2)"));
+        assert!(!name_matches("work", "Work"));
+        assert!(!name_matches("INBOX", "inbox (2)"));
     }
 
     #[test]
@@ -837,107 +830,6 @@ mod tests {
         // Nothing matched: just the blank terminator.
         let out = header_fields(header, &["\"X-Missing\"".to_string()]);
         assert_eq!(out, b"\r\n".to_vec());
-    }
-
-    #[test]
-    fn search_dates_map_to_utc_day_boundaries() {
-        // 14-Nov-2023 00:00 UTC, and the day after.
-        let date = parse_search_date("14-Nov-2023").unwrap();
-        assert_eq!(day_start_ms(date), 1_699_920_000_000);
-        assert_eq!(next_day_start_ms(date), 1_700_006_400_000);
-        // One-digit days parse too (RFC 3501 date-day is unpadded).
-        assert_eq!(
-            day_start_ms(parse_search_date("4-Nov-2023").unwrap()),
-            1_699_056_000_000
-        );
-        // The month parses in any casing: `nov` and `NOV` alike.
-        for raw in ["14-nov-2023", "14-NOV-2023"] {
-            assert_eq!(
-                day_start_ms(parse_search_date(raw).unwrap()),
-                1_699_920_000_000,
-                "{raw} must parse in any casing"
-            );
-        }
-        // The one-digit-day retry path keeps that behavior too.
-        assert_eq!(
-            day_start_ms(parse_search_date("4-nOV-2023").unwrap()),
-            1_699_056_000_000
-        );
-        // Fixed error strings, no client input echoed.
-        assert!(matches!(
-            parse_search_date("2023-11-14"),
-            Err(Error::Unsupported(message)) if message == "invalid search date"
-        ));
-        assert!(matches!(
-            parse_search_date("99-Xxx-9999"),
-            Err(Error::Unsupported(message)) if message == "invalid search date"
-        ));
-    }
-
-    #[test]
-    fn search_criteria_parse_index_keys_and_refuse_bodies() {
-        let parse = |criteria: &[&str]| {
-            let owned: Vec<String> = criteria.iter().map(|c| c.to_string()).collect();
-            parse_search_criteria(&owned)
-        };
-
-        assert!(matches!(parse(&["ALL"]).unwrap()[0], SearchKey::All));
-        assert!(matches!(parse(&["UNSEEN"]).unwrap()[0], SearchKey::Unseen));
-        assert!(matches!(parse(&["SEEN"]).unwrap()[0], SearchKey::Seen));
-        assert!(matches!(
-            parse(&["UID", "1:2"]).unwrap()[0],
-            SearchKey::Uid(_)
-        ));
-        assert!(matches!(
-            parse(&["1:2"]).unwrap()[0],
-            SearchKey::Sequence(_)
-        ));
-        assert!(matches!(
-            parse(&["NOT", "SEEN"]).unwrap()[0],
-            SearchKey::Not(_)
-        ));
-        assert!(matches!(
-            parse(&["OR", "UNSEEN", "SUBJECT", "x"]).unwrap()[0],
-            SearchKey::Or(_, _)
-        ));
-        assert!(matches!(
-            parse(&["SINCE", "15-Nov-2023"]).unwrap()[0],
-            SearchKey::Since(start) if start == 1_700_006_400_000
-        ));
-
-        // Structural failures answer the fixed criteria string.
-        assert!(parse(&[]).is_err());
-        assert!(parse(&["SUBJECT"]).is_err());
-        assert!(parse(&["UID", "0"]).is_err());
-        assert!(matches!(
-            parse(&["HEADER", "Subject"]),
-            Err(Error::Unsupported(message)) if message == "invalid search criteria"
-        ));
-
-        // Unsupported keys answer the fixed unsupported string — NEW/OLD
-        // included: they are \Recent-based, and their only faithful
-        // reductions (nothing / everything) would be a lie.
-        for criteria in [
-            ["BODY", "x"],
-            ["TEXT", "x"],
-            ["KEYWORD", "f"],
-            ["FLAGGED", ""],
-            ["NEW", ""],
-            ["OLD", ""],
-        ] {
-            assert!(
-                matches!(parse(&criteria), Err(Error::Unsupported(message)) if message == "search key not supported"),
-                "{criteria:?} must be refused"
-            );
-        }
-
-        // Deep NOT nesting is refused instead of recursing without bound.
-        let mut deep: Vec<String> = (0..20).map(|_| "NOT".to_string()).collect();
-        deep.push("SEEN".to_string());
-        assert!(matches!(
-            parse_search_criteria(&deep),
-            Err(Error::Unsupported(message)) if message == "invalid search criteria"
-        ));
     }
 
     #[test]

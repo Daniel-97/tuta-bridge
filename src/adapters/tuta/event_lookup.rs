@@ -15,7 +15,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tutasdk::entities::generated::tutanota::{Mail, MailSet, MailSetEntry};
-use tutasdk::{CustomId, GeneratedId, IdTupleCustom, IdTupleGenerated, LoggedInSdk};
+use tutasdk::rest_error::HttpError;
+use tutasdk::{ApiCallError, CustomId, GeneratedId, IdTupleCustom, IdTupleGenerated, LoggedInSdk};
 
 use super::content::mail_is_intact;
 use super::mail_source::{folder_from_parts, header_from_parts};
@@ -43,6 +44,25 @@ fn entity_unavailable() -> Error {
     Error::Network("event entity unavailable".into())
 }
 
+/// Classify one SDK load: `Ok(None)` when the server answers that the
+/// entity does not exist, the fixed network error for every other failure.
+///
+/// A replayed batch (after downtime, or within one busy batch) routinely
+/// references mails, entries, and sets that were deleted afterwards. That
+/// is a definitive answer, not a lookup failure: counting it as one makes
+/// the processor believe the index desynced and triggers a full resync.
+/// The caller reports such an entity as absent, which keeps the existing
+/// rows; the entity's own delete event removes them.
+fn found<T>(loaded: std::result::Result<T, ApiCallError>) -> Result<Option<T>> {
+    match loaded {
+        Ok(entity) => Ok(Some(entity)),
+        Err(ApiCallError::ServerResponseError {
+            source: HttpError::NotFoundError,
+        }) => Ok(None),
+        Err(_) => Err(entity_unavailable()),
+    }
+}
+
 /// Tuta implementation of [`EventLookup`].
 pub struct TutaEventLookup {
     logged: Arc<LoggedInSdk>,
@@ -66,10 +86,9 @@ impl EventLookup for TutaEventLookup {
             GeneratedId(mail_list_id.to_string()),
             GeneratedId(mail_element_id.to_string()),
         );
-        let mail: Mail = crypto_client
-            .load(&mail_id)
-            .await
-            .map_err(|_| entity_unavailable())?;
+        let Some(mail) = found::<Mail>(crypto_client.load(&mail_id).await)? else {
+            return Ok(None);
+        };
 
         // An unreadable mail must keep its existing rows: report it as
         // unreadable instead of as "no placements". Without its own id the
@@ -90,10 +109,12 @@ impl EventLookup for TutaEventLookup {
         // entries list id that resolves the mailbox row.
         let mut placements = Vec::with_capacity(mail.sets.len());
         for set_id in &mail.sets {
-            let set: MailSet = crypto_client
-                .load(set_id)
-                .await
-                .map_err(|_| entity_unavailable())?;
+            // A set that vanished between the event and this lookup means
+            // the mail is being moved: report the mail as absent (rows
+            // kept) rather than guess a partial placement list.
+            let Some(set) = found::<MailSet>(crypto_client.load(set_id).await)? else {
+                return Ok(None);
+            };
             let mailbox_list_id = set.entries.as_str();
             if mailbox_list_id.is_empty() {
                 continue;
@@ -128,15 +149,13 @@ impl EventLookup for TutaEventLookup {
             GeneratedId(entry_list_id.to_string()),
             CustomId(entry_element_id.to_string()),
         );
-        let entry: MailSetEntry = crypto_client
-            .load(&entry_id)
-            .await
-            .map_err(|_| entity_unavailable())?;
+        let Some(entry) = found::<MailSetEntry>(crypto_client.load(&entry_id).await)? else {
+            return Ok(None);
+        };
 
-        let mail: Mail = crypto_client
-            .load(&entry.mail)
-            .await
-            .map_err(|_| entity_unavailable())?;
+        let Some(mail) = found::<Mail>(crypto_client.load(&entry.mail).await)? else {
+            return Ok(None);
+        };
         if !mail_is_intact(&mail) {
             return Ok(None);
         }
@@ -168,10 +187,9 @@ impl EventLookup for TutaEventLookup {
             GeneratedId(set_list_id.to_string()),
             GeneratedId(set_element_id.to_string()),
         );
-        let set: MailSet = crypto_client
-            .load(&set_id)
-            .await
-            .map_err(|_| entity_unavailable())?;
+        let Some(set) = found::<MailSet>(crypto_client.load(&set_id).await)? else {
+            return Ok(None);
+        };
         Ok(folder_from_parts(
             set.entries.as_str(),
             &set.name,
@@ -214,6 +232,38 @@ mod tests {
         MailPlacement {
             mailbox_list_id: mailbox_list_id.to_string(),
             header: header(mail_list_id, element_id),
+        }
+    }
+
+    #[test]
+    fn a_deleted_entity_is_absent_not_a_lookup_failure() {
+        let gone: std::result::Result<u8, ApiCallError> = Err(ApiCallError::ServerResponseError {
+            source: HttpError::NotFoundError,
+        });
+        assert!(matches!(found(gone), Ok(None)));
+        assert!(matches!(found(Ok::<u8, ApiCallError>(7)), Ok(Some(7))));
+    }
+
+    #[test]
+    fn every_other_load_failure_stays_a_network_error() {
+        for error in [
+            ApiCallError::ServerResponseError {
+                source: HttpError::NotAuthorizedError,
+            },
+            ApiCallError::ServerResponseError {
+                source: HttpError::InternalServerError,
+            },
+            ApiCallError::InternalSdkError {
+                error_message: "SECRET".into(),
+            },
+        ] {
+            let Err(mapped) = found::<u8>(Err(error)) else {
+                panic!("expected an error")
+            };
+            assert_eq!(
+                mapped.to_string(),
+                "network error: event entity unavailable"
+            );
         }
     }
 

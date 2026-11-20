@@ -10,7 +10,8 @@ use std::path::PathBuf;
 pub struct Cli {
     #[arg(long, global = true)]
     pub base_url: Option<String>,
-    /// Print HTTP phase, status, and sanitized server error details to stderr.
+    /// Print each login HTTP request's phase, method, URL path, status, and
+    /// response size to stderr; never a body, query, or header.
     #[arg(long, global = true)]
     pub debug: bool,
     #[command(subcommand)]
