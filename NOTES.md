@@ -339,6 +339,51 @@
   idle minutes (RFC 1939's minimum autologout) and after three failed
   logins, with failed-login delays serialized across connections.
 
+## M7 SMTP submission
+
+- Port of `MailFacade.createDraft` + `sendDraft`
+  (`src/applications/common/api/worker/facades/lazy/MailFacade.ts` at the
+  pinned rev) in `src/adapters/tuta/mail_sender.rs`. Draft: the sender's
+  mail group (`get_group_id_for_mail_address`, which also rejects
+  foreign `From:` addresses), its current key
+  (`LoggedInSdk::get_current_sym_group_key`), a fresh AES-256 session
+  key, `_ownerEncSessionKey` = session key under the group key; POST
+  `DraftService` with `ExtraServiceParams.session_key`, which makes the
+  SDK encrypt the request tree (`entity_facade.encrypt_and_map`) and
+  lz4-compress `body.compressedText`. Deprecated top-level/`DraftData`
+  fields stay null/empty exactly like the web client sends them.
+- **Non-confidential only.** `SendDraftService` gets the raw
+  `mailSessionKey` (the web client's path for a mail with external
+  recipients and confidential off). The confidential path needs
+  `AsymmetricCryptoFacade::asym_encrypt_sym_key` and
+  `PublicKeyProvider`, which `LoggedInSdk` does not expose at this rev
+  (the `CryptoFacade` field is private); rebuilding them from
+  `crypto::{rsa,tuta_crypt}` would reimplement the protocol, which rule
+  6 forbids. Revisit when the SDK exposes them. The decision to ship the
+  non-confidential v1 (documented, warned at startup) was the owner's.
+- **Attachments reuse the mail session key.** The SDK encrypts a whole
+  service request under one key, so a `FileTransferAggregatedType`'s
+  name/MIME type are encrypted with the mail key; its
+  `_ownerEncSessionKey` therefore is the mail's, the blob is uploaded
+  with that key (`encrypt_and_upload_single_legacy`; the `_multiple`
+  variant keys a map by session key and would collapse files), and
+  `AttachmentKeyData.fileSessionKey` is the same key. The File ids come
+  from reloading the draft `Mail` (`attachments`). The upload future is
+  not `Send`; it runs on `spawn_blocking` via `Handle::block_on`.
+- Aggregate `_id`s: the SDK generates them only on the encrypted path,
+  so `SendDraftData`'s aggregates get theirs from the same 4-byte
+  base64url format (`make_random_aggregate_id`).
+- Unverified against the real server (rule 1: no contact without the
+  owner): the CBC-then-HMAC values the SDK produces where the current
+  web client may use AEAD, the shared attachment key, and Bcc delivery.
+  These are the M7 manual-acceptance checks.
+- SMTP side (`src/adapters/smtp`): implicit TLS, EHLO advertises
+  `SIZE 26214400`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `AUTH PLAIN
+  LOGIN`; no PIPELINING/STARTTLS/DSN. Envelope recipients decide
+  delivery; those absent from `To:`/`Cc:` become Bcc. Network failures
+  answer `451` (client retries), everything else `554`. Opt-in through
+  `smtp_port`.
+
 ## M1/M2 manual acceptance (2026-11-16)
 
 - Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.

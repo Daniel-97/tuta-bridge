@@ -15,11 +15,13 @@ use super::event_stream::{
 };
 use super::generated_id::timestamp_to_generated_id;
 use super::json::session_id_from_access_token;
+use super::mail_sender::TutaMailSender;
 use super::mail_source::TutaMailSource;
 use super::mailbox_writer::TutaMailboxWriter;
 use super::pre_session::TutaPreSession;
 use crate::domain::{AccountInfo, Error, Result, StoredCredentials};
 use crate::ports::event_stream::EventHandles;
+use crate::ports::mail_sender::MailSender;
 use crate::ports::mail_source::MailSource;
 use crate::ports::mailbox_writer::MailboxWriter;
 use crate::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
@@ -157,6 +159,10 @@ impl Session for TutaSession {
 
     fn shared_writer(&self) -> Arc<dyn MailboxWriter> {
         Arc::new(TutaMailboxWriter::new(Arc::clone(&self.logged)))
+    }
+
+    fn shared_sender(&self) -> Arc<dyn MailSender> {
+        Arc::new(TutaMailSender::new(Arc::clone(&self.logged)))
     }
 
     fn event_groups(&self) -> Vec<String> {

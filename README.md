@@ -2,7 +2,7 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, an IMAP server with read/unread, move and delete, and an optional read-only POP3 server). SMTP (M7) is not implemented yet.
+Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, an IMAP server with read/unread, move and delete, an optional read-only POP3 server, and optional SMTP submission). Sending is **not end-to-end encrypted** — see "SMTP submission" below.
 
 ## Credentials
 
@@ -153,8 +153,9 @@ Use manual account configuration (not the automatic account dialog):
   bridge password set by `passwd`.
 - Accept the certificate exception on first connect — the certificate
   is self-signed.
-- Outgoing (SMTP) fields are placeholders: SMTP is not implemented, so
-  sending always fails.
+- Outgoing (SMTP), once `smtp_port` is set (see below): hostname
+  `127.0.0.1`, the configured port, connection security SSL/TLS,
+  authentication "Normal password", same username and password.
 
 Marking mail read/unread, moving it between folders (drag and drop)
 and deleting it (Thunderbird's default "move to Trash") are applied to
@@ -255,6 +256,46 @@ pop3_port = 9950
   client to leave messages on the server (Thunderbird's default;
   `fetchmail --keep`). POP3 has no folders, flags, push, or server-side
   search; use IMAP for those.
+
+## SMTP submission (optional)
+
+`serve` can accept mail to send over SMTP submission with implicit TLS.
+It is off unless the config file names a port:
+
+```toml
+smtp_port = 9925
+```
+
+> **Not end-to-end encrypted.** The bridge sends every mail the way the
+> Tuta web client sends a *non-confidential* mail: the mail's key is
+> handed to the Tuta server, which delivers it — in plain text to
+> external recipients, and readable by Tuta's servers in transit even
+> for Tuta recipients. The web client encrypts Tuta-to-Tuta mail end to
+> end; the bridge cannot yet, because the Tuta SDK pinned here does not
+> expose the public-key operations that needs, and the bridge never
+> reimplements cryptography. Use the web or desktop client for mail that
+> must stay end-to-end encrypted. Password-protected mail to external
+> recipients is not available either.
+
+- Same listener rules as IMAP: `127.0.0.1` only, the same self-signed
+  certificate, `AUTH PLAIN`/`AUTH LOGIN` with the account address and
+  the bridge password, the same failed-login delay. Mail is accepted
+  only after authentication.
+- The `From:` address must be one of the account's enabled addresses or
+  aliases; anything else is refused with `554`.
+- Recipients come from the SMTP envelope: envelope recipients that are
+  not in `To:`/`Cc:` are sent as Bcc. Attachments and inline parts are
+  uploaded. HTML bodies are sent as they are; plain-text bodies are
+  escaped into HTML. Messages are limited to 25 MiB and bodies to 1 MiB
+  (Tuta's limit).
+- Tuta files the sent copy in Sent itself; it reaches IMAP clients
+  through the event stream like any other new mail.
+- A `250` reply means Tuta accepted the mail. If Tuta cannot be reached
+  the reply is a temporary `451`, so the client keeps the mail and
+  retries.
+- Not carried over from the submitted message: custom headers,
+  `In-Reply-To`/`References` (Tuta builds its own threading headers),
+  and the `Date:` (Tuta stamps the send time).
 
 ## Dump
 

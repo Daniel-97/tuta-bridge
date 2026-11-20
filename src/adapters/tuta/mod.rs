@@ -5,6 +5,7 @@ pub mod event_stream;
 pub mod event_wire;
 pub mod generated_id;
 pub mod json;
+pub mod mail_sender;
 pub mod mail_source;
 pub mod mailbox_writer;
 pub mod pre_session;

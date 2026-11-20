@@ -4,6 +4,7 @@ use std::sync::Arc;
 use secrecy::SecretString;
 
 use super::event_stream::EventHandles;
+use super::mail_sender::{MailSender, OutgoingMail};
 use super::mail_source::MailSource;
 use super::mailbox_writer::{MailRef, MailboxWriter};
 use crate::domain::{AccountInfo, Error, Result, StoredCredentials};
@@ -38,6 +39,12 @@ pub trait Session: Send + Sync {
     /// without write support keep the bridge read-only.
     fn shared_writer(&self) -> Arc<dyn MailboxWriter> {
         Arc::new(ReadOnlyWriter)
+    }
+
+    /// The send seam `serve` hands to the SMTP listener. Defaults to a
+    /// sender that refuses every mail.
+    fn shared_sender(&self) -> Arc<dyn MailSender> {
+        Arc::new(NoSender)
     }
 
     /// Group ids the event bus must be subscribed to, in subscription order.
@@ -103,5 +110,17 @@ impl MailboxWriter for ReadOnlyWriter {
 
     async fn delete_permanently(&self, _folder: &str, _mails: &[MailRef]) -> Result<()> {
         Err(Error::Unsupported("read-only session".into()))
+    }
+}
+
+/// A [`MailSender`] that refuses every mail.
+pub struct NoSender;
+
+#[async_trait::async_trait]
+impl MailSender for NoSender {
+    async fn send(&self, _mail: &OutgoingMail) -> Result<()> {
+        Err(Error::Unsupported(
+            "sending is not supported by this session".into(),
+        ))
     }
 }

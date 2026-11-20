@@ -38,6 +38,7 @@ use crate::adapters::imap::backend::TutaImapBackend;
 use crate::adapters::imap::server::{self, ensure_certificate, tls_acceptor, ServeLimits};
 use crate::adapters::mime::MimeRenderer;
 use crate::adapters::pop3::server::{serve_pop3, Pop3ServeLimits};
+use crate::adapters::smtp::server::{serve_smtp, SmtpServeLimits};
 use crate::adapters::sqlite_state::STATE_BUSY_MESSAGE;
 use crate::adapters::tuta::event_wire::is_invalid_event;
 use crate::adapters::tuta::generated_id::{
@@ -684,6 +685,7 @@ impl ServeUseCase {
             renderer,
             writer: session.shared_writer(),
         });
+        let mail_sender = session.shared_sender();
         let _session = session;
 
         // 5. The watch task feeds the same store and broadcasts every
@@ -735,6 +737,22 @@ impl ServeUseCase {
             }
             None => None,
         };
+        // SMTP is opt-in as well: sending is non-confidential (see the
+        // README), so it listens only when the config names a port.
+        let smtp_listener = match config.smtp_port {
+            Some(smtp_port) => {
+                validate_imap_port(smtp_port)
+                    .map_err(|_| Error::Config("smtp_port must be between 1 and 65535".into()))?;
+                let smtp_listener = TcpListener::bind(("127.0.0.1", smtp_port))
+                    .await
+                    .map_err(|_| Error::Network("smtp listener bind failed".into()))?;
+                println!(
+                    "serving SMTP submission on 127.0.0.1:{smtp_port} (not end-to-end encrypted)"
+                );
+                Some(smtp_listener)
+            }
+            None => None,
+        };
         println!("serving IMAP on 127.0.0.1:{port}; press Ctrl-C to stop");
 
         // 7. Accept until the stop future resolves, then end the
@@ -743,6 +761,23 @@ impl ServeUseCase {
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
         let mut stop = pin!(stop);
+        let smtp_auth = Arc::clone(&backend);
+        let smtp_tls = tls.clone();
+        let mut smtp_accepting = pin!(async move {
+            match smtp_listener {
+                Some(smtp_listener) => {
+                    serve_smtp(
+                        smtp_listener,
+                        smtp_tls,
+                        smtp_auth,
+                        mail_sender,
+                        SmtpServeLimits::default(),
+                    )
+                    .await
+                }
+                None => std::future::pending().await,
+            }
+        });
         let pop3_backend = Arc::clone(&backend);
         let pop3_tls = tls.clone();
         let mut pop3_accepting = pin!(async move {
@@ -777,6 +812,7 @@ impl ServeUseCase {
             }
             () = &mut accepting => {}
             () = &mut pop3_accepting => {}
+            () = &mut smtp_accepting => {}
         }
         let _ = stop_watch.send(());
         match watch_task.await {
