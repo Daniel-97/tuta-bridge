@@ -1493,7 +1493,10 @@ impl tuta_bridge::ports::mailbox_writer::MailboxWriter for RacingWriter {
     ) -> Result<()> {
         Ok(())
     }
-    async fn move_to_trash(&self, _mails: &[tuta_bridge::ports::mailbox_writer::MailRef]) -> Result<()> {
+    async fn move_to_trash(
+        &self,
+        _mails: &[tuta_bridge::ports::mailbox_writer::MailRef],
+    ) -> Result<()> {
         Ok(())
     }
     async fn delete_permanently(
@@ -1525,6 +1528,11 @@ async fn a_row_vanishing_during_the_remote_write_is_skipped() {
         .unwrap();
 
     assert_eq!(applied, vec![(kept, false)]);
-    let row = w.store.message_by_uid(w.inbox, kept).await.unwrap().unwrap();
+    let row = w
+        .store
+        .message_by_uid(w.inbox, kept)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!row.header.unread);
 }

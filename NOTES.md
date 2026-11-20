@@ -384,6 +384,36 @@
   answer `451` (client retries), everything else `554`. Opt-in through
   `smtp_port`.
 
+## Review of #2 (2026-11-20)
+
+The maintainer verified M6 and M7 against the live account (IMAP writes
+both ways, SMTP send with the Sent copy arriving through events and the
+disclosed missing E2E padlock); POP3 is still on the manual list. Fixes
+from the review:
+
+- POP3/SMTP writes go through the shared `adapters::stall::StallGuard`
+  (60 s) and both have IMAP's 60 s pre-auth deadline; SMTP also bounds a
+  whole DATA at 10 minutes. The three listeners share one failed-login
+  gate (`app::watch::shared_listener_limits`); connection caps stay per
+  listener.
+- POP3 re-reads the Inbox snapshot before every transaction command: a
+  changed UIDVALIDITY ends the session, vanished messages leave LIST,
+  STAT and UIDL together, and an unloadable size skips one message.
+- SMTP sender lookup: the SDK answers `NotFound` only after checking
+  every mail group, so that alone is the permanent "not your address";
+  every other failure is transient (`451`). Lookups use Tuta's canonical
+  form (`cleanMailAddress` = trim + lowercase in the web client).
+- mail-parser files a `text/html` part as an attachment when a
+  multipart/related starts with an inline image (the image becomes the
+  body); the sender now takes the first undeclared `text/html` part as
+  the body and keeps the image as an inline attachment.
+- IMAP: `APPEND` to Sent is a silent no-op so Thunderbird's "Place a
+  copy in Sent" does not report every send as failed; a row removed by
+  the event loop during a remote STORE is skipped like FETCH skips it.
+- `watch` prints per-kind counts from the store's own transaction
+  (`applied 2 new, 1 read-state, 1 moved out`); new vs. updated is one
+  extra `SELECT unread` per header.
+
 ## M1/M2 manual acceptance (2026-11-16)
 
 - Login with password + TOTP against `https://app.tuta.com` succeeded; credentials were persisted in the Secret Service and `status` showed the account.

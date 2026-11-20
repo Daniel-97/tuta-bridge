@@ -162,6 +162,11 @@ and deleting it (Thunderbird's default "move to Trash") are applied to
 Tuta. Starring a mail (`\Flagged`) and copying a mail are refused with
 `NO`: Tuta has neither.
 
+After a send, Thunderbird uploads its own copy to Sent ("Place a copy
+in Sent"). The bridge accepts that upload and discards it, because Tuta
+already filed the sent copy itself (it appears through the event
+stream); turning the option off saves the upload.
+
 ### mbsync
 
 ```ini
@@ -207,9 +212,12 @@ kept by Tuta, so other pushed flags are refused. The `Far`/`Near` names require 
   (RFC 6851) move mail to another folder; the moved mail gets a new UID
   in the target when the Tuta event arrives. `EXPUNGE` moves `\Deleted`
   mail to Trash, and deletes it for good only when it already is in
-  Trash. `COPY` answers `NO` (Tuta has no copy), as do `APPEND` and
-  folder mutations (`CREATE`, `DELETE`, `RENAME`, `SUBSCRIBE`,
-  `UNSUBSCRIBE`). `EXAMINE`d mailboxes refuse every write. `UIDPLUS` is
+  Trash. `COPY` answers `NO` (Tuta has no copy; `[TRYCREATE]` when the
+  target does not exist). `APPEND` to Sent is accepted and discarded
+  (see Thunderbird above); any other `APPEND` answers `NO`, as do folder
+  mutations (`CREATE`, `DELETE`, `RENAME`, `SUBSCRIBE`,
+  `UNSUBSCRIBE`). `SEARCH DELETED` stays unsupported even though
+  `\Deleted` is kept per session. `EXAMINE`d mailboxes refuse every write. `UIDPLUS` is
   not advertised, so `UID EXPUNGE` is unknown.
 - IDLE pushes new mail (`EXISTS`) and removals; read-state changes made
   elsewhere reach the client at its next `NOOP`/poll or during IDLE.
@@ -248,7 +256,12 @@ pop3_port = 9950
   certificate, the same bridge password, the same failed-login delay.
 - The maildrop is the Inbox as it was at login. `UIDL` answers
   `<uidvalidity>.<uid>`, stable across sessions, so a client that keeps
-  mail on the server never downloads a message twice.
+  mail on the server never downloads a message twice. Mail that leaves
+  the Inbox during a session disappears from `LIST`, `STAT` and `UIDL`
+  alike; a `resync` during a session ends it (`-ERR [SYS/TEMP]`) rather
+  than renumbering. `CAPA` advertises `EXPIRE NEVER`.
+- Connections are bounded like IMAP's: 60 seconds to log in, 10 minutes
+  of inactivity, 60 seconds for a stalled write, at most 16 at once.
 - Supported: `CAPA`, `USER`/`PASS`, `STAT`, `LIST`, `UIDL`, `RETR`,
   `TOP`, `NOOP`, `RSET`, `QUIT`. Messages render on demand like IMAP
   `BODY[]`.
@@ -281,8 +294,15 @@ smtp_port = 9925
   certificate, `AUTH PLAIN`/`AUTH LOGIN` with the account address and
   the bridge password, the same failed-login delay. Mail is accepted
   only after authentication.
-- The `From:` address must be one of the account's enabled addresses or
-  aliases; anything else is refused with `554`.
+- The sender must be one of the account's enabled addresses or aliases
+  (compared case-insensitively). `MAIL FROM` is checked right away and
+  refused with `553`; if the check cannot reach Tuta the answer is a
+  temporary `451`. Envelope and header addresses must be plain
+  `local@domain`.
+- Connections are bounded: 60 seconds to log in, 5 minutes of
+  inactivity, 10 minutes for one whole `DATA`, 60 seconds for a stalled
+  write, at most 16 at once. IMAP, POP3 and SMTP share one
+  failed-login delay queue.
 - Recipients come from the SMTP envelope: envelope recipients that are
   not in `To:`/`Cc:` are sent as Bcc. Attachments and inline parts are
   uploaded. HTML bodies are sent as they are; plain-text bodies are
