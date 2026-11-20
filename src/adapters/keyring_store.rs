@@ -1,6 +1,26 @@
 use crate::domain::{AccountId, Error, Result, StoredCredentials};
 use crate::ports::credentials::CredentialStore;
 
+/// Fixed explanation for a keyring that cannot be reached or is locked.
+pub const KEYRING_UNAVAILABLE: &str =
+    "the Secret Service is not running or the keyring is locked; unlock it and start again";
+
+/// Map a failed keyring operation to a fixed message.
+///
+/// A keyring that cannot be reached at all (no Secret Service on the
+/// session bus, a locked collection, an unlock prompt that cannot be
+/// shown) becomes [`Error::Keyring`]: it needs the user, so a supervisor
+/// must not restart into it. Anything else stays an opaque storage
+/// error naming only the operation.
+pub fn keyring_error(error: &keyring::Error, operation: &str) -> Error {
+    match error {
+        keyring::Error::NoStorageAccess(_) | keyring::Error::PlatformFailure(_) => {
+            Error::Keyring(KEYRING_UNAVAILABLE.into())
+        }
+        _ => Error::Storage(format!("keyring {operation} failed")),
+    }
+}
+
 pub struct KeyringCredentialStore {
     service: String,
 }
@@ -19,27 +39,27 @@ impl CredentialStore for KeyringCredentialStore {
             .map_err(|_| Error::Storage("keyring write failed".into()))?;
         keyring::Entry::new(&self.service, account.0.as_str())
             .and_then(|entry| entry.set_password(&json))
-            .map_err(|_| Error::Storage("keyring write failed".into()))
+            .map_err(|e| keyring_error(&e, "write"))
     }
 
     fn load(&self, account: &AccountId) -> Result<Option<StoredCredentials>> {
         let entry = keyring::Entry::new(&self.service, account.0.as_str())
-            .map_err(|_| Error::Storage("keyring read failed".into()))?;
+            .map_err(|e| keyring_error(&e, "read"))?;
         match entry.get_password() {
             Ok(json) => serde_json::from_str(&json)
                 .map(Some)
                 .map_err(|_| Error::Storage("keyring read failed".into())),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err(Error::Storage("keyring read failed".into())),
+            Err(e) => Err(keyring_error(&e, "read")),
         }
     }
 
     fn delete(&self, account: &AccountId) -> Result<()> {
         let entry = keyring::Entry::new(&self.service, account.0.as_str())
-            .map_err(|_| Error::Storage("keyring delete failed".into()))?;
+            .map_err(|e| keyring_error(&e, "delete"))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err(Error::Storage("keyring delete failed".into())),
+            Err(e) => Err(keyring_error(&e, "delete")),
         }
     }
 }
@@ -47,6 +67,24 @@ impl CredentialStore for KeyringCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreachable_or_locked_keyring_is_a_keyring_error() {
+        for error in [
+            keyring::Error::NoStorageAccess("locked".into()),
+            keyring::Error::PlatformFailure("no bus".into()),
+        ] {
+            let mapped = keyring_error(&error, "read");
+            assert!(matches!(mapped, Error::Keyring(ref m) if m == KEYRING_UNAVAILABLE));
+            assert_eq!(mapped.exit_code(), 8);
+        }
+    }
+
+    #[test]
+    fn other_keyring_failures_stay_opaque_storage_errors() {
+        let mapped = keyring_error(&keyring::Error::BadEncoding(vec![0xff]), "read");
+        assert!(matches!(mapped, Error::Storage(ref m) if m == "keyring read failed"));
+    }
 
     #[test]
     fn stored_credentials_json_roundtrip() {

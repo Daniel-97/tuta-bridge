@@ -1,0 +1,51 @@
+# systemd --user unit for `tuta-bridge serve`.
+#
+# Install:
+#   install -Dm644 contrib/systemd/tuta-bridge.service \
+#       ~/.config/systemd/user/tuta-bridge.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now tuta-bridge
+#
+# Logs: journalctl --user -u tuta-bridge
+#
+# Only one bridge runs at a time: `serve` holds an exclusive lock on the
+# state database (state.sqlite3.lock), so a second instance — this unit
+# started twice, or `serve`/`watch`/`sync` in a terminal — fails at once
+# with exit code 10 instead of running side by side.
+
+[Unit]
+Description=tuta-bridge: local IMAP/POP3/SMTP bridge for Tuta Mail
+Documentation=https://github.com/Daniel-97/tuta-bridge#running-as-a-service
+# A crash loop that never reaches a stable run is stopped after five
+# starts within two minutes; the unit then stays failed until
+# `systemctl --user reset-failed tuta-bridge` or a manual start.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=exec
+# Adjust the path if the binary is not installed with `cargo install`.
+ExecStart=%h/.cargo/bin/tuta-bridge serve
+# SIGTERM (systemctl stop, kill) stops serve cleanly with exit code 0.
+# `Restart=always` brings it back after a plain kill as well — systemd
+# never restarts a unit stopped with `systemctl --user stop`.
+Restart=always
+RestartSec=10
+# Exit codes that need the user, not a restart:
+#   1  configuration (including: no local password, run `tuta-bridge passwd`)
+#   3  no active account or no stored credentials (run `tuta-bridge login`)
+#   4  authentication: session expired or revoked, second factor
+#      required (run `tuta-bridge login` again)
+#   5  folder not found
+#   8  keyring unavailable or locked (unlock it, then start the unit)
+#   9  unsupported: server model or client version changed, state
+#      database written by a newer tuta-bridge (update the bridge)
+#  10  already in use: the state lock or a listening port is held by
+#      another process (stop it)
+# Exit codes 2 (storage) and 6 (network) and crashes are restarted.
+RestartPreventExitStatus=1 3 4 5 8 9 10
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

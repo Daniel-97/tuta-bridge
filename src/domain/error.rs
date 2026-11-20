@@ -26,9 +26,20 @@ pub enum Error {
     Unsupported(String),
     #[error("partial dump: {failed} messages failed")]
     PartialDump { failed: usize },
+    #[error("system keyring unavailable: {0}")]
+    Keyring(String),
+    #[error("already in use: {0}")]
+    InUse(String),
 }
 
 impl Error {
+    /// The process exit code for this error.
+    ///
+    /// The codes are a contract with supervisors such as the shipped
+    /// systemd unit: transient failures (2 storage, 6 network) may be
+    /// retried by restarting the process, while every other non-zero
+    /// code needs the user to act — log in again, unlock the keyring,
+    /// stop the other instance — and a restart would only repeat it.
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::NoActiveAccount => 3,
@@ -42,7 +53,9 @@ impl Error {
             Self::Config(_) => 1,
             Self::Storage(_) => 2,
             Self::Message(_) => 2,
-            Self::Unsupported(_) => 2,
+            Self::Unsupported(_) => 9,
+            Self::Keyring(_) => 8,
+            Self::InUse(_) => 10,
         }
     }
 }
@@ -64,5 +77,9 @@ mod tests {
         assert_eq!(Error::Network("x".into()).exit_code(), 6);
         assert_eq!(Error::PartialDump { failed: 2 }.exit_code(), 7);
         assert_eq!(Error::Config("x".into()).exit_code(), 1);
+        assert_eq!(Error::Storage("x".into()).exit_code(), 2);
+        assert_eq!(Error::Keyring("x".into()).exit_code(), 8);
+        assert_eq!(Error::Unsupported("x".into()).exit_code(), 9);
+        assert_eq!(Error::InUse("x".into()).exit_code(), 10);
     }
 }

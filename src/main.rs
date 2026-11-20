@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::process;
 use std::sync::Arc;
 
@@ -65,8 +66,11 @@ fn main() {
     ] {
         filter = filter.add_directive(directive.parse().expect("valid directive"));
     }
+    // Colours only on a terminal: under systemd stderr goes to the
+    // journal, which would store the escape sequences verbatim.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
 

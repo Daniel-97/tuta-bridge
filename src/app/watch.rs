@@ -49,7 +49,7 @@ use crate::app::event_sync::{deletes_folder, EventProcessor, EventReport};
 use crate::app::state_sync::{current_uidvalidity, sync_with};
 use crate::app::sync::{SyncEngine, SyncReport};
 use crate::config::{resolve_imap_port, validate_imap_port, Config};
-use crate::domain::{AccountId, Error, EventBatch, EventFrame, Result};
+use crate::domain::{AccountId, Error, EventBatch, EventFrame, Result, StoredCredentials};
 use crate::ports::clock::Clock;
 use crate::ports::credentials::CredentialStore;
 use crate::ports::event_lookup::EventLookup;
@@ -98,6 +98,50 @@ impl BackoffPolicy {
     }
 }
 
+/// Resolves on the first Ctrl-C (SIGINT) or, on Unix, SIGTERM.
+///
+/// SIGTERM is what `kill` and `systemctl stop` send; handling it lets
+/// `watch` and `serve` stop like on Ctrl-C — accept loop closed, watch
+/// loop ended, exit code 0 — instead of dying mid-batch.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Bind a loopback listener for `protocol` on `port`.
+///
+/// A port another process already holds is [`Error::InUse`]: it needs
+/// the user, so a supervisor must not restart into it. Any other bind
+/// failure stays a network error. Only the protocol name and the port
+/// number appear in the message.
+pub async fn bind_loopback(protocol: &str, port: u16) -> Result<TcpListener> {
+    TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrInUse => {
+                Error::InUse(format!("{protocol} port {port} is already in use"))
+            }
+            _ => Error::Network(format!("{protocol} listener bind failed")),
+        })
+}
+
 /// Whether an error must end the watch loop.
 ///
 /// Only network errors are retried; authentication, storage, and
@@ -140,13 +184,10 @@ impl WatchUseCase {
         self
     }
 
-    /// Watch until Ctrl-C.
+    /// Watch until Ctrl-C or SIGTERM.
     pub async fn run(&self) -> Result<()> {
         println!("watching for Tuta events; press Ctrl-C to stop");
-        self.run_until(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+        self.run_until(shutdown_signal()).await
     }
 
     /// Watch until `stop` resolves.
@@ -168,7 +209,17 @@ impl WatchUseCase {
             .credentials
             .load(&AccountId(account))?
             .ok_or(Error::MissingCredentials)?;
-        let session = self.factory.resume(&credentials).await?;
+        let mut stop = pin!(stop);
+        let resumed = resume_retrying(
+            self.factory.as_ref(),
+            &credentials,
+            &self.backoff,
+            &mut stop,
+        );
+        let Some(session) = resumed.await else {
+            return Ok(());
+        };
+        let session = session?;
 
         // 2. Local account row and the groups to subscribe to.
         let account_id = self.state.upsert_account(&credentials.login).await?;
@@ -184,7 +235,6 @@ impl WatchUseCase {
         // 4. Sync-and-reconnect loop: network errors retry with the
         //    backoff, everything else is fatal.
         let processor = EventProcessor::new(Arc::clone(&self.state));
-        let mut stop = pin!(stop);
         let mut attempt: u32 = 0;
         // Connections in a row that ended on an unparseable frame.
         let mut invalid_frames: u32 = 0;
@@ -553,6 +603,36 @@ impl WatchUseCase {
 ///
 /// `None` means the stop won and `work` was dropped where it stood; the
 /// caller must return without polling `stop` again.
+/// Resume the stored session, retrying network failures with `backoff`.
+///
+/// At login or boot the network may not be up yet; a supervised `serve`
+/// must wait for it instead of exiting into a restart loop. Fatal
+/// errors — an expired session above all — are returned at once.
+/// `None` when `stop` resolves first.
+async fn resume_retrying<S>(
+    factory: &dyn SessionFactory,
+    credentials: &StoredCredentials,
+    backoff: &BackoffPolicy,
+    stop: &mut Pin<&mut S>,
+) -> Option<Result<Box<dyn Session>>>
+where
+    S: Future<Output = ()>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match unless_stopped(stop, factory.resume(credentials)).await? {
+            Err(e) if !is_fatal(&e) => {
+                attempt += 1;
+                let delay = backoff.delay_ms(attempt);
+                println!("session resume failed; retrying in {delay} ms");
+                let sleep = tokio::time::sleep(Duration::from_millis(delay));
+                unless_stopped(stop, sleep).await?;
+            }
+            resumed => return Some(resumed),
+        }
+    }
+}
+
 async fn unless_stopped<S, W>(stop: &mut Pin<&mut S>, work: W) -> Option<W::Output>
 where
     S: Future<Output = ()>,
@@ -614,12 +694,9 @@ pub struct ServeUseCase {
 }
 
 impl ServeUseCase {
-    /// Serve until Ctrl-C.
+    /// Serve until Ctrl-C or SIGTERM.
     pub async fn run(&self) -> Result<()> {
-        self.run_until(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+        self.run_until(shutdown_signal()).await
     }
 
     /// Serve until `stop` resolves, then end the watch loop and return
@@ -656,7 +733,17 @@ impl ServeUseCase {
             .credentials
             .load(&AccountId(account))?
             .ok_or(Error::MissingCredentials)?;
-        let session = self.factory.resume(&credentials).await?;
+        let mut stop = pin!(stop);
+        let resumed = resume_retrying(
+            self.factory.as_ref(),
+            &credentials,
+            &self.backoff,
+            &mut stop,
+        );
+        let Some(session) = resumed.await else {
+            return Ok(());
+        };
+        let session = session?;
         let account_id = self.state.upsert_account(&credentials.login).await?;
         let expected_user = session.account().mail_address;
 
@@ -722,17 +809,13 @@ impl ServeUseCase {
         //    address is fixed.
         let (cert_pem, key_pem) = ensure_certificate(&self.data_dir)?;
         let tls = tls_acceptor(&cert_pem, &key_pem)?;
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .map_err(|_| Error::Network("imap listener bind failed".into()))?;
+        let listener = bind_loopback("imap", port).await?;
         // POP3 is opt-in: it listens only when the config names a port.
         let pop3_listener = match config.pop3_port {
             Some(pop3_port) => {
                 validate_imap_port(pop3_port)
                     .map_err(|_| Error::Config("pop3_port must be between 1 and 65535".into()))?;
-                let pop3_listener = TcpListener::bind(("127.0.0.1", pop3_port))
-                    .await
-                    .map_err(|_| Error::Network("pop3 listener bind failed".into()))?;
+                let pop3_listener = bind_loopback("pop3", pop3_port).await?;
                 println!("serving POP3 on 127.0.0.1:{pop3_port}");
                 Some(pop3_listener)
             }
@@ -744,9 +827,7 @@ impl ServeUseCase {
             Some(smtp_port) => {
                 validate_imap_port(smtp_port)
                     .map_err(|_| Error::Config("smtp_port must be between 1 and 65535".into()))?;
-                let smtp_listener = TcpListener::bind(("127.0.0.1", smtp_port))
-                    .await
-                    .map_err(|_| Error::Network("smtp listener bind failed".into()))?;
+                let smtp_listener = bind_loopback("smtp", smtp_port).await?;
                 println!(
                     "serving SMTP submission on 127.0.0.1:{smtp_port} (not end-to-end encrypted)"
                 );
@@ -761,7 +842,6 @@ impl ServeUseCase {
         //    its own — only a fatal error can — ends serve with that
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
-        let mut stop = pin!(stop);
         let (imap_limits, pop3_limits, smtp_limits) = shared_listener_limits();
         let smtp_auth = Arc::clone(&backend);
         let smtp_tls = tls.clone();
@@ -857,5 +937,18 @@ mod tests {
         assert!(is_fatal(&Error::Storage("x".into())));
         assert!(is_fatal(&Error::MissingCredentials));
         assert!(is_fatal(&Error::Unsupported("x".into())));
+        assert!(is_fatal(&Error::Keyring("x".into())));
+        assert!(is_fatal(&Error::InUse("x".into())));
+    }
+
+    #[tokio::test]
+    async fn a_held_port_is_in_use_not_a_network_error() {
+        let held = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = held.local_addr().unwrap().port();
+        let error = bind_loopback("imap", port).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InUse(ref m) if m == &format!("imap port {port} is already in use"))
+        );
+        assert_eq!(error.exit_code(), 10);
     }
 }

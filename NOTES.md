@@ -439,3 +439,10 @@ from the review:
 - The state database is still metadata-only (17 columns); `rfc822_size` and `mime_structure` are populated only for fetched mails; `serve` logs carry only fixed strings and counts.
 - A `resync` run during acceptance changed UIDVALIDITY as designed and Thunderbird rebuilt its cache without errors (the session-reset path exercised in production).
 
+## Exit codes and the systemd unit
+
+- `Error::exit_code` is a contract with `contrib/systemd/tuta-bridge.service`: 2 (storage) and 6 (network) are the only restartable codes; 1, 3, 4, 5, 8 (keyring unavailable or locked), 9 (unsupported) and 10 (state lock or port already in use) are listed in `RestartPreventExitStatus`. Adding a variant means placing it on one side of that line and updating the unit and the README table.
+- `Unsupported` moved from 2 to 9, and the state lock (`StateInUse`) from 2 to 10, so that neither restarts into the same failure. A state database written by a newer build (`SchemaTooNew`) is `Unsupported`.
+- `keyring::Error::NoStorageAccess` (locked collection, dismissed unlock prompt) and `PlatformFailure` (no Secret Service on the bus) map to `Error::Keyring`; other keyring failures stay opaque `Storage` errors.
+- `watch` and `serve` stop on SIGTERM as on Ctrl-C and exit 0. The unit uses `Restart=always` because `Restart=on-failure` does not restart after SIGTERM, which is what a plain `kill` sends.
+- The initial session resume retries network errors with the watch backoff; under systemd a network that is not up yet at login would otherwise burn through `StartLimitBurst`.

@@ -85,13 +85,15 @@ pub async fn open_state_store() -> Result<Arc<dyn StateStore>> {
 ///
 /// A database held by another process or written by a newer binary keeps
 /// its own explanation, which carries no data beyond schema version
-/// numbers; every other failure stays opaque.
+/// numbers; every other failure stays opaque. The first two need the
+/// user (stop the other process, upgrade the binary), so they carry
+/// their own exit codes instead of the restartable storage one.
 fn open_error(error: anyhow::Error) -> Error {
     if let Some(in_use) = error.downcast_ref::<StateInUse>() {
-        return Error::Storage(in_use.to_string());
+        return Error::InUse(in_use.to_string());
     }
     match error.downcast_ref::<SchemaTooNew>() {
-        Some(too_new) => Error::Storage(too_new.to_string()),
+        Some(too_new) => Error::Unsupported(too_new.to_string()),
         None => Error::Storage("failed to open state database".into()),
     }
 }
