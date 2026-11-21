@@ -9,7 +9,9 @@
 //! Rendering ([`render_multistatus`]) writes fixed prefixes for the
 //! namespaces DAV clients know (`d`, `card`, `cal`, `cs`, `ical`) and an
 //! inline default namespace for any other; every text and attribute
-//! value is escaped.
+//! value is escaped. A carriage return is written as `&#xD;`: a raw one
+//! would be normalized away by the client's parser (XML 1.0 §2.11), and
+//! vCard and iCalendar bodies need their CRLF line ends intact.
 //!
 //! Errors are fixed text: nothing from the body reaches an error string.
 
@@ -218,9 +220,10 @@ pub fn parse_xml(body: &[u8]) -> XmlResult<XmlElement> {
                     None => root = Some(element),
                 }
             }
+            // Line ends are normalized to LF (XML 1.0 §2.11).
             Event::Text(text) => {
                 let text = text
-                    .decode()
+                    .xml10_content()
                     .map_err(|_| XmlError("xml text is not utf-8"))?;
                 match stack.last_mut() {
                     Some(element) => element.text.push_str(&text),
@@ -230,7 +233,7 @@ pub fn parse_xml(body: &[u8]) -> XmlResult<XmlElement> {
             }
             Event::CData(data) => {
                 let data = data
-                    .decode()
+                    .xml10_content()
                     .map_err(|_| XmlError("xml text is not utf-8"))?;
                 match stack.last_mut() {
                     Some(element) => element.text.push_str(&data),
@@ -629,6 +632,9 @@ pub struct MultiStatusEntry {
     /// A whole-resource status instead of propstats, e.g. `404` for a
     /// multiget href that does not exist.
     pub status: Option<u16>,
+    /// A `<d:error>` precondition or postcondition element after the
+    /// status, e.g. `d:number-of-matches-within-limits` with a `507`.
+    pub error: Option<PropName>,
 }
 
 impl MultiStatusEntry {
@@ -639,6 +645,7 @@ impl MultiStatusEntry {
             found,
             missing,
             status: None,
+            error: None,
         }
     }
 
@@ -660,7 +667,14 @@ impl MultiStatusEntry {
             found: Vec::new(),
             missing: Vec::new(),
             status: Some(status),
+            error: None,
         }
+    }
+
+    /// The same entry with a `<d:error>` element naming `condition`.
+    pub fn with_error(mut self, condition: PropName) -> Self {
+        self.error = Some(condition);
+        self
     }
 }
 
@@ -678,6 +692,11 @@ pub fn render_multistatus(entries: &[MultiStatusEntry], sync_token: Option<&str>
         out.push_str("</d:href>");
         if let Some(status) = entry.status {
             push_status(&mut out, status);
+            if let Some(condition) = &entry.error {
+                out.push_str("<d:error>");
+                render_node(&mut out, &XmlNode::empty(condition.clone()));
+                out.push_str("</d:error>");
+            }
         } else {
             if !entry.found.is_empty() || entry.missing.is_empty() {
                 out.push_str("<d:propstat><d:prop>");
@@ -752,8 +771,9 @@ fn render_node(out: &mut String, node: &XmlNode) {
     }
 }
 
-/// Escape text for an XML element or a double-quoted attribute. Control
-/// characters XML 1.0 cannot carry are dropped.
+/// Escape text for an XML element or a double-quoted attribute. CR is
+/// written as a character reference so that CRLF reaches the client
+/// intact; control characters XML 1.0 cannot carry are dropped.
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
@@ -763,7 +783,10 @@ pub fn escape(text: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            '\t' | '\n' | '\r' => out.push(character),
+            // A raw CR would not survive the reader's line-end
+            // normalization; the character reference does.
+            '\r' => out.push_str("&#xD;"),
+            '\t' | '\n' => out.push(character),
             c if (c as u32) < 0x20 || c == '\u{FFFE}' || c == '\u{FFFF}' => {}
             c => out.push(c),
         }
@@ -999,6 +1022,36 @@ mod tests {
     #[test]
     fn escape_drops_unrepresentable_controls() {
         assert_eq!(escape("a\u{1}b\tc"), "ab\tc");
+    }
+
+    #[test]
+    fn crlf_survives_rendering_and_parsing() {
+        assert_eq!(escape("A\r\nB"), "A&#xD;\nB");
+        let data = "BEGIN:VCARD\r\nFN:A\r\n  folded\r\nEND:VCARD\r\n";
+        let body = render_multistatus(
+            &[MultiStatusEntry::props(
+                "/a.vcf",
+                vec![XmlNode::text(PropName::carddav("address-data"), data)],
+                Vec::new(),
+            )],
+            None,
+        );
+        assert!(!body.contains(&b'\r'));
+        let root = parse_xml(&body).unwrap();
+        assert_eq!(root.descendants(CARDDAV_NS, "address-data")[0].text, data);
+        // A raw CRLF in a request body is read as LF.
+        let root = parse_xml(b"<a xmlns=\"DAV:\">x\r\ny\rz</a>").unwrap();
+        assert_eq!(root.text, "x\ny\nz");
+    }
+
+    #[test]
+    fn a_status_entry_can_carry_an_error_element() {
+        let entry = MultiStatusEntry::status("/book/", 507)
+            .with_error(PropName::dav("number-of-matches-within-limits"));
+        let body = String::from_utf8(render_multistatus(&[entry], None)).unwrap();
+        assert!(body.contains(
+            "<d:status>HTTP/1.1 507 Insufficient Storage</d:status><d:error><d:number-of-matches-within-limits/></d:error></d:response>"
+        ));
     }
 
     #[test]

@@ -302,6 +302,7 @@ fn unescape(xml: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
+        .replace("&#xD;", "\r")
         .replace("&amp;", "&")
 }
 
@@ -712,4 +713,73 @@ async fn a_get_ahead_of_the_event_bus_updates_the_cached_etag() {
     assert_eq!(listed.1, new_etag);
     let rows = fixture.store.calendar_rows(1, "work").await.unwrap();
     assert!(!rows.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Multiget bodies survive a conforming XML parser (CRLF kept)
+// ---------------------------------------------------------------------------
+
+/// The text of every element named `local` (any prefix) in `body`, read
+/// the way a conforming XML parser does: line ends normalized (XML 1.0
+/// §2.11), entities and character references resolved.
+fn parsed_element_texts(body: &str, local: &str) -> Vec<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(body);
+    let mut texts = Vec::new();
+    let mut current: Option<String> = None;
+    loop {
+        match reader.read_event().unwrap() {
+            Event::Start(start) if start.local_name().as_ref() == local.as_bytes() => {
+                current = Some(String::new());
+            }
+            Event::End(end) if end.local_name().as_ref() == local.as_bytes() => {
+                texts.extend(current.take());
+            }
+            Event::Text(text) => {
+                if let Some(current) = current.as_mut() {
+                    current.push_str(&text.xml10_content().unwrap());
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(current) = current.as_mut() {
+                    let character = match reference.resolve_char_ref().unwrap() {
+                        Some(character) => character,
+                        None => match &*reference.decode().unwrap() {
+                            "amp" => '&',
+                            "lt" => '<',
+                            "gt" => '>',
+                            "quot" => '"',
+                            "apos" => '\'',
+                            other => panic!("unexpected entity {other}"),
+                        },
+                    };
+                    current.push(character);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    texts
+}
+
+#[tokio::test]
+async fn multiget_calendar_data_is_byte_identical_to_get_after_xml_parsing() {
+    let fixture = fixture().await;
+    let (mut wire, _session) = spawn(&fixture.handler);
+    let listed = listing(&mut wire, "work").await;
+    assert!(!listed.is_empty());
+    for (href, _) in &listed {
+        let get = wire.request("GET", href, &[], "").await;
+        assert_eq!(get.status, 200);
+        assert!(get.body.contains("\r\n"));
+        let body = format!(
+            r#"<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><d:href>{href}</d:href></c:calendar-multiget>"#
+        );
+        let response = wire.report("/caldav/calendars/work/", &body).await;
+        assert_eq!(response.status, 207);
+        let data = parsed_element_texts(&response.body, "calendar-data");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0], get.body, "multiget body equals GET for {href}");
+    }
 }
