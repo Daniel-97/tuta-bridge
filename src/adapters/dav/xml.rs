@@ -392,7 +392,7 @@ fn prop_request(parent: &XmlElement) -> XmlResult<Option<PropRequest>> {
     Ok(None)
 }
 
-/// A CalDAV `time-range` (RFC 4791 §9.9), in UTC. Either bound may be
+/// A CalDAV `time-range` (RFC 4791 §9.10), in UTC. Either bound may be
 /// absent; a present one was a valid `YYYYMMDDTHHMMSSZ` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeRange {

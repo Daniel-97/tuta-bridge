@@ -11,19 +11,24 @@
 //! | `/caldav/calendars/<calendar>/<r>.ics` | one event with its UID      |
 //!
 //! `<calendar>` is the Tuta calendar group id, `<r>` a hash of the
-//! event's UID. Listings, ETags and collection tags come from the
-//! metadata cache; iCalendar bodies are rendered from the SDK on each
-//! `GET` and for each `calendar-data` a report asks for. A body that no
-//! longer matches its cached row (an edit the event bus has not
-//! delivered yet) updates the row first, so the ETag served always
-//! describes the body served.
+//! event's UID. A UID with several masters (a series Tuta split with
+//! "edit this and all future events") is one resource per master: the
+//! earliest keeps the UID's name, so an unsplit series never changes
+//! href, and each later one gets a name and a UID derived from its own
+//! ids (see [`group_resources`]).
+//!
+//! Listings, ETags and collection tags come from the metadata cache;
+//! iCalendar bodies are rendered from the SDK on each `GET` and for
+//! each `calendar-data` a report asks for. A body that no longer
+//! matches its cached row (an edit the event bus has not delivered
+//! yet) updates the row first, so the ETag served always describes the
+//! body served.
 //!
 //! `Depth: infinity` (and a `PROPFIND` without `Depth`) is served as
 //! `Depth: 1`. Reports: `calendar-query` (the first `time-range` of
 //! its filter is honoured, `expand` is not) and `calendar-multiget`;
 //! any other report is `403`.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,7 +39,9 @@ use crate::adapters::dav::xml::{
     props, MultiStatusEntry, PropName, PropRequest, Report, XmlNode, APPLE_ICAL_NS, CALDAV_NS,
 };
 use crate::adapters::dav::{DavHandler, DavMethod, DavRequest, DavResponse, Depth, WellKnown};
-use crate::domain::calendar::{collection_tag, resource_etag};
+use crate::domain::calendar::{
+    collection_tag, group_resources, resource_etag, split_uid, Resource,
+};
 use crate::domain::{CalendarEvent, CalendarInfo, CalendarRow, Result};
 use crate::ports::calendar::{CalendarSource, CalendarStore};
 use crate::ports::clock::Clock;
@@ -108,15 +115,6 @@ fn item_href(calendar_id: &str, resource: &str) -> String {
     format!("{HOME_PATH}{calendar_id}/{resource}.ics")
 }
 
-/// The cached rows of a calendar grouped by resource.
-fn group_rows(rows: Vec<CalendarRow>) -> BTreeMap<String, Vec<CalendarRow>> {
-    let mut groups: BTreeMap<String, Vec<CalendarRow>> = BTreeMap::new();
-    for row in rows {
-        groups.entry(row.resource.clone()).or_default().push(row);
-    }
-    groups
-}
-
 /// The read-only CalDAV handler.
 pub struct CalDavHandler {
     pub account_id: i64,
@@ -146,10 +144,10 @@ impl CalDavHandler {
     /// Load and render one resource from its cached rows. Rows whose
     /// event changed are updated first; rows whose event vanished are
     /// removed. `None` when nothing of the resource is left.
-    async fn render(&self, calendar_id: &str, rows: &[CalendarRow]) -> Result<Option<Rendered>> {
+    async fn render(&self, calendar_id: &str, resource: &Resource) -> Result<Option<Rendered>> {
         let now = self.clock.now_ms();
         let mut loaded: Vec<(CalendarEvent, CalendarRow, Vec<String>)> = Vec::new();
-        for row in rows {
+        for row in &resource.rows {
             let Some(event) = self.source.event(&row.list_id, &row.element_id).await? else {
                 self.store
                     .remove_calendar_row(self.account_id, &row.list_id, &row.element_id)
@@ -169,6 +167,11 @@ impl CalDavHandler {
                 continue;
             }
             let alarms = self.source.alarm_triggers(&event.alarm_ids).await?;
+            let mut event = event;
+            if let (Some((list_id, element_id)), Some(uid)) = (&resource.split_master, &event.uid) {
+                // A later half of a split series: its own UID.
+                event.uid = Some(split_uid(uid, list_id, element_id));
+            }
             loaded.push((event, stored, alarms));
         }
         if loaded.is_empty() {
@@ -194,18 +197,18 @@ impl CalDavHandler {
     async fn item_entry(
         &self,
         calendar_id: &str,
-        resource: &str,
-        rows: &[CalendarRow],
+        name: &str,
+        resource: &Resource,
         wanted: &PropRequest,
     ) -> Result<MultiStatusEntry> {
-        let href = item_href(calendar_id, resource);
+        let href = item_href(calendar_id, name);
         let calendar_data = PropName::caldav("calendar-data");
         let mut available = vec![
             props::getcontenttype(ITEM_CONTENT_TYPE),
             props::resourcetype(false, &[]),
         ];
         if wanted.names(&calendar_data) {
-            match self.render(calendar_id, rows).await? {
+            match self.render(calendar_id, resource).await? {
                 Some(rendered) => {
                     available.push(props::getetag(&rendered.etag));
                     available.push(XmlNode::text(calendar_data, rendered.body));
@@ -213,7 +216,7 @@ impl CalDavHandler {
                 None => return Ok(MultiStatusEntry::status(href, 404)),
             }
         } else {
-            available.push(props::getetag(&resource_etag(rows)));
+            available.push(props::getetag(&resource_etag(&resource.rows)));
         }
         Ok(MultiStatusEntry::for_request(href, wanted, available))
     }
@@ -222,12 +225,12 @@ impl CalDavHandler {
     async fn item_entries(
         &self,
         calendar_id: &str,
-        resources: Vec<(String, Vec<CalendarRow>)>,
+        resources: Vec<(String, Resource)>,
         wanted: &PropRequest,
     ) -> Result<Vec<MultiStatusEntry>> {
         stream::iter(resources)
-            .map(|(resource, rows)| async move {
-                self.item_entry(calendar_id, &resource, &rows, wanted).await
+            .map(|(name, resource)| async move {
+                self.item_entry(calendar_id, &name, &resource, wanted).await
             })
             .buffered(RENDER_CONCURRENCY)
             .try_collect()
@@ -271,11 +274,11 @@ impl CalDavHandler {
             .store
             .calendar_rows(self.account_id, &calendar.calendar_id)
             .await?;
-        let tags: Vec<(String, String)> = group_rows(rows)
+        let tags: Vec<(String, String)> = group_resources(rows)
             .into_iter()
-            .map(|(resource, rows)| {
-                let etag = resource_etag(&rows);
-                (resource, etag)
+            .map(|(name, resource)| {
+                let etag = resource_etag(&resource.rows);
+                (name, etag)
             })
             .collect();
         let ctag = collection_tag(&tags);
@@ -358,17 +361,16 @@ impl CalDavHandler {
                         .store
                         .calendar_rows(self.account_id, &calendar_id)
                         .await?;
-                    let resources: Vec<_> = group_rows(rows).into_iter().collect();
+                    let resources: Vec<_> = group_resources(rows).into_iter().collect();
                     entries.extend(self.item_entries(&calendar_id, resources, wanted).await?);
                 }
             }
-            Target::Item(calendar_id, resource) => {
-                let rows = self.resource_rows(&calendar_id, &resource).await?;
-                if rows.is_empty() {
+            Target::Item(calendar_id, name) => {
+                let Some(resource) = self.resource(&calendar_id, &name).await? else {
                     return Ok(DavResponse::not_found());
-                }
+                };
                 let entry = self
-                    .item_entry(&calendar_id, &resource, &rows, wanted)
+                    .item_entry(&calendar_id, &name, &resource, wanted)
                     .await?;
                 if entry.status == Some(404) {
                     return Ok(DavResponse::not_found());
@@ -380,14 +382,13 @@ impl CalDavHandler {
         Ok(DavResponse::multistatus(&entries, None))
     }
 
-    async fn resource_rows(&self, calendar_id: &str, resource: &str) -> Result<Vec<CalendarRow>> {
-        Ok(self
+    /// One resource of a calendar by name, `None` when it has no rows.
+    async fn resource(&self, calendar_id: &str, name: &str) -> Result<Option<Resource>> {
+        let rows = self
             .store
             .calendar_rows(self.account_id, calendar_id)
-            .await?
-            .into_iter()
-            .filter(|row| row.resource == resource)
-            .collect())
+            .await?;
+        Ok(group_resources(rows).remove(name))
     }
 
     async fn report(&self, request: &DavRequest, report: &Report) -> Result<DavResponse> {
@@ -401,7 +402,7 @@ impl CalDavHandler {
             .props
             .clone()
             .unwrap_or_else(|| PropRequest::Prop(vec![PropName::dav("getetag")]));
-        let groups = group_rows(
+        let groups = group_resources(
             self.store
                 .calendar_rows(self.account_id, &calendar_id)
                 .await?,
@@ -440,7 +441,7 @@ impl CalDavHandler {
             };
             let matching: Vec<_> = groups
                 .into_iter()
-                .filter(|(_, rows)| rows.iter().any(|row| row.may_overlap(from, to)))
+                .filter(|(_, resource)| resource.rows.iter().any(|row| row.may_overlap(from, to)))
                 .collect();
             let entries = self.item_entries(&calendar_id, matching, &wanted).await?;
             return Ok(DavResponse::multistatus(&entries, None));
@@ -451,12 +452,11 @@ impl CalDavHandler {
 
     async fn get(&self, request: &DavRequest) -> Result<DavResponse> {
         match target(&request.path) {
-            Target::Item(calendar_id, resource) => {
-                let rows = self.resource_rows(&calendar_id, &resource).await?;
-                if rows.is_empty() {
+            Target::Item(calendar_id, name) => {
+                let Some(resource) = self.resource(&calendar_id, &name).await? else {
                     return Ok(DavResponse::not_found());
-                }
-                match self.render(&calendar_id, &rows).await? {
+                };
+                match self.render(&calendar_id, &resource).await? {
                     Some(rendered) => Ok(DavResponse::ok(
                         CALENDAR_CONTENT_TYPE,
                         rendered.body.into_bytes(),

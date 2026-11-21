@@ -9,6 +9,8 @@
 //! None of these types derive `Debug`: they carry titles, addresses and
 //! ids that must never reach a log line.
 
+use std::collections::BTreeMap;
+
 use crypto_primitives::sha::sha256;
 
 /// Type id of a `CalendarEvent` (application `tutanota`).
@@ -114,7 +116,8 @@ impl CalendarEvent {
         is_all_day(self.start_ms, self.end_ms)
     }
 
-    /// The CalDAV resource this event belongs to.
+    /// The series this event belongs to: the CalDAV resource, unless
+    /// the UID holds more than one master (see [`group_resources`]).
     ///
     /// A repeating event and its altered occurrences share one UID and
     /// must share one resource (RFC 4791 §4.1), so the name derives
@@ -225,6 +228,7 @@ impl CalendarEvent {
             list_id: self.list_id.clone(),
             element_id: self.element_id.clone(),
             resource: self.resource_name(),
+            recurrence_id_ms: self.recurrence_id_ms,
             start_ms: self.start_ms,
             end_ms: self.end_ms,
             recurring: self.repeat.is_some(),
@@ -241,9 +245,13 @@ pub struct CalendarRow {
     pub calendar_id: String,
     pub list_id: String,
     pub element_id: String,
-    /// The resource name (without `.ics`), shared by a repeating event
-    /// and its altered occurrences.
+    /// The series name (see [`CalendarEvent::resource_name`]), shared
+    /// by every event with the same UID. It is the resource name
+    /// (without `.ics`) unless the UID holds more than one master.
     pub resource: String,
+    /// See [`CalendarEvent::recurrence_id_ms`]: set on an altered
+    /// occurrence.
+    pub recurrence_id_ms: Option<i64>,
     pub start_ms: i64,
     pub end_ms: i64,
     pub recurring: bool,
@@ -271,9 +279,137 @@ impl CalendarRow {
     }
 }
 
+/// One CalDAV resource: its rows and, when it holds a later master of
+/// a split series, that master's ids (they derive its UID).
+#[derive(Clone)]
+pub struct Resource {
+    pub rows: Vec<CalendarRow>,
+    /// `(list_id, element_id)` of the master whose series this resource
+    /// serves under a derived UID; `None` for the UID's own resource.
+    pub split_master: Option<(String, String)>,
+}
+
+/// Group the cached rows of one calendar into CalDAV resources, keyed
+/// by resource name.
+///
+/// Normally a UID is one resource: its master (the event without a
+/// recurrence id) and its altered occurrences. Tuta's "edit this and
+/// all future events" ends the series and starts a second master with
+/// the same UID; two masters cannot share a `VCALENDAR` (clients key
+/// components by UID and `RECURRENCE-ID`, so one would replace the
+/// other) nor a UID across resources (RFC 4791 §4.1). So a UID with
+/// several masters is split:
+///
+/// - Masters are ordered by start (then ids). The first keeps the UID
+///   and the UID's resource name, so an unsplit series and the original
+///   half of a split one keep their href.
+/// - Every later master gets a resource of its own, named from the
+///   series name and its ids ([`split_resource_name`]), served under a
+///   UID derived the same way ([`split_uid`]): both are stable while
+///   that master exists, whatever happens to the others.
+/// - An altered occurrence joins the master whose series its recurrence
+///   id falls in: the latest master starting at or before it whose
+///   known end is after it; else the latest starting at or before it;
+///   else the first. Split series follow each other in time, so this
+///   is the series that generated the occurrence.
+pub fn group_resources(rows: Vec<CalendarRow>) -> BTreeMap<String, Resource> {
+    let mut series: BTreeMap<String, Vec<CalendarRow>> = BTreeMap::new();
+    for row in rows {
+        series.entry(row.resource.clone()).or_default().push(row);
+    }
+    let mut resources = BTreeMap::new();
+    for (name, rows) in series {
+        // (start, list id, element id, known end) of every master.
+        let mut masters: Vec<(i64, String, String, Option<i64>)> = rows
+            .iter()
+            .filter(|row| row.recurrence_id_ms.is_none())
+            .map(|row| {
+                (
+                    row.start_ms,
+                    row.list_id.clone(),
+                    row.element_id.clone(),
+                    row.series_end_ms,
+                )
+            })
+            .collect();
+        if masters.len() < 2 {
+            resources.insert(
+                name,
+                Resource {
+                    rows,
+                    split_master: None,
+                },
+            );
+            continue;
+        }
+        masters.sort();
+        let spans: Vec<(i64, Option<i64>)> = masters
+            .iter()
+            .map(|(start, _, _, end)| (*start, *end))
+            .collect();
+        let mut split: Vec<Vec<CalendarRow>> = vec![Vec::new(); masters.len()];
+        for row in rows {
+            let index = match row.recurrence_id_ms {
+                None => masters
+                    .iter()
+                    .position(|(_, list, element, _)| {
+                        *list == row.list_id && *element == row.element_id
+                    })
+                    .unwrap_or(0),
+                Some(recurrence_id) => owning_master(&spans, recurrence_id),
+            };
+            split[index].push(row);
+        }
+        let keys = masters
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, list, element, _))| {
+                if index == 0 {
+                    (name.clone(), None)
+                } else {
+                    (
+                        split_resource_name(&name, &list, &element),
+                        Some((list, element)),
+                    )
+                }
+            });
+        for ((key, split_master), rows) in keys.zip(split) {
+            resources.insert(key, Resource { rows, split_master });
+        }
+    }
+    resources
+}
+
+/// The master (index into `masters`, ordered by start) an altered
+/// occurrence with `recurrence_id` belongs to; see [`group_resources`].
+fn owning_master(masters: &[(i64, Option<i64>)], recurrence_id: i64) -> usize {
+    let started = |index: &usize| masters[*index].0 <= recurrence_id;
+    let running = (0..masters.len())
+        .rev()
+        .filter(started)
+        .find(|index| masters[*index].1.is_none_or(|end| recurrence_id < end));
+    running
+        .or_else(|| (0..masters.len()).rev().find(started))
+        .unwrap_or(0)
+}
+
+/// The resource name of a later master of a split series.
+pub fn split_resource_name(series: &str, list_id: &str, element_id: &str) -> String {
+    let key = format!("split\0{series}\0{list_id}\0{element_id}");
+    hex(&sha256(key.as_bytes())[..16])
+}
+
+/// The UID a later master of a split series (and its altered
+/// occurrences) is served under: the Tuta UID plus a hash of the
+/// master's ids, so no id appears in it.
+pub fn split_uid(uid: &str, list_id: &str, element_id: &str) -> String {
+    let key = format!("{list_id}\0{element_id}");
+    format!("{uid}-split-{}", hex(&sha256(key.as_bytes())[..8]))
+}
+
 /// Bump this when the iCalendar output changes for unchanged data, so
 /// every ETag changes with it and clients fetch the new rendering.
-pub const RENDER_VERSION: &str = "caldav-ics-1";
+pub const RENDER_VERSION: &str = "caldav-ics-2";
 
 /// The strong ETag of a resource made of `rows` (quoted).
 pub fn resource_etag<'a>(rows: impl IntoIterator<Item = &'a CalendarRow>) -> String {
@@ -316,7 +452,7 @@ pub fn is_all_day(start_ms: i64, end_ms: i64) -> bool {
     start_ms.rem_euclid(DAY_MS) == 0 && end_ms.rem_euclid(DAY_MS) == 0 && end_ms > start_ms
 }
 
-/// Overlap test shared by events and rows (RFC 4791 §9.9, generous).
+/// Overlap test shared by events and rows (RFC 4791 §9.10, generous).
 fn overlaps(start_ms: i64, end_ms: Option<i64>, all_day: bool, from_ms: i64, to_ms: i64) -> bool {
     // Floating dates can fall on either side of UTC midnight.
     let slack = if all_day { 14 * 60 * 60 * 1000 } else { 0 };
@@ -407,6 +543,125 @@ mod tests {
         changed.fingerprint = "f".into();
         assert_ne!(resource_etag([&a, &b]), resource_etag([&a, &changed]));
         assert!(resource_etag([&a]).starts_with('"'));
+    }
+
+    fn weekly(end: Option<i64>) -> RepeatRule {
+        RepeatRule {
+            frequency: 1,
+            interval: 1,
+            end_type: if end.is_some() { 2 } else { 0 },
+            end_value: end,
+            time_zone: "UTC".into(),
+            excluded_ms: Vec::new(),
+            advanced: Vec::new(),
+        }
+    }
+
+    const WEEK: i64 = 7 * DAY_MS;
+
+    #[test]
+    fn one_master_per_uid_keeps_the_uid_resource() {
+        let mut master = event();
+        master.repeat = Some(weekly(None));
+        let mut altered = event();
+        altered.element_id = "moved".into();
+        altered.recurrence_id_ms = Some(master.start_ms + WEEK);
+        let resources = group_resources(vec![master.row("cal", 0), altered.row("cal", 0)]);
+        assert_eq!(resources.len(), 1);
+        let (name, resource) = resources.iter().next().unwrap();
+        assert_eq!(name, &master.resource_name());
+        assert_eq!(resource.rows.len(), 2);
+        assert!(resource.split_master.is_none());
+    }
+
+    #[test]
+    fn a_split_series_becomes_one_resource_per_master() {
+        // "Edit this and all future events": the original ends before
+        // week 4, a second master with the same UID starts there.
+        let start = 1_700_000_000_000;
+        let split_at = start + 4 * WEEK;
+        let mut original = event();
+        original.element_id = "original".into();
+        original.start_ms = start;
+        original.end_ms = start + 3_600_000;
+        original.repeat = Some(weekly(Some(split_at)));
+        let mut future = original.clone();
+        future.element_id = "future".into();
+        future.start_ms = split_at + 3_600_000; // moved one hour later
+        future.end_ms = future.start_ms + 3_600_000;
+        future.repeat = Some(weekly(None));
+        let mut early = event();
+        early.element_id = "early".into();
+        early.recurrence_id_ms = Some(start + WEEK);
+        let mut late = event();
+        late.element_id = "late".into();
+        late.recurrence_id_ms = Some(future.start_ms + 2 * WEEK);
+        // Moved before the second series' start, but generated by it.
+        late.start_ms = split_at - DAY_MS;
+        let rows = vec![
+            late.row("cal", 0),
+            future.row("cal", 0),
+            early.row("cal", 0),
+            original.row("cal", 0),
+        ];
+        let resources = group_resources(rows.clone());
+        assert_eq!(resources.len(), 2);
+        let first = &resources[&original.resource_name()];
+        assert!(
+            first.split_master.is_none(),
+            "the first master keeps the UID"
+        );
+        let mut ids: Vec<&str> = first.rows.iter().map(|r| r.element_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["early", "original"]);
+        let name = split_resource_name(&original.resource_name(), "list", "future");
+        let second = &resources[&name];
+        assert_eq!(
+            second.split_master,
+            Some(("list".to_string(), "future".to_string()))
+        );
+        let mut ids: Vec<&str> = second.rows.iter().map(|r| r.element_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["future", "late"]);
+        // Deterministic whatever the row order.
+        let mut reversed = rows;
+        reversed.reverse();
+        assert_eq!(
+            group_resources(reversed).keys().collect::<Vec<_>>(),
+            resources.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(name.len(), 32);
+        assert_ne!(
+            split_uid("uid-1", "list", "future"),
+            split_uid("uid-1", "list", "other")
+        );
+        assert!(split_uid("uid-1", "list", "future").starts_with("uid-1-split-"));
+        assert!(!split_uid("uid-1", "list", "future").contains("future"));
+    }
+
+    #[test]
+    fn an_occurrence_before_every_master_joins_the_first() {
+        assert_eq!(owning_master(&[(10, Some(20)), (20, None)], 5), 0);
+        assert_eq!(owning_master(&[(10, Some(20)), (20, None)], 15), 0);
+        assert_eq!(owning_master(&[(10, Some(20)), (20, None)], 20), 1);
+        // A master whose known end is past: the next running one wins,
+        // else the latest started.
+        assert_eq!(owning_master(&[(10, None), (20, Some(25))], 30), 0);
+        assert_eq!(owning_master(&[(10, Some(12)), (20, Some(25))], 30), 1);
+    }
+
+    #[test]
+    fn a_rule_ending_exactly_at_the_window_start_is_out() {
+        // Tuta's end is exclusive: a rule ending at `from` has its last
+        // occurrence before it; only its duration can reach into it.
+        let mut repeating = event();
+        let duration = repeating.end_ms - repeating.start_ms;
+        let until = repeating.start_ms + 3 * WEEK;
+        repeating.repeat = Some(weekly(Some(until)));
+        let row = repeating.row("cal", 0);
+        assert_eq!(row.series_end_ms, Some(until + duration));
+        assert!(row.may_overlap(until + duration - 1, i64::MAX));
+        assert!(!row.may_overlap(until + duration, i64::MAX));
     }
 
     #[test]
