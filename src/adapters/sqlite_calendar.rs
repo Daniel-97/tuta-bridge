@@ -3,7 +3,8 @@
 //! Two tables: `calendars` (one row per Tuta calendar: name, colour and
 //! the two event lists that map an event back to its calendar) and
 //! `calendar_events` (one row per Tuta event: ids, the resource it
-//! belongs to, times, a recurrence flag, a content fingerprint and the
+//! belongs to, the recurrence id of an altered occurrence, times, a
+//! recurrence flag, a content fingerprint and the
 //! time the bridge first saw that fingerprint). Event titles, texts,
 //! attendees and iCalendar bodies are never stored: bodies are rendered
 //! on demand from the SDK.
@@ -30,7 +31,8 @@ pub(crate) const CALENDAR_SCHEMA_STATEMENTS: &[&str] = &[
         calendar_id TEXT NOT NULL,
         list_id TEXT NOT NULL,
         element_id TEXT NOT NULL,
-        resource TEXT NOT NULL,             -- hashed UID: the .ics name
+        resource TEXT NOT NULL,             -- hashed UID: the series name
+        recurrence_id_ms INTEGER,           -- set on an altered occurrence
         start_ms INTEGER NOT NULL,
         end_ms INTEGER NOT NULL,
         recurring INTEGER NOT NULL,
@@ -57,12 +59,13 @@ const UPSERT_CALENDAR_SQL: &str = "INSERT INTO calendars
 /// An unchanged fingerprint keeps the stored `modified_ms`: it is the
 /// `DTSTAMP` and part of the ETag, which a reload must not change.
 const UPSERT_ROW_SQL: &str = "INSERT INTO calendar_events
-        (account_id, calendar_id, list_id, element_id, resource, start_ms, end_ms,
-         recurring, series_end_ms, fingerprint, modified_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (account_id, calendar_id, list_id, element_id, resource, recurrence_id_ms,
+         start_ms, end_ms, recurring, series_end_ms, fingerprint, modified_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (account_id, list_id, element_id) DO UPDATE SET
         calendar_id = excluded.calendar_id,
         resource = excluded.resource,
+        recurrence_id_ms = excluded.recurrence_id_ms,
         start_ms = excluded.start_ms,
         end_ms = excluded.end_ms,
         recurring = excluded.recurring,
@@ -74,13 +77,13 @@ const UPSERT_ROW_SQL: &str = "INSERT INTO calendar_events
         END,
         fingerprint = excluded.fingerprint";
 
-const SELECT_ROWS_SQL: &str = "SELECT calendar_id, list_id, element_id, resource, start_ms,
-        end_ms, recurring, series_end_ms, fingerprint, modified_ms
+const SELECT_ROWS_SQL: &str = "SELECT calendar_id, list_id, element_id, resource,
+        recurrence_id_ms, start_ms, end_ms, recurring, series_end_ms, fingerprint, modified_ms
      FROM calendar_events WHERE account_id = ? AND calendar_id = ?
      ORDER BY resource, list_id, element_id";
 
-const SELECT_ROW_SQL: &str = "SELECT calendar_id, list_id, element_id, resource, start_ms,
-        end_ms, recurring, series_end_ms, fingerprint, modified_ms
+const SELECT_ROW_SQL: &str = "SELECT calendar_id, list_id, element_id, resource,
+        recurrence_id_ms, start_ms, end_ms, recurring, series_end_ms, fingerprint, modified_ms
      FROM calendar_events WHERE account_id = ? AND list_id = ? AND element_id = ?";
 
 fn row_from(row: &sqlx::sqlite::SqliteRow) -> CalendarRow {
@@ -89,6 +92,7 @@ fn row_from(row: &sqlx::sqlite::SqliteRow) -> CalendarRow {
         list_id: row.get("list_id"),
         element_id: row.get("element_id"),
         resource: row.get("resource"),
+        recurrence_id_ms: row.get("recurrence_id_ms"),
         start_ms: row.get("start_ms"),
         end_ms: row.get("end_ms"),
         recurring: row.get::<i64, _>("recurring") != 0,
@@ -108,6 +112,7 @@ where
         .bind(&row.list_id)
         .bind(&row.element_id)
         .bind(&row.resource)
+        .bind(row.recurrence_id_ms)
         .bind(row.start_ms)
         .bind(row.end_ms)
         .bind(i64::from(row.recurring))
@@ -309,6 +314,7 @@ mod tests {
             list_id: format!("{calendar_id}-short"),
             element_id: element_id.into(),
             resource: format!("res-{element_id}"),
+            recurrence_id_ms: None,
             start_ms: 1_000,
             end_ms: 2_000,
             recurring: false,

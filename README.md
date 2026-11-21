@@ -459,7 +459,10 @@ another process holds stops `serve` with exit code 10.
 | `/caldav/calendars/<calendar>/<event>.ics` | one event (with its moved occurrences) |
 
 `<calendar>` is the Tuta calendar id, `<event>` a hash of the event's
-UID. Tuta's birthday calendar is not served: Tuta builds it in the
+UID. A series split in Tuta with "edit this and all future events"
+(two series sharing one UID) is served as two `.ics`: the original
+half keeps its URL and UID, the later half gets its own URL and a UID
+ending in `-split-<hash>`. Tuta's birthday calendar is not served: Tuta builds it in the
 client from your contacts, it is not a calendar on the server.
 
 ### How events are mapped
@@ -485,7 +488,8 @@ client from your contacts, it is not a calendar on the server.
   series (`RECURRENCE-ID`). Where Tuta and RFC 5545 disagree, the rule
   is rewritten to match what Tuta shows: a monthly event on the 29th–31st
   falls on the last day of shorter months, a yearly one on Feb 29 on
-  Feb 28, and "ends after N" does not count removed occurrences.
+  Feb 28. "Ends after N occurrences" counts removed occurrences too,
+  as in the Tuta app.
 - **Degradation.** A repeat rule that cannot be expressed in iCalendar
   (an unknown repeat type, or a combination RFC 5545 forbids) is never
   approximated: the event is served as its first occurrence only, its

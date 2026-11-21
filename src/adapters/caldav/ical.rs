@@ -1,7 +1,11 @@
 //! iCalendar (RFC 5545) rendering of Tuta events.
 //!
 //! One CalDAV resource is one `VCALENDAR`: the repeating event (if the
-//! calendar holds it) and every altered occurrence sharing its UID.
+//! calendar holds it) and every altered occurrence sharing its UID. A
+//! series Tuta split in two ("edit this and all future events") is two
+//! resources, the later one under a derived UID (see
+//! [`crate::domain::calendar::group_resources`]); the caller sets that
+//! UID on the events it hands in.
 //!
 //! Times:
 //! - A non-repeating timed event, and every altered occurrence, is
@@ -16,20 +20,23 @@
 //!   SDK does with it.
 //!
 //! Recurrence: frequency, interval, `COUNT`/`UNTIL` and the advanced
-//! `BYxxx` parts map to an `RRULE`, removed occurrences to `EXDATE`.
-//! Where Tuta's expansion differs from RFC 5545 the rule is rewritten to
-//! match Tuta (a monthly rule on day 29-31 and a yearly rule on Feb 29
-//! fall back to the month's last day; `COUNT` with removed occurrences
-//! does not count them). A rule that cannot be expressed is never
-//! approximated: the event is served as its first occurrence only, and
-//! its description says so (see [`UNSUPPORTED_NOTE`]).
+//! `BYxxx` parts map to an `RRULE`, removed occurrences to `EXDATE`
+//! (in the rule's zone, like `DTSTART`). Where Tuta differs from RFC
+//! 5545 the rule is rewritten to match Tuta: a monthly rule on day
+//! 29-31 and a yearly rule on Feb 29 fall back to the month's last day.
+//! `COUNT` is plain RFC 5545, removed occurrences included, which is
+//! how the Tuta web app expands and exports it. A rule that cannot be
+//! expressed is never approximated: the event is served as its first
+//! occurrence only, and its description says so (see
+//! [`UNSUPPORTED_NOTE`]).
 //!
-//! Text values are escaped, lines folded at 75 octets on character
-//! boundaries, and every line ends in CRLF.
+//! Text values are escaped, parameter values quoted with RFC 6868
+//! caret encoding, lines folded at 75 octets on character boundaries,
+//! and every line ends in CRLF.
 
 use std::collections::BTreeMap;
 
-use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime};
+use time::{Month, OffsetDateTime, PrimitiveDateTime};
 
 use super::timezone::{format_local, year_start, Zone};
 use crate::domain::calendar::DAY_MS;
@@ -165,12 +172,17 @@ fn render_event(
     match recurrence {
         Some(Ok(mapped)) => {
             lines.push(format!("RRULE:{}", mapped.rrule));
-            // One EXDATE line per value keeps lines short and diffable.
+            // One EXDATE line per value keeps lines short and diffable;
+            // same form as DTSTART, so clients match it to an instance.
             for excluded in mapped.exdates {
-                if all_day {
-                    lines.push(format!("EXDATE;VALUE=DATE:{}", format_date(excluded)));
-                } else {
-                    lines.push(format!("EXDATE:{}", format_utc(excluded)));
+                match (&mapped.zone, all_day) {
+                    (_, true) => lines.push(format!("EXDATE;VALUE=DATE:{}", format_date(excluded))),
+                    (Some(zone), false) => lines.push(format!(
+                        "EXDATE;TZID={}:{}",
+                        zone.name,
+                        format_local(zone.local(instant(excluded)))
+                    )),
+                    (None, false) => lines.push(format!("EXDATE:{}", format_utc(excluded))),
                 }
             }
             if let Some(zone) = mapped.zone {
@@ -381,18 +393,8 @@ fn map_rule(
     };
     match (rule.end_type, rule.end_value) {
         (0, _) => {}
-        (1, Some(count)) if count > 0 => {
-            if rule.excluded_ms.is_empty() {
-                rrule.push_str(&format!(";COUNT={count}"));
-            } else if parts.is_empty() && rule.advanced.is_empty() {
-                // Tuta does not count removed occurrences; RFC 5545
-                // does. End the rule at Tuta's last occurrence instead.
-                let last = nth_kept_occurrence(event, rule, zone.as_ref(), count).ok_or(())?;
-                rrule.push_str(&format!(";UNTIL={}", until_value(last + 1, all_day)));
-            } else {
-                return Err(());
-            }
-        }
+        // Removed occurrences count, as in the Tuta web app.
+        (1, Some(count)) if count > 0 => rrule.push_str(&format!(";COUNT={count}")),
         // Tuta's end instant is exclusive, UNTIL is inclusive.
         (2, Some(until)) => rrule.push_str(&format!(";UNTIL={}", until_value(until, all_day))),
         _ => return Err(()),
@@ -425,65 +427,6 @@ fn local_start(start_ms: i64, all_day: bool, zone: Option<&Zone>) -> PrimitiveDa
         (false, Some(zone)) => zone.local(start),
         _ => PrimitiveDateTime::new(start.date(), start.time()),
     }
-}
-
-/// The start of the `count`-th occurrence Tuta shows for a rule
-/// without advanced parts, skipping removed occurrences.
-fn nth_kept_occurrence(
-    event: &CalendarEvent,
-    rule: &RepeatRule,
-    zone: Option<&Zone>,
-    count: i64,
-) -> Option<i64> {
-    let all_day = event.is_all_day();
-    let start_local = local_start(event.start_ms, all_day, zone);
-    let interval = rule.interval.max(1);
-    let excluded: Vec<i64> = rule
-        .excluded_ms
-        .iter()
-        .map(|&ms| {
-            if all_day {
-                ms.div_euclid(DAY_MS) * DAY_MS
-            } else {
-                ms
-            }
-        })
-        .collect();
-    let mut kept = 0;
-    for step in 0..200_000i64 {
-        let local = match rule.frequency {
-            0 => start_local.checked_add(Duration::days(step * interval))?,
-            1 => start_local.checked_add(Duration::weeks(step * interval))?,
-            2 => add_months(start_local, step * interval)?,
-            3 => add_months(start_local, step * interval * 12)?,
-            _ => return None,
-        };
-        let at = match (all_day, zone) {
-            (false, Some(zone)) => zone.instant(local),
-            _ => local.assume_utc(),
-        };
-        let at_ms = i64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()?;
-        if !excluded.contains(&at_ms) {
-            kept += 1;
-            if kept == count {
-                return Some(at_ms);
-            }
-        }
-    }
-    None
-}
-
-/// Add months, clamping the day to the target month's length (Tuta's
-/// behaviour), anchored on the original day.
-fn add_months(local: PrimitiveDateTime, months: i64) -> Option<PrimitiveDateTime> {
-    let index = i64::from(local.year()) * 12 + i64::from(u8::from(local.month())) - 1 + months;
-    let year = i32::try_from(index.div_euclid(12)).ok()?;
-    let month = Month::try_from(u8::try_from(index.rem_euclid(12) + 1).ok()?).ok()?;
-    let day = local.day().min(month.length(year));
-    Some(PrimitiveDateTime::new(
-        Date::from_calendar_date(year, month, day).ok()?,
-        local.time(),
-    ))
 }
 
 fn valid_part_value(name: &str, value: &str) -> bool {
@@ -618,18 +561,27 @@ fn person_line(property: &str, person: &EventPerson, status: Option<i64>) -> Opt
     Some(line)
 }
 
-/// A parameter value: control characters and `"` dropped, quoted when
-/// it contains `;`, `:` or `,`.
+/// A quoted parameter value (empty when nothing is left), RFC 6868
+/// caret-encoded: RFC 5545 parameter values have no escaping and cannot
+/// hold `"` or a line break, so `^` becomes `^^`, `"` becomes `^'` and
+/// a line break `^n`; other control characters are dropped. Quoting
+/// every value keeps `;`, `:`, `,` and `\` literal.
 pub fn param_value(value: &str) -> String {
-    let clean: String = value
-        .chars()
-        .filter(|c| !c.is_control() && *c != '"')
-        .collect();
-    let clean = clean.trim().to_string();
-    if clean.contains([';', ':', ',']) {
-        format!("\"{clean}\"")
+    let value = value.trim().replace("\r\n", "\n");
+    let mut out = String::with_capacity(value.len() + 2);
+    for character in value.chars() {
+        match character {
+            '^' => out.push_str("^^"),
+            '"' => out.push_str("^'"),
+            '\n' | '\r' => out.push_str("^n"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    if out.is_empty() {
+        out
     } else {
-        clean
+        format!("\"{out}\"")
     }
 }
 
@@ -939,7 +891,7 @@ mod tests {
         );
         assert!(body.contains("DTEND;TZID=Europe/Berlin:20250106T100000\r\n"));
         assert!(body.contains("RRULE:FREQ=WEEKLY;UNTIL=20250330T235959Z;BYDAY=MO,WE\r\n"));
-        assert!(body.contains("EXDATE:20250113T080000Z\r\n"));
+        assert!(body.contains("EXDATE;TZID=Europe/Berlin:20250113T090000\r\n"));
         assert!(body.contains("BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n"));
         let vtimezone_at = body.find("BEGIN:VTIMEZONE").unwrap();
         assert!(vtimezone_at < body.find("BEGIN:VEVENT").unwrap());
@@ -1002,21 +954,90 @@ mod tests {
     }
 
     #[test]
-    fn count_with_removed_occurrences_becomes_until() {
+    fn count_with_removed_occurrences_stays_count() {
         let mut daily = event();
         let mut repeat = rule(0);
         repeat.time_zone = "UTC".into();
         repeat.end_type = 1;
         repeat.end_value = Some(3);
-        // The second occurrence is removed: Tuta shows days 1, 3, 4.
+        // The second occurrence is removed and still counts, as in the
+        // Tuta web app: days 1 and 3 are shown.
         repeat.excluded_ms = vec![MONDAY_8_UTC + DAY_MS];
         daily.repeat = Some(repeat);
         let body = render(&[daily]);
+        assert!(body.contains("RRULE:FREQ=DAILY;COUNT=3\r\n"), "{body}");
+        assert!(body.contains("EXDATE:20250107T080000Z\r\n"));
+    }
+
+    #[test]
+    fn month_end_count_and_exdate_is_a_real_rule() {
+        let mut monthly = event();
+        // 2025-01-31 08:00 UTC = 09:00 Berlin; February falls on the 28th.
+        monthly.start_ms = MONDAY_8_UTC + 25 * DAY_MS;
+        monthly.end_ms = monthly.start_ms + HOUR;
+        let mut repeat = rule(2);
+        repeat.end_type = 1;
+        repeat.end_value = Some(5);
+        // 2025-02-28 09:00 Berlin.
+        repeat.excluded_ms = vec![MONDAY_8_UTC + 53 * DAY_MS];
+        monthly.repeat = Some(repeat);
+        let body = unfolded(&render(&[monthly]));
         assert!(
-            body.contains("RRULE:FREQ=DAILY;UNTIL=20250109T080000Z\r\n"),
+            body.contains("RRULE:FREQ=MONTHLY;COUNT=5;BYMONTHDAY=28,29,30,31;BYSETPOS=-1\r\n"),
             "{body}"
         );
-        assert!(body.contains("EXDATE:20250107T080000Z\r\n"));
+        assert!(body.contains("EXDATE;TZID=Europe/Berlin:20250228T090000\r\n"));
+        assert!(!body.contains("UNSUPPORTED"));
+    }
+
+    #[test]
+    fn count_and_exdate_keep_the_wall_clock_across_dst() {
+        // Weekly at 09:00 Berlin from 2025-03-24 (CET, 08:00 UTC); the
+        // removed 2025-03-31 occurrence is in CEST (07:00 UTC).
+        let mut weekly = event();
+        weekly.start_ms = MONDAY_8_UTC + 77 * DAY_MS;
+        weekly.end_ms = weekly.start_ms + HOUR;
+        let mut repeat = rule(1);
+        repeat.end_type = 1;
+        repeat.end_value = Some(4);
+        repeat.excluded_ms = vec![weekly.start_ms + 7 * DAY_MS - HOUR];
+        weekly.repeat = Some(repeat);
+        let body = unfolded(&render(&[weekly]));
+        assert!(body.contains("DTSTART;TZID=Europe/Berlin:20250324T090000\r\n"));
+        assert!(body.contains("RRULE:FREQ=WEEKLY;COUNT=4\r\n"), "{body}");
+        assert!(
+            body.contains("EXDATE;TZID=Europe/Berlin:20250331T090000\r\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn an_end_on_an_occurrence_excludes_it() {
+        // Tuta's end is exclusive: ending at the start of the third
+        // occurrence leaves two, so UNTIL is one second before it.
+        let mut daily = event();
+        let mut repeat = rule(0);
+        repeat.end_type = 2;
+        repeat.end_value = Some(MONDAY_8_UTC + 2 * DAY_MS);
+        daily.repeat = Some(repeat);
+        let body = render(&[daily]);
+        assert!(
+            body.contains("RRULE:FREQ=DAILY;UNTIL=20250108T075959Z\r\n"),
+            "{body}"
+        );
+        // All-day: the last kept date.
+        let mut day = event();
+        day.start_ms = 20_094 * DAY_MS;
+        day.end_ms = 20_095 * DAY_MS;
+        let mut repeat = rule(0);
+        repeat.end_type = 2;
+        repeat.end_value = Some(20_096 * DAY_MS);
+        day.repeat = Some(repeat);
+        let body = render(&[day]);
+        assert!(
+            body.contains("RRULE:FREQ=DAILY;UNTIL=20250107\r\n"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -1060,8 +1081,8 @@ mod tests {
         let first = body.find("RRULE").unwrap();
         let second = body.find("RECURRENCE-ID:20250113T080000Z").unwrap();
         assert!(first < second, "master first");
-        assert!(!body.contains("EXDATE:20250113T080000Z"));
-        assert!(body.contains("EXDATE:20250120T080000Z"));
+        assert!(!body.contains("EXDATE;TZID=Europe/Berlin:20250113T090000"));
+        assert!(body.contains("EXDATE;TZID=Europe/Berlin:20250120T090000\r\n"));
         assert!(body.contains("DTSTART:20250113T100000Z"));
     }
 
@@ -1094,8 +1115,8 @@ mod tests {
             modified_ms: 0,
             alarms: &alarms,
         }]));
-        assert!(body.contains("ORGANIZER;CN=\"Ann, Boss\":mailto:ann@example.invalid\r\n"));
-        assert!(body.contains("ATTENDEE;CN=Bob;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:bob@example.invalid\r\n"));
+        assert!(body.contains("ORGANIZER;CN=\"Ann, ^'Boss^'\":mailto:ann@example.invalid\r\n"));
+        assert!(body.contains("ATTENDEE;CN=\"Bob\";CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:bob@example.invalid\r\n"));
         assert!(body.contains("ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION:mailto:cy@example.invalid\r\n"));
         assert_eq!(body.matches("BEGIN:VALARM").count(), 2);
         assert!(body.contains("TRIGGER:-PT15M\r\n"));
@@ -1105,6 +1126,25 @@ mod tests {
         assert_eq!(alarm_trigger("0M").as_deref(), Some("PT0S"));
         assert_eq!(alarm_trigger("M"), None);
         assert_eq!(alarm_trigger("5Y"), None);
+    }
+
+    #[test]
+    fn parameter_values_are_quoted_and_caret_encoded() {
+        assert_eq!(param_value("Bob"), "\"Bob\"");
+        assert_eq!(param_value("  "), "");
+        assert_eq!(param_value("a\\b;c:d,e"), "\"a\\b;c:d,e\"");
+        assert_eq!(param_value("say \"hi\" ^_^"), "\"say ^'hi^' ^^_^^\"");
+        assert_eq!(param_value("one\r\ntwo\nthree\u{7}"), "\"one^ntwo^nthree\"");
+        let mut meeting = event();
+        meeting.organizer = Some(EventPerson {
+            name: "Dom\\Ann \"A\"".into(),
+            address: "ann@example.invalid".into(),
+        });
+        let body = unfolded(&render(&[meeting]));
+        assert!(
+            body.contains("ORGANIZER;CN=\"Dom\\Ann ^'A^'\":mailto:ann@example.invalid\r\n"),
+            "{body}"
+        );
     }
 
     #[test]

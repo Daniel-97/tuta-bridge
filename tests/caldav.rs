@@ -3,7 +3,8 @@
 //! SQLite metadata cache and a fake calendar source. Covers the
 //! Thunderbird flow — discovery, ctag/getetag listing, multiget — plus
 //! calendar-query with a time range, GET with ETag/304, the read-only
-//! answers, and ETag stability across reloads.
+//! answers, ETag stability across reloads and database reopens, a
+//! series Tuta split in two, and a moved occurrence outside the window.
 
 mod support;
 
@@ -122,6 +123,11 @@ async fn fixture() -> Fixture {
     source.put_alarm("alarms", "alarm-tomorrow", "15M");
 
     let store = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    over(source, store).await
+}
+
+/// The sync and handler over `source` and `store`, after a reload.
+async fn over(source: Arc<FakeCalendarSource>, store: Arc<SqliteStateStore>) -> Fixture {
     let account_id = store.upsert_account(USER).await.unwrap();
     let clock = Arc::new(TestClock(AtomicI64::new(NOW_MS)));
     let sync = Arc::new(CalendarSync::new(
@@ -566,7 +572,7 @@ async fn get_serves_icalendar_with_a_stable_etag_and_304() {
         );
         assert_eq!(response.header("ETag"), Some(etag.as_str()));
         let unfolded = response.body.replace("\r\n ", "");
-        assert!(unfolded.contains("\r\nORGANIZER;CN=Ann:mailto:ann@example.invalid\r\n"));
+        assert!(unfolded.contains("\r\nORGANIZER;CN=\"Ann\":mailto:ann@example.invalid\r\n"));
         assert!(unfolded.contains("PARTSTAT=ACCEPTED:mailto:bob@example.invalid\r\n"));
         assert!(unfolded.contains("\r\nLOCATION:Room 1\r\n"));
         found_alarm |= unfolded.contains("TRIGGER:-PT15M");
@@ -712,4 +718,216 @@ async fn a_get_ahead_of_the_event_bus_updates_the_cached_etag() {
     assert_eq!(listed.1, new_etag);
     let rows = fixture.store.calendar_rows(1, "work").await.unwrap();
     assert!(!rows.is_empty());
+}
+
+#[tokio::test]
+async fn the_ctag_and_etags_survive_a_database_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work", "Work"));
+    let mut weekly = event("work", "series", "series-uid", NOW_MS);
+    weekly.list_id = "work-long".into();
+    weekly.repeat = Some(RepeatRule {
+        frequency: 1,
+        interval: 1,
+        end_type: 0,
+        end_value: None,
+        time_zone: "Europe/Berlin".into(),
+        excluded_ms: vec![NOW_MS + 7 * DAY_MS],
+        advanced: Vec::new(),
+    });
+    let mut moved = event("work", "moved", "series-uid", NOW_MS + 7 * DAY_MS + HOUR);
+    moved.recurrence_id_ms = Some(NOW_MS + 7 * DAY_MS);
+    source.put_event(weekly);
+    source.put_event(moved);
+    source.put_event(event("work", "tomorrow", "tomorrow-uid", NOW_MS + DAY_MS));
+
+    let (before, ctag_before) = {
+        let store = Arc::new(SqliteStateStore::open(&path).await.unwrap());
+        let fixture = over(Arc::clone(&source), Arc::clone(&store)).await;
+        let (mut wire, _session) = spawn(&fixture.handler);
+        let listed = listing(&mut wire, "work").await;
+        let tag = ctag(&mut wire, "work").await;
+        drop(fixture);
+        store.pool().close().await;
+        (listed, tag)
+    };
+    assert_eq!(before.len(), 2);
+
+    // Reopened later: the stored stamps survive, and a reload of the
+    // unchanged data at a later time keeps every tag.
+    let store = Arc::new(SqliteStateStore::open(&path).await.unwrap());
+    let fixture = over(Arc::clone(&source), store).await;
+    fixture.clock.0.store(NOW_MS + DAY_MS, Ordering::SeqCst);
+    fixture.sync.reload().await.unwrap();
+    let (mut wire, _session) = spawn(&fixture.handler);
+    assert_eq!(listing(&mut wire, "work").await, before);
+    assert_eq!(ctag(&mut wire, "work").await, ctag_before);
+    let rows = fixture.store.calendar_rows(1, "work").await.unwrap();
+    let moved = rows.iter().find(|row| row.element_id == "moved").unwrap();
+    assert_eq!(moved.recurrence_id_ms, Some(NOW_MS + 7 * DAY_MS));
+}
+
+/// The bodies of every resource of `calendar`, by href.
+async fn bodies(wire: &mut Wire, calendar: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (href, etag) in listing(wire, calendar).await {
+        let response = wire.request("GET", &href, &[], "").await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header("ETag"), Some(etag.as_str()));
+        out.push((href, response.body.replace("\r\n ", "")));
+    }
+    out
+}
+
+/// The `UID` values of an iCalendar body.
+fn uids(body: &str) -> Vec<&str> {
+    body.split("\r\n")
+        .filter_map(|line| line.strip_prefix("UID:"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_series_split_in_tuta_is_one_resource_per_master() {
+    let fixture = fixture().await;
+    let weekly = |end: Option<i64>| RepeatRule {
+        frequency: 1,
+        interval: 1,
+        end_type: if end.is_some() { 2 } else { 0 },
+        end_value: end,
+        time_zone: "Europe/Berlin".into(),
+        excluded_ms: Vec::new(),
+        advanced: Vec::new(),
+    };
+    let split_at = NOW_MS + 21 * DAY_MS;
+    let mut original = event("work", "original", "split-uid", NOW_MS + 2 * HOUR);
+    original.list_id = "work-long".into();
+    original.repeat = Some(weekly(None));
+    let mut early = event("work", "early", "split-uid", NOW_MS + 7 * DAY_MS + 4 * HOUR);
+    early.recurrence_id_ms = Some(NOW_MS + 7 * DAY_MS + 2 * HOUR);
+    fixture.source.put_event(original.clone());
+    fixture.source.put_event(early);
+    fixture.sync.reload().await.unwrap();
+    let (mut wire, _session) = spawn(&fixture.handler);
+    let unsplit = listing(&mut wire, "work").await;
+    assert_eq!(unsplit.len(), 4);
+
+    // "Edit this and all future events" at week 3: the original ends
+    // there, a second master with the same UID starts an hour later.
+    original.repeat = Some(weekly(Some(split_at + 2 * HOUR)));
+    let mut future = event("work", "future", "split-uid", split_at + 3 * HOUR);
+    future.list_id = "work-long".into();
+    future.repeat = Some(weekly(None));
+    future.summary = "Later half".into();
+    let mut late = event(
+        "work",
+        "late",
+        "split-uid",
+        split_at + 7 * DAY_MS + 5 * HOUR,
+    );
+    late.recurrence_id_ms = Some(split_at + 7 * DAY_MS + 3 * HOUR);
+    fixture.source.put_event(original);
+    fixture.source.put_event(future);
+    fixture.source.put_event(late);
+    fixture.sync.reload().await.unwrap();
+
+    let listed = listing(&mut wire, "work").await;
+    assert_eq!(listed.len(), 5);
+    // Every href of the unsplit listing is still there: the original
+    // half keeps the UID's resource.
+    for (href, _) in &unsplit {
+        assert!(listed.iter().any(|(h, _)| h == href), "{href} kept");
+    }
+    let split: Vec<(String, String)> = bodies(&mut wire, "work")
+        .await
+        .into_iter()
+        .filter(|(_, body)| body.contains("UID:split-uid"))
+        .collect();
+    assert_eq!(split.len(), 2);
+    let (first_href, first) = split
+        .iter()
+        .find(|(_, body)| uids(body).contains(&"split-uid"))
+        .unwrap();
+    let (second_href, second) = split.iter().find(|(h, _)| h != first_href).unwrap();
+    assert!(unsplit.iter().any(|(h, _)| h == first_href));
+    assert!(!unsplit.iter().any(|(h, _)| h == second_href));
+
+    // Each body: one master (no RECURRENCE-ID) and its own occurrence,
+    // all under one UID; the two UIDs differ.
+    for body in [first, second] {
+        assert_eq!(body.matches("BEGIN:VEVENT").count(), 2, "{body}");
+        assert_eq!(body.matches("RRULE:").count(), 1);
+        assert_eq!(body.matches("RECURRENCE-ID").count(), 1);
+        let ids = uids(body);
+        assert!(ids.iter().all(|uid| *uid == ids[0]));
+    }
+    let second_uid = uids(second)[0];
+    assert!(second_uid.starts_with("split-uid-split-"), "{second_uid}");
+    assert!(!second_uid.contains("future"), "no id in the UID");
+    assert!(first.contains("RRULE:FREQ=WEEKLY;UNTIL=20250127T095959Z"));
+    assert!(first.contains("RECURRENCE-ID:20250113T100000Z"));
+    assert!(second.contains("SUMMARY:Later half"));
+    assert!(second.contains("RRULE:FREQ=WEEKLY\r\n"));
+    assert!(second.contains("RECURRENCE-ID:20250203T110000Z"));
+
+    // Stable: a later reload changes nothing.
+    fixture.clock.0.store(NOW_MS + HOUR, Ordering::SeqCst);
+    fixture.sync.reload().await.unwrap();
+    assert_eq!(listing(&mut wire, "work").await, listed);
+}
+
+#[tokio::test]
+async fn an_occurrence_moved_out_of_the_window_stays_removed_from_the_series() {
+    let fixture = fixture().await;
+    // The second weekly occurrence is moved three years ahead: outside
+    // the two-year window, so it is not loaded, and the series keeps
+    // the slot it left as an EXDATE.
+    let mut far = event("work", "far", "series-uid", NOW_MS + 3 * 365 * DAY_MS);
+    far.recurrence_id_ms = Some(NOW_MS + 14 * DAY_MS);
+    let mut master = fixture
+        .source
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.element_id == "series")
+        .cloned()
+        .unwrap();
+    master
+        .repeat
+        .as_mut()
+        .unwrap()
+        .excluded_ms
+        .push(NOW_MS + 14 * DAY_MS);
+    fixture.source.put_event(master);
+    fixture.source.put_event(far);
+    fixture.sync.reload().await.unwrap();
+    let rows = fixture.store.calendar_rows(1, "work").await.unwrap();
+    assert!(!rows.iter().any(|row| row.element_id == "far"));
+
+    let (mut wire, _session) = spawn(&fixture.handler);
+    let series = bodies(&mut wire, "work")
+        .await
+        .into_iter()
+        .map(|(_, body)| body)
+        .find(|body| body.contains("RRULE"))
+        .unwrap();
+    assert!(series.contains("EXDATE;TZID=Europe/Berlin:20250120T090000\r\n"));
+    // The occurrence moved within the window is still attached.
+    assert_eq!(series.matches("RECURRENCE-ID").count(), 1);
+    assert!(series.contains("RECURRENCE-ID:20250113T080000Z"));
+
+    // An update of the far occurrence through the bus does not store it.
+    fixture
+        .sync
+        .apply(&calendar_batch(
+            EntityOperation::Update,
+            "work-short",
+            "far",
+        ))
+        .await
+        .unwrap();
+    let rows = fixture.store.calendar_rows(1, "work").await.unwrap();
+    assert!(!rows.iter().any(|row| row.element_id == "far"));
 }
