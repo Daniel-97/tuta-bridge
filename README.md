@@ -410,9 +410,21 @@ preshared password.
 - Reports: `addressbook-multiget`, `addressbook-query` and
   `sync-collection`. Query filters support `prop-filter` on `FN`, `N`,
   `NICKNAME`, `EMAIL`, `TEL`, `ORG` and `NOTE` with `text-match`
-  (case-insensitive equals/contains/starts-with/ends-with, negation) or
-  `is-not-defined`; anything else (`param-filter`, other properties)
-  answers `403` with `supported-filter`. Only vCard 4.0 is produced.
+  (equals/contains/starts-with/ends-with, negation; collations
+  `i;unicode-casemap` (default), `i;ascii-casemap` and `i;octet`) or
+  `is-not-defined`, matched against the values as rendered (`FN` with
+  its fallbacks and suffix). Another collation answers `403` with
+  `supported-collation`; anything else (`param-filter`, other
+  properties) `403` with `supported-filter`.
+- Only vCard 4.0 is produced: an `address-data` asking explicitly for
+  another version or type answers `403` with `supported-address-data`.
+- `addressbook-query` honours `limit` by truncating (marked with a `507`
+  response). `sync-collection` does not truncate: if a `DAV:limit` is
+  smaller than the changes due, it answers `507`
+  (`number-of-matches-within-limits`) and the client syncs without one.
+- A contact that exists but fails to decrypt keeps its last cached
+  entry (it is not reported deleted) but is not served until it
+  decrypts again; it is counted as skipped in the console output.
 - Filtered queries and multigets of more than a few cards load the
   whole address book from Tuta.
 

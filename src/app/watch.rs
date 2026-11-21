@@ -741,6 +741,9 @@ fn print_contact_report(report: &crate::app::contacts::ContactEventReport) {
             report.counts.added, report.counts.updated, report.counts.removed
         );
     }
+    if report.skipped > 0 {
+        println!("contacts skipped: {} did not decrypt", report.skipped);
+    }
 }
 
 /// Print the counters of an index sync; counts only, never mail data.
@@ -1000,12 +1003,17 @@ impl ServeUseCase {
             let book = Arc::clone(book);
             tokio::spawn(async move {
                 match book.reload().await {
-                    Ok(_) => match book.listing().await {
-                        Ok(contacts) => {
-                            println!("address book loaded: {} contacts", contacts.len())
+                    Ok(report) => {
+                        match book.listing().await {
+                            Ok(contacts) => {
+                                println!("address book loaded: {} contacts", contacts.len())
+                            }
+                            Err(_) => println!("address book loaded"),
                         }
-                        Err(_) => println!("address book loaded"),
-                    },
+                        if report.skipped > 0 {
+                            println!("contacts skipped: {} did not decrypt", report.skipped);
+                        }
+                    }
                     Err(_) => {
                         println!("address book load failed; retrying on the next CardDAV request")
                     }

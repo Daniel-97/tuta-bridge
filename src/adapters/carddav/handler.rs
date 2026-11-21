@@ -14,7 +14,19 @@
 //! depth 0 and 1; `infinity` (or no `Depth`) is treated as 1. `REPORT`
 //! serves `addressbook-multiget`, `addressbook-query` (no filter, or
 //! `prop-filter` with `text-match` / `is-not-defined` on FN, N,
-//! NICKNAME, EMAIL, TEL, ORG, NOTE) and `sync-collection`.
+//! NICKNAME, EMAIL, TEL, ORG, NOTE, matched against the values as
+//! rendered, under the `i;octet`, `i;ascii-casemap` or
+//! `i;unicode-casemap` collation) and `sync-collection`.
+//!
+//! Cards are vCard 4.0 only: an `address-data` that explicitly asks for
+//! another `content-type` or `version` is refused with the
+//! `CARDDAV:supported-address-data` precondition (one without attributes
+//! gets 4.0). A `card:limit` truncates an `addressbook-query` and marks
+//! it with a `507` response carrying `DAV:number-of-matches-within-limits`.
+//! A `DAV:limit` on `sync-collection` is not honoured by truncation: when
+//! more changes are due than it allows, the report fails with `507` and
+//! the same condition (RFC 6578 §3.7), and the client retries without
+//! a limit.
 //!
 //! Listings, ETags, the ctag and the sync token come from the contact
 //! cache; vCards are rendered from the SDK only when `address-data` is
@@ -25,7 +37,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::vcard::VCARD_CONTENT_TYPE;
+use super::vcard::{formatted_name, VCARD_CONTENT_TYPE};
 use crate::adapters::dav::xml::{
     props, MultiStatusEntry, PropName, PropRequest, Report, XmlElement, XmlNode, CARDDAV_NS, DAV_NS,
 };
@@ -133,6 +145,43 @@ fn home_set() -> XmlNode {
     XmlNode::href(PropName::carddav("addressbook-home-set"), HOME_HREF)
 }
 
+/// The collations `text-match` supports, as advertised.
+const COLLATIONS: &[&str] = &["i;ascii-casemap", "i;octet", "i;unicode-casemap"];
+
+/// Whether every `address-data` element of a report asks for a type this
+/// server renders: `text/vcard` version 4.0. Absent attributes are
+/// accepted (the card served is 4.0 regardless).
+fn address_data_supported(report: &Report) -> bool {
+    let Some(prop) = report.root.child(DAV_NS, "prop") else {
+        return true;
+    };
+    prop.children_named(CARDDAV_NS, "address-data")
+        .all(|element| {
+            let content_type = element.attribute("content-type").is_none_or(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/vcard")
+            });
+            let version = element
+                .attribute("version")
+                .is_none_or(|value| value.trim() == "4.0");
+            content_type && version
+        })
+}
+
+/// The `nresults` of a `limit` element in `namespace` under the
+/// report's root.
+fn report_limit(report: &Report, namespace: &str) -> Option<usize> {
+    report
+        .root
+        .child(namespace, "limit")
+        .and_then(|limit| limit.child(namespace, "nresults"))
+        .and_then(|count| count.text.trim().parse::<usize>().ok())
+}
+
 /// A `<d:error>` body with one precondition element.
 fn dav_error(status: u16, namespace: &str, local: &str) -> DavResponse {
     let element = if namespace == CARDDAV_NS {
@@ -202,6 +251,13 @@ impl CardDavHandler {
                 vec![XmlNode::empty(PropName::carddav("address-data-type"))
                     .with_attribute("content-type", "text/vcard")
                     .with_attribute("version", "4.0")],
+            ),
+            XmlNode::children(
+                PropName::carddav("supported-collation-set"),
+                COLLATIONS
+                    .iter()
+                    .map(|name| XmlNode::text(PropName::carddav("supported-collation"), *name))
+                    .collect(),
             ),
         ]
     }
@@ -351,6 +407,9 @@ impl CardDavHandler {
         if target != Target::Book {
             return Ok(dav_error(403, DAV_NS, "supported-report"));
         }
+        if !address_data_supported(report) {
+            return Ok(dav_error(403, CARDDAV_NS, "supported-address-data"));
+        }
         // Without a `prop`, a report returns the ETag and the vCard.
         let default_props = PropRequest::Prop(vec![PropName::dav("getetag"), address_data()]);
         let wanted = report.props.clone().unwrap_or(default_props);
@@ -386,16 +445,17 @@ impl CardDavHandler {
     async fn query(&self, report: &Report, wanted: &PropRequest) -> Result<DavResponse> {
         let filter = match report.filter.as_ref() {
             Some(filter) => match CardFilter::parse(filter) {
-                Some(filter) => filter,
-                None => return Ok(dav_error(403, CARDDAV_NS, "supported-filter")),
+                Ok(filter) => filter,
+                Err(FilterError::Collation) => {
+                    return Ok(dav_error(403, CARDDAV_NS, "supported-collation"))
+                }
+                Err(FilterError::Unsupported) => {
+                    return Ok(dav_error(403, CARDDAV_NS, "supported-filter"))
+                }
             },
             None => CardFilter::default(),
         };
-        let limit = report
-            .root
-            .child(CARDDAV_NS, "limit")
-            .and_then(|limit| limit.child(CARDDAV_NS, "nresults"))
-            .and_then(|count| count.text.trim().parse::<usize>().ok());
+        let limit = report_limit(report, CARDDAV_NS);
         self.book.ensure_fresh().await?;
         let mut entries = Vec::new();
         if filter.is_empty() && !wanted.names(&address_data()) {
@@ -425,7 +485,10 @@ impl CardDavHandler {
         if let Some(limit) = limit {
             if entries.len() > limit {
                 entries.truncate(limit);
-                entries.push(MultiStatusEntry::status(BOOK_HREF, 507));
+                entries.push(
+                    MultiStatusEntry::status(BOOK_HREF, 507)
+                        .with_error(PropName::dav("number-of-matches-within-limits")),
+                );
             }
         }
         Ok(DavResponse::multistatus(&entries, None))
@@ -457,6 +520,13 @@ impl CardDavHandler {
                 }
             } else {
                 live.push(row);
+            }
+        }
+        // A limit is not honoured by truncation: more changes than it
+        // allows fail the report (RFC 6578 §3.7).
+        if let Some(limit) = report_limit(report, DAV_NS) {
+            if entries.len() + live.len() > limit {
+                return Ok(dav_error(507, DAV_NS, "number-of-matches-within-limits"));
             }
         }
         live.sort_by(|a, b| a.element_id.cmp(&b.element_id));
@@ -514,18 +584,49 @@ enum MatchType {
     EndsWith,
 }
 
-/// One `text-match`.
+/// A `text-match` collation (RFC 4790).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Collation {
+    /// Exact octets.
+    Octet,
+    /// ASCII letters fold to lowercase, nothing else does.
+    AsciiCasemap,
+    /// Approximated by Unicode lowercase folding. The default.
+    UnicodeCasemap,
+}
+
+impl Collation {
+    /// `None` for a collation this server does not implement.
+    fn parse(name: Option<&str>) -> Option<Self> {
+        match name {
+            None | Some("i;unicode-casemap") => Some(Self::UnicodeCasemap),
+            Some("i;ascii-casemap") => Some(Self::AsciiCasemap),
+            Some("i;octet") => Some(Self::Octet),
+            Some(_) => None,
+        }
+    }
+
+    fn fold(self, text: &str) -> String {
+        match self {
+            Self::Octet => text.to_string(),
+            Self::AsciiCasemap => text.to_ascii_lowercase(),
+            Self::UnicodeCasemap => text.to_lowercase(),
+        }
+    }
+}
+
+/// One `text-match`; `text` is already folded by its collation.
 #[derive(Debug, Clone)]
 struct TextMatch {
     text: String,
+    collation: Collation,
     match_type: MatchType,
     negate: bool,
 }
 
 impl TextMatch {
     fn matches(&self, value: &str) -> bool {
-        // `i;unicode-casemap` approximated by lowercase comparison.
-        let value = value.to_lowercase();
+        let value = self.collation.fold(value);
         let hit = match self.match_type {
             MatchType::Equals => value == self.text,
             MatchType::Contains => value.contains(&self.text),
@@ -567,6 +668,15 @@ impl PropFilter {
     }
 }
 
+/// Why a `card:filter` cannot be evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterError {
+    /// Another property, a `param-filter`, an unknown match type.
+    Unsupported,
+    /// A collation outside [`COLLATIONS`].
+    Collation,
+}
+
 /// A parsed `card:filter`. An empty filter matches every card.
 #[derive(Debug, Clone, Default)]
 struct CardFilter {
@@ -578,18 +688,21 @@ struct CardFilter {
 const FILTERABLE: &[&str] = &["FN", "N", "NICKNAME", "EMAIL", "TEL", "ORG", "NOTE"];
 
 impl CardFilter {
-    /// `None` for anything this server does not evaluate (another
-    /// property, a `param-filter`, an unknown match type or collation).
-    fn parse(filter: &XmlElement) -> Option<Self> {
+    /// An error for anything this server does not evaluate.
+    fn parse(filter: &XmlElement) -> std::result::Result<Self, FilterError> {
+        use FilterError::Unsupported;
         let all_of = filter.attribute("test") == Some("allof");
         let mut props = Vec::new();
         for child in &filter.children {
             if !child.is(CARDDAV_NS, "prop-filter") {
-                return None;
+                return Err(Unsupported);
             }
-            let name = child.attribute("name")?.to_ascii_uppercase();
+            let name = child
+                .attribute("name")
+                .ok_or(Unsupported)?
+                .to_ascii_uppercase();
             if !FILTERABLE.contains(&name.as_str()) {
-                return None;
+                return Err(Unsupported);
             }
             let mut prop = PropFilter {
                 name,
@@ -606,24 +719,23 @@ impl CardFilter {
                         "contains" => MatchType::Contains,
                         "starts-with" => MatchType::StartsWith,
                         "ends-with" => MatchType::EndsWith,
-                        _ => return None,
+                        _ => return Err(Unsupported),
                     };
-                    match inner.attribute("collation") {
-                        None | Some("i;unicode-casemap") | Some("i;ascii-casemap") => {}
-                        _ => return None,
-                    }
+                    let collation = Collation::parse(inner.attribute("collation"))
+                        .ok_or(FilterError::Collation)?;
                     prop.matches.push(TextMatch {
-                        text: inner.text.trim().to_lowercase(),
+                        text: collation.fold(inner.text.trim()),
+                        collation,
                         match_type,
                         negate: inner.attribute("negate-condition") == Some("yes"),
                     });
                 } else {
-                    return None;
+                    return Err(Unsupported);
                 }
             }
             props.push(prop);
         }
-        Some(Self { props, all_of })
+        Ok(Self { props, all_of })
     }
 
     fn is_empty(&self) -> bool {
@@ -642,24 +754,18 @@ impl CardFilter {
     }
 }
 
-/// The plain values of a filterable property, empty ones left out.
+/// The plain (unescaped) values of a filterable property as the vCard
+/// renders them, empty ones left out: `FN` is the rendered formatted
+/// name (fallbacks and suffix included), `N` its five components.
 fn property_values(card: &ContactCard, name: &str) -> Vec<String> {
     let values: Vec<String> = match name {
-        "FN" => vec![[
-            card.title.as_str(),
-            &card.first_name,
-            &card.middle_name,
-            &card.last_name,
-        ]
-        .iter()
-        .map(|part| part.trim())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")],
+        "FN" => vec![formatted_name(card)],
         "N" => vec![
             card.last_name.clone(),
             card.first_name.clone(),
             card.middle_name.clone(),
+            card.title.clone(),
+            card.name_suffix.clone(),
         ],
         "NICKNAME" => vec![card.nickname.clone()],
         "EMAIL" => card.emails.iter().map(|f| f.value.clone()).collect(),

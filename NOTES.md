@@ -501,6 +501,36 @@ from the review:
   answers `503`; a stale one that cannot reload serves the cache). Every
   render heals the cache when it finds a different ETag, so a client
   never loops on an ETag mismatch.
+- Undecryptable contacts: `ContactSource::contact` answers
+  `ContactLookup::{Found, Gone, Undecryptable}` and the listing carries
+  `skipped` plus the element ids of the existing-but-undecryptable
+  contacts. Only `Gone` (an SDK `NotFound`) or absence from a full
+  listing tombstones a row; an undecryptable contact keeps its cached
+  row and ETag (full load and event refresh alike) and is counted in
+  `ContactReloadReport::skipped` / `ContactEventReport::skipped`, printed
+  as a counter only. A fetch of it answers `404` without touching the
+  cache.
+- XML: `dav::xml::escape` writes CR as `&#xD;`. A raw CR would be
+  folded into LF by the client's XML parser (XML 1.0 §2.11), breaking
+  the CRLF that vCard/iCalendar require and the byte identity between a
+  multiget's `address-data`/`calendar-data` and `GET`; both are tested
+  after a real (quick-xml) parse. The request parser normalizes line
+  ends the same way.
+- Filters evaluate `FN` as `vcard::formatted_name` (fallbacks, `, suffix`)
+  and `N` as its five rendered components, so a query matches what the
+  client displays. Collations: `supported-collation-set` advertises
+  `i;ascii-casemap`, `i;octet`, `i;unicode-casemap` (approximated by
+  Unicode lowercase); another one is `403 CARDDAV:supported-collation`.
+- `address-data` with an explicit `content-type` other than
+  `text/vcard` or `version` other than `4.0` is `403
+  CARDDAV:supported-address-data`; without attributes (whose RFC default
+  is 3.0) the 4.0 card is served, as every client expects.
+- Limits: `addressbook-query` truncates at `card:limit` and appends a
+  `507` response for the collection with `DAV:error`
+  `number-of-matches-within-limits` (RFC 6352 §8.6.1). `sync-collection`
+  does not truncate (that would need intermediate tokens): when the
+  changes due exceed `DAV:limit` the whole report is `507` with the same
+  condition, as RFC 6578 §3.7 allows.
 - Rendering on demand: `GET` and small multigets (≤ 4) load contacts one
   by one; larger ones, filtered queries and `address-data` in queries
   load the whole book once (which also refreshes the cache).

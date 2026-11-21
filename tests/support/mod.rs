@@ -1867,6 +1867,8 @@ pub struct FakeContactSource {
     pub fail: std::sync::atomic::AtomicBool,
     pub full_loads: AtomicUsize,
     pub single_loads: AtomicUsize,
+    /// Element ids of contacts that exist but do not decrypt.
+    pub undecryptable: Mutex<Vec<String>>,
 }
 
 impl FakeContactSource {
@@ -1876,6 +1878,16 @@ impl FakeContactSource {
             fail: std::sync::atomic::AtomicBool::new(false),
             full_loads: AtomicUsize::new(0),
             single_loads: AtomicUsize::new(0),
+            undecryptable: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Make the contact `element_id` fail to decrypt (or decrypt again).
+    pub fn set_undecryptable(&self, element_id: &str, undecryptable: bool) {
+        let mut ids = self.undecryptable.lock().unwrap();
+        ids.retain(|id| id != element_id);
+        if undecryptable {
+            ids.push(element_id.to_string());
         }
     }
 
@@ -1979,9 +1991,18 @@ impl tuta_bridge::ports::contact_source::ContactSource for FakeContactSource {
         if self.fail.load(Ordering::SeqCst) {
             return Err(Error::Network("contacts unavailable".into()));
         }
+        let undecryptable = self.undecryptable.lock().unwrap().clone();
+        let (skipped, cards): (Vec<_>, Vec<_>) = self
+            .cards
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .partition(|card| undecryptable.contains(&card.element_id));
         Ok(tuta_bridge::ports::contact_source::ContactListing {
-            cards: self.cards.lock().unwrap().clone(),
-            skipped: 0,
+            cards,
+            skipped: skipped.len(),
+            undecryptable: skipped.into_iter().map(|card| card.element_id).collect(),
         })
     }
 
@@ -1989,18 +2010,33 @@ impl tuta_bridge::ports::contact_source::ContactSource for FakeContactSource {
         &self,
         list_id: &str,
         element_id: &str,
-    ) -> Result<Option<tuta_bridge::domain::ContactCard>> {
+    ) -> Result<tuta_bridge::ports::contact_source::ContactLookup> {
+        use tuta_bridge::ports::contact_source::ContactLookup;
         self.single_loads.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
             return Err(Error::Network("contacts unavailable".into()));
         }
-        Ok(self
+        let found = self
             .cards
             .lock()
             .unwrap()
             .iter()
             .find(|card| card.list_id == list_id && card.element_id == element_id)
-            .cloned())
+            .cloned();
+        Ok(match found {
+            Some(_)
+                if self
+                    .undecryptable
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == element_id) =>
+            {
+                ContactLookup::Undecryptable
+            }
+            Some(card) => ContactLookup::Found(Box::new(card)),
+            None => ContactLookup::Gone,
+        })
     }
 }
 

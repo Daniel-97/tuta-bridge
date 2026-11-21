@@ -9,6 +9,11 @@
 //! stored. Every write runs under one lock, so a slow full load and an
 //! event refresh never interleave.
 //!
+//! A contact that exists but does not decrypt is never turned into a
+//! tombstone: a full load keeps its cached row (and counts it as
+//! skipped), an event refresh leaves the row alone. It is not served
+//! until it decrypts again (a fetch answers `404`).
+//!
 //! Output and errors carry fixed text and counters only.
 
 use std::collections::HashMap;
@@ -20,7 +25,7 @@ use tokio::sync::Mutex;
 use crate::adapters::carddav::vcard::{render_vcard, vcard_etag};
 use crate::app::event_sync::{contact_events, ContactEventAction};
 use crate::domain::{ContactCard, Error, EventBatch, Result};
-use crate::ports::contact_source::ContactSource;
+use crate::ports::contact_source::{ContactLookup, ContactSource};
 use crate::ports::contact_store::{
     ContactBookState, ContactCounts, ContactEntry, ContactStore, StoredContact,
 };
@@ -54,12 +59,23 @@ impl RenderedCard {
     }
 }
 
+/// What one full load did to the cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContactReloadReport {
+    pub counts: ContactCounts,
+    /// Contacts that did not decrypt; the cached rows of those that
+    /// exist are kept.
+    pub skipped: usize,
+}
+
 /// What one event batch did to the cache.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContactEventReport {
     /// Contact events in the batch (after coalescing).
     pub events: usize,
     pub counts: ContactCounts,
+    /// Refreshed contacts that did not decrypt; their rows are kept.
+    pub skipped: usize,
     /// A reload failed: the cache is marked stale and the next CardDAV
     /// request reloads the whole book.
     pub failed: bool,
@@ -114,13 +130,13 @@ impl ContactBook {
     }
 
     /// Load the whole book and replace the cache. Unchanged contacts
-    /// keep their ETag and revision.
-    pub async fn reload(&self) -> Result<ContactCounts> {
+    /// keep their ETag and revision; undecryptable ones keep their row.
+    pub async fn reload(&self) -> Result<ContactReloadReport> {
         let _guard = self.write.lock().await;
-        self.reload_locked().await.map(|(counts, _)| counts)
+        self.reload_locked().await.map(|(report, _)| report)
     }
 
-    async fn reload_locked(&self) -> Result<(ContactCounts, Vec<RenderedCard>)> {
+    async fn reload_locked(&self) -> Result<(ContactReloadReport, Vec<RenderedCard>)> {
         // Cleared first: a change reported while the load runs sets it
         // again and is picked up by the next request.
         self.stale.store(false, Ordering::SeqCst);
@@ -133,14 +149,34 @@ impl ContactBook {
         };
         let rendered: Vec<RenderedCard> =
             listing.cards.into_iter().map(RenderedCard::new).collect();
-        let entries: Vec<ContactEntry> = rendered.iter().map(RenderedCard::entry).collect();
+        let mut entries: Vec<ContactEntry> = rendered.iter().map(RenderedCard::entry).collect();
+        // Undecryptable contacts are not gone: their cached rows stay
+        // as they are.
+        for element_id in &listing.undecryptable {
+            let kept = self
+                .store()
+                .contact(self.account_id, element_id)
+                .await
+                .inspect_err(|_| self.stale.store(true, Ordering::SeqCst))?;
+            if let Some(stored) = kept {
+                entries.push(ContactEntry {
+                    list_id: stored.list_id,
+                    element_id: stored.element_id,
+                    etag: stored.etag,
+                });
+            }
+        }
         let list_id = rendered.first().map(|card| card.card.list_id.as_str());
         let counts = self
             .store()
             .replace_contacts(self.account_id, list_id, &entries)
             .await
             .inspect_err(|_| self.stale.store(true, Ordering::SeqCst))?;
-        Ok((counts, rendered))
+        let report = ContactReloadReport {
+            counts,
+            skipped: listing.skipped,
+        };
+        Ok((report, rendered))
     }
 
     /// Make sure the cache can answer a listing: a book that was never
@@ -187,23 +223,27 @@ impl ContactBook {
             .await
     }
 
-    /// Render one cached contact from the SDK. `None` when it is gone;
-    /// the cache is healed either way.
+    /// Render one cached contact from the SDK. `None` when it is gone
+    /// (the cache is healed) or does not decrypt (the cache is left as
+    /// it is); a changed ETag is healed too.
     pub async fn render(&self, stored: &StoredContact) -> Result<Option<RenderedCard>> {
         let loaded = self
             .source
             .contact(&stored.list_id, &stored.element_id)
             .await?;
-        let rendered = loaded.map(RenderedCard::new);
         let _guard = self.write.lock().await;
-        match &rendered {
-            Some(card) if card.etag != stored.etag => {
-                self.store()
-                    .update_contacts(self.account_id, &[card.entry()], &[])
-                    .await?;
+        match loaded {
+            ContactLookup::Found(card) => {
+                let card = RenderedCard::new(*card);
+                if card.etag != stored.etag {
+                    self.store()
+                        .update_contacts(self.account_id, &[card.entry()], &[])
+                        .await?;
+                }
+                Ok(Some(card))
             }
-            Some(_) => {}
-            None => {
+            ContactLookup::Undecryptable => Ok(None),
+            ContactLookup::Gone => {
                 self.store()
                     .update_contacts(
                         self.account_id,
@@ -211,9 +251,9 @@ impl ContactBook {
                         std::slice::from_ref(&stored.element_id),
                     )
                     .await?;
+                Ok(None)
             }
         }
-        Ok(rendered)
     }
 
     /// Render several cached contacts, keyed by element id; contacts that
@@ -247,8 +287,9 @@ impl ContactBook {
 
     /// Apply the `Contact` events of one event batch: reload created and
     /// updated contacts, drop deleted ones. Events of another contact
-    /// list than the loaded book's are ignored. A failed reload marks
-    /// the book stale instead of failing the batch.
+    /// list than the loaded book's are ignored. A contact that does not
+    /// decrypt keeps its row and counts as skipped. A failed reload
+    /// marks the book stale instead of failing the batch.
     pub async fn apply_batch(&self, batch: &EventBatch) -> ContactEventReport {
         let actions = contact_events(batch);
         let mut report = ContactEventReport {
@@ -276,9 +317,12 @@ impl ContactBook {
             match action {
                 ContactEventAction::Remove => removals.push(element),
                 ContactEventAction::Refresh => match self.source.contact(&list, &element).await {
-                    Ok(Some(card)) => upserts.push(RenderedCard::new(card).entry()),
-                    // Gone (or no longer readable): drop it.
-                    Ok(None) => removals.push(element),
+                    Ok(ContactLookup::Found(card)) => {
+                        upserts.push(RenderedCard::new(*card).entry())
+                    }
+                    Ok(ContactLookup::Gone) => removals.push(element),
+                    // Still there, just not readable now: keep the row.
+                    Ok(ContactLookup::Undecryptable) => report.skipped += 1,
                     Err(_) => {
                         self.mark_stale();
                         report.failed = true;

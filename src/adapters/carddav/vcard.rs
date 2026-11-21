@@ -176,7 +176,7 @@ pub fn render_vcard(card: &ContactCard) -> String {
 
 /// `FN` is mandatory: the composed name, else the nickname, the
 /// company, the first email or the first phone number.
-fn formatted_name(card: &ContactCard) -> String {
+pub fn formatted_name(card: &ContactCard) -> String {
     let mut name = [
         card.title.trim(),
         card.first_name.trim(),

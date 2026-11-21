@@ -2,7 +2,8 @@
 //!
 //! The whole book comes from `ContactFacade::load_all_user_contacts`,
 //! one contact from the crypto entity client (for event refreshes).
-//! Contacts whose fields failed to decrypt are skipped. Every SDK
+//! Contacts whose fields failed to decrypt are skipped, and reported
+//! as undecryptable (not gone) so the cache keeps them. Every SDK
 //! failure maps to one fixed [`Error::Network`] message: names,
 //! addresses and ids never appear in errors or logs.
 
@@ -16,7 +17,7 @@ use crate::domain::{
     ContactCard, ContactField, ContactFieldKind, ContactRelation, ContactRelationKind, Error,
     Result,
 };
-use crate::ports::contact_source::{ContactListing, ContactSource};
+use crate::ports::contact_source::{ContactListing, ContactLookup, ContactSource};
 
 /// Tuta implementation of [`ContactSource`].
 pub struct TutaContactSource {
@@ -42,15 +43,28 @@ impl ContactSource for TutaContactSource {
             .load_all_user_contacts()
             .await
             .map_err(|_| contacts_unavailable())?;
-        let total = contacts.len();
-        let cards: Vec<ContactCard> = contacts.iter().filter_map(contact_card).collect();
-        Ok(ContactListing {
-            skipped: total - cards.len(),
-            cards,
-        })
+        let mut listing = ContactListing {
+            cards: Vec::with_capacity(contacts.len()),
+            skipped: 0,
+            undecryptable: Vec::new(),
+        };
+        for contact in &contacts {
+            match contact_card(contact) {
+                Some(card) => listing.cards.push(card),
+                None => {
+                    listing.skipped += 1;
+                    if let Some(id) = &contact._id {
+                        listing
+                            .undecryptable
+                            .push(id.element_id.as_str().to_string());
+                    }
+                }
+            }
+        }
+        Ok(listing)
     }
 
-    async fn contact(&self, list_id: &str, element_id: &str) -> Result<Option<ContactCard>> {
+    async fn contact(&self, list_id: &str, element_id: &str) -> Result<ContactLookup> {
         let id = IdTupleGenerated::new(
             GeneratedId(list_id.to_string()),
             GeneratedId(element_id.to_string()),
@@ -62,10 +76,13 @@ impl ContactSource for TutaContactSource {
             .load::<Contact, IdTupleGenerated>(&id)
             .await;
         match loaded {
-            Ok(contact) => Ok(contact_card(&contact)),
+            Ok(contact) => Ok(match contact_card(&contact) {
+                Some(card) => ContactLookup::Found(Box::new(card)),
+                None => ContactLookup::Undecryptable,
+            }),
             Err(ApiCallError::ServerResponseError {
                 source: HttpError::NotFoundError,
-            }) => Ok(None),
+            }) => Ok(ContactLookup::Gone),
             Err(_) => Err(contacts_unavailable()),
         }
     }

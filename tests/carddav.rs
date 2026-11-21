@@ -289,7 +289,7 @@ async fn discovery_leads_from_the_root_to_the_address_book() {
 async fn the_book_advertises_its_reports_and_address_data_type() {
     let (book, _) = book_with(three_cards()).await;
     let mut wire = spawn(book);
-    let body = r#"<propfind xmlns="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><prop><supported-report-set/><card:supported-address-data/><sync-token/><card:max-image-size/></prop></propfind>"#;
+    let body = r#"<propfind xmlns="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><prop><supported-report-set/><card:supported-address-data/><card:supported-collation-set/><sync-token/><card:max-image-size/></prop></propfind>"#;
     let response = wire
         .request("PROPFIND", "/addressbooks/contacts/", &["Depth: 0"], body)
         .await;
@@ -300,6 +300,11 @@ async fn the_book_advertises_its_reports_and_address_data_type() {
     assert!(response
         .body
         .contains("content-type=\"text/vcard\" version=\"4.0\""));
+    // Only vCard 4.0 is declared.
+    assert_eq!(response.body.matches("<card:address-data-type").count(), 1);
+    assert!(response.body.contains(
+        "<card:supported-collation-set><card:supported-collation>i;ascii-casemap</card:supported-collation><card:supported-collation>i;octet</card:supported-collation><card:supported-collation>i;unicode-casemap</card:supported-collation></card:supported-collation-set>"
+    ));
     assert!(response.body.contains("urn:tuta-bridge:carddav:sync:"));
     // An unknown property is reported missing.
     assert!(response.body.contains("404 Not Found"));
@@ -558,7 +563,9 @@ async fn query_limits_and_unsupported_filters() {
         .request("REPORT", "/addressbooks/contacts/", &["Depth: 1"], body)
         .await;
     assert_eq!(hrefs_with_etags(&response.body).len(), 2);
-    assert!(response.body.contains("507"));
+    assert!(response.body.contains(
+        "<d:response><d:href>/addressbooks/contacts/</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status><d:error><d:number-of-matches-within-limits/></d:error></d:response>"
+    ));
 
     let body = r#"<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/></d:prop><card:filter><card:prop-filter name="X-CUSTOM"/></card:filter></card:addressbook-query>"#;
     let response = wire
@@ -791,4 +798,339 @@ async fn a_book_needs_a_store_with_a_contact_cache() {
         Err(Error::Config(_)) => {}
         _ => panic!("expected a configuration error"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review follow-ups
+// ---------------------------------------------------------------------------
+
+/// The text of every element named `local` (any prefix) in `body`, read
+/// the way a conforming XML parser does: line ends normalized (XML 1.0
+/// §2.11), entities and character references resolved.
+fn parsed_element_texts(body: &str, local: &str) -> Vec<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(body);
+    let mut texts = Vec::new();
+    let mut current: Option<String> = None;
+    loop {
+        match reader.read_event().unwrap() {
+            Event::Start(start) if start.local_name().as_ref() == local.as_bytes() => {
+                current = Some(String::new());
+            }
+            Event::End(end) if end.local_name().as_ref() == local.as_bytes() => {
+                texts.extend(current.take());
+            }
+            Event::Text(text) => {
+                if let Some(current) = current.as_mut() {
+                    current.push_str(&text.xml10_content().unwrap());
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(current) = current.as_mut() {
+                    let character = match reference.resolve_char_ref().unwrap() {
+                        Some(character) => character,
+                        None => match &*reference.decode().unwrap() {
+                            "amp" => '&',
+                            "lt" => '<',
+                            "gt" => '>',
+                            "quot" => '"',
+                            "apos" => '\'',
+                            other => panic!("unexpected entity {other}"),
+                        },
+                    };
+                    current.push(character);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    texts
+}
+
+/// The hrefs of a multistatus, in order.
+fn hrefs_of(body: &str) -> Vec<String> {
+    body.split("<d:href>")
+        .skip(1)
+        .map(|part| part.split("</d:href>").next().unwrap().to_string())
+        .collect()
+}
+
+fn query(filter: &str) -> String {
+    format!(
+        r#"<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/></d:prop><card:filter>{filter}</card:filter></card:addressbook-query>"#
+    )
+}
+
+#[tokio::test]
+async fn multiget_address_data_is_byte_identical_to_get_after_xml_parsing() {
+    let mut long = card("c9", "Ada", "Lovelace", "ada@example.invalid");
+    long.comment = "A note long enough to be folded over more than one line of the vCard, \
+                    with a line break\nand <markup> & \"quotes\"."
+        .into();
+    long.addresses = vec![ContactField {
+        kind: ContactFieldKind::Home,
+        value: "1 Analytical Way\nLondon".into(),
+    }];
+    let (book, _) = book_with(vec![long]).await;
+    let mut wire = spawn(book);
+    let get = wire
+        .request("GET", "/addressbooks/contacts/c9.vcf", &[], "")
+        .await;
+    assert_eq!(get.status, 200);
+    assert!(get.body.contains("\r\n "), "the card is folded");
+    let response = wire
+        .request(
+            "REPORT",
+            "/addressbooks/contacts/",
+            &["Depth: 1"],
+            &multiget(&["/addressbooks/contacts/c9.vcf"]),
+        )
+        .await;
+    assert_eq!(response.status, 207);
+    assert!(!response.body.contains('\r'), "no raw CR in the XML");
+    let cards = parsed_element_texts(&response.body, "address-data");
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].as_bytes(), get.body.as_bytes());
+}
+
+#[tokio::test]
+async fn query_matches_the_rendered_fn_of_a_company_or_a_suffix() {
+    let company = ContactCard {
+        list_id: LIST.into(),
+        element_id: "co".into(),
+        company: "Analytical Engines Ltd".into(),
+        ..ContactCard::default()
+    };
+    let mut suffixed = card("jr", "Martin", "King", "mlk@example.invalid");
+    suffixed.name_suffix = "Jr.".into();
+    let (book, _) = book_with(vec![company, suffixed]).await;
+    let mut wire = spawn(book);
+
+    let body = query(
+        r#"<card:prop-filter name="FN"><card:text-match match-type="equals">analytical engines ltd</card:text-match></card:prop-filter>"#,
+    );
+    let response = wire
+        .request("REPORT", "/addressbooks/contacts/", &["Depth: 1"], &body)
+        .await;
+    assert_eq!(response.status, 207);
+    assert_eq!(hrefs_of(&response.body), ["/addressbooks/contacts/co.vcf"]);
+
+    let body = query(
+        r#"<card:prop-filter name="FN"><card:text-match match-type="ends-with">king, jr.</card:text-match></card:prop-filter>"#,
+    );
+    let response = wire
+        .request("REPORT", "/addressbooks/contacts/", &["Depth: 1"], &body)
+        .await;
+    assert_eq!(hrefs_of(&response.body), ["/addressbooks/contacts/jr.vcf"]);
+
+    // The suffix is an N component too.
+    let body = query(
+        r#"<card:prop-filter name="N"><card:text-match match-type="equals">jr.</card:text-match></card:prop-filter>"#,
+    );
+    let response = wire
+        .request("REPORT", "/addressbooks/contacts/", &["Depth: 1"], &body)
+        .await;
+    assert_eq!(hrefs_of(&response.body), ["/addressbooks/contacts/jr.vcf"]);
+}
+
+#[tokio::test]
+async fn collations_are_honoured_and_an_unknown_one_is_refused() {
+    let (book, _) = book_with(three_cards()).await;
+    let mut wire = spawn(book);
+
+    let body = query(
+        r#"<card:prop-filter name="FN"><card:text-match collation="i;octet">ada</card:text-match></card:prop-filter>"#,
+    );
+    let response = wire
+        .request("REPORT", "/addressbooks/contacts/", &["Depth: 1"], &body)
+        .await;
+    assert_eq!(response.status, 207);
+    assert!(
+        hrefs_of(&response.body).is_empty(),
+        "i;octet is case-sensitive"
+    );
+
+    let body = query(
+        r#"<card:prop-filter name="FN"><card:text-match collation="i;ascii-casemap">ADA</card:text-match></card:prop-filter>"#,
+    );
+    let response = wire
+        .request("REPORT", "/addressbooks/contacts/", &["Depth: 1"], &body)
+        .await;
+    assert_eq!(hrefs_of(&response.body), ["/addressbooks/contacts/c1.vcf"]);
+
+    let body = query(
+        r#"<card:prop-filter name="FN"><card:text-match collation="i;klingon">ada</card:text-match></card:prop-filter>"#,
+    );
+    let response = wire
+        .request("REPORT", "/addressbooks/contacts/", &["Depth: 1"], &body)
+        .await;
+    assert_eq!(response.status, 403);
+    assert!(response.body.contains("<card:supported-collation/>"));
+    assert!(!response.body.contains("supported-filter"));
+}
+
+#[tokio::test]
+async fn sync_collection_with_a_limit_it_cannot_honour_answers_507() {
+    let (book, _) = book_with(three_cards()).await;
+    let mut wire = spawn(book);
+    let limited = |n: usize| {
+        format!(
+            r#"<d:sync-collection xmlns:d="DAV:"><d:sync-token/><d:sync-level>1</d:sync-level><d:limit><d:nresults>{n}</d:nresults></d:limit><d:prop><d:getetag/></d:prop></d:sync-collection>"#
+        )
+    };
+    let response = wire
+        .request("REPORT", "/addressbooks/contacts/", &[], &limited(2))
+        .await;
+    assert_eq!(response.status, 507);
+    assert!(response.body.contains("<d:error xmlns:d=\"DAV:\""));
+    assert!(response
+        .body
+        .contains("<d:number-of-matches-within-limits/></d:error>"));
+
+    let response = wire
+        .request("REPORT", "/addressbooks/contacts/", &[], &limited(3))
+        .await;
+    assert_eq!(response.status, 207);
+    assert_eq!(hrefs_with_etags(&response.body).len(), 3);
+    let token = element_text(&response.body, "sync-token").unwrap();
+    assert!(token.starts_with("urn:tuta-bridge:carddav:sync:"));
+}
+
+#[tokio::test]
+async fn address_data_in_another_version_is_refused() {
+    let (book, _) = book_with(three_cards()).await;
+    let mut wire = spawn(book);
+    let request = |attributes: &str| {
+        format!(
+            r#"<card:addressbook-multiget xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/><card:address-data {attributes}/></d:prop><d:href>/addressbooks/contacts/c1.vcf</d:href></card:addressbook-multiget>"#
+        )
+    };
+    for refused in [
+        r#"content-type="text/vcard" version="3.0""#,
+        r#"version="3.0""#,
+        r#"content-type="application/vcard+json""#,
+    ] {
+        let response = wire
+            .request(
+                "REPORT",
+                "/addressbooks/contacts/",
+                &["Depth: 1"],
+                &request(refused),
+            )
+            .await;
+        assert_eq!(response.status, 403, "{refused}");
+        assert!(response.body.contains("<card:supported-address-data/>"));
+    }
+    let response = wire
+        .request(
+            "REPORT",
+            "/addressbooks/contacts/",
+            &["Depth: 1"],
+            &request(r#"content-type="text/vcard" version="4.0""#),
+        )
+        .await;
+    assert_eq!(response.status, 207);
+    assert!(response.body.contains("VERSION:4.0"));
+}
+
+#[tokio::test]
+async fn an_undecryptable_contact_is_not_turned_into_a_tombstone() {
+    let (book, source) = book_with(three_cards()).await;
+    book.reload().await.unwrap();
+    let (revision, _) = book.changes_since(0).await.unwrap();
+    let before = book.listing().await.unwrap();
+
+    // A full load that cannot decrypt c2 keeps its row and counts it.
+    source.set_undecryptable("c2", true);
+    let report = book.reload().await.unwrap();
+    assert_eq!(report.skipped, 1);
+    assert!(report.counts.is_empty());
+    assert_eq!(book.listing().await.unwrap(), before);
+
+    // Neither does an event refresh.
+    let report = book
+        .apply_batch(&contact_batch(&[("c2", EntityOperation::Update)]))
+        .await;
+    assert!(!report.failed);
+    assert_eq!(report.skipped, 1);
+    assert!(report.counts.is_empty());
+    assert_eq!(book.listing().await.unwrap(), before);
+    // Nor does a fetch of the card.
+    let stored = book.lookup("c2").await.unwrap().unwrap();
+    assert!(book.render(&stored).await.unwrap().is_none());
+    assert!(book.lookup("c2").await.unwrap().is_some());
+    let (after, changes) = book.changes_since(revision).await.unwrap();
+    assert_eq!(after, revision);
+    assert!(changes.is_empty(), "no tombstone was written");
+
+    // Once it decrypts again, nothing changed either.
+    source.set_undecryptable("c2", false);
+    assert!(book.reload().await.unwrap().counts.is_empty());
+    // A real deletion still tombstones it.
+    source.remove("c2");
+    assert_eq!(book.reload().await.unwrap().counts.removed, 1);
+}
+
+#[tokio::test]
+async fn the_book_epoch_and_ctag_survive_a_database_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let source = Arc::new(FakeContactSource::new(three_cards()));
+    let open = |path: std::path::PathBuf, source: Arc<FakeContactSource>| async move {
+        let state = Arc::new(SqliteStateStore::open(&path).await.unwrap());
+        let account = state.upsert_account(USER).await.unwrap();
+        let book = ContactBook::new(
+            account,
+            state as Arc<dyn StateStore>,
+            source as Arc<dyn ContactSource>,
+        )
+        .unwrap();
+        Arc::new(book)
+    };
+
+    let (state, token, ctag) = {
+        let book = open(path.clone(), Arc::clone(&source)).await;
+        let mut wire = spawn(Arc::clone(&book));
+        let initial = wire
+            .request("REPORT", "/addressbooks/contacts/", &[], &sync_body(""))
+            .await;
+        let token = element_text(&initial.body, "sync-token")
+            .unwrap()
+            .to_string();
+        let listing = wire
+            .request(
+                "PROPFIND",
+                "/addressbooks/contacts/",
+                &["Depth: 0"],
+                THUNDERBIRD_LISTING,
+            )
+            .await;
+        let ctag = element_text(&listing.body, "getctag").unwrap().to_string();
+        (book.state().await.unwrap(), token, ctag)
+    };
+    assert!(state.loaded);
+    assert_eq!(source.full_loads(), 1);
+
+    let book = open(path, Arc::clone(&source)).await;
+    assert_eq!(book.state().await.unwrap(), state);
+    let mut wire = spawn(Arc::clone(&book));
+    let listing = wire
+        .request(
+            "PROPFIND",
+            "/addressbooks/contacts/",
+            &["Depth: 0"],
+            THUNDERBIRD_LISTING,
+        )
+        .await;
+    assert_eq!(element_text(&listing.body, "getctag").unwrap(), ctag);
+    // The old token is still valid and nothing changed since.
+    let delta = wire
+        .request("REPORT", "/addressbooks/contacts/", &[], &sync_body(&token))
+        .await;
+    assert_eq!(delta.status, 207);
+    assert!(hrefs_with_etags(&delta.body).is_empty());
+    assert_eq!(element_text(&delta.body, "sync-token").unwrap(), token);
+    // The cache answered: no second full load.
+    assert_eq!(source.full_loads(), 1);
 }
