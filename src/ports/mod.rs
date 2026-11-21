@@ -1,4 +1,7 @@
+pub mod calendar;
 pub mod clock;
+pub mod contact_source;
+pub mod contact_store;
 pub mod credentials;
 pub mod event_lookup;
 pub mod event_stream;
@@ -13,6 +16,7 @@ pub mod renderer;
 pub mod session;
 pub mod state_store;
 
+pub use calendar::{CalendarSource, CalendarStore};
 pub use clock::Clock;
 pub use credentials::CredentialStore;
 pub use event_lookup::EventLookup;

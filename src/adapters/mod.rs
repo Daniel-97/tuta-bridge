@@ -1,10 +1,15 @@
+pub mod caldav;
+pub mod carddav;
 pub mod cli;
+pub mod dav;
 pub mod imap;
 pub mod keyring_store;
 pub mod mime;
 pub mod password_store;
 pub mod pop3;
 pub mod smtp;
+pub mod sqlite_calendar;
+pub mod sqlite_contacts;
 pub mod sqlite_state;
 pub mod stall;
 pub mod terminal_prompt;

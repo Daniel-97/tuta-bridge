@@ -2,7 +2,7 @@
 
 Local command-line bridge for Tuta Mail. It logs in to a Tuta account, reads mail through the official Tuta Rust SDK, and exposes the decrypted data to local tooling.
 
-Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, an IMAP server with read/unread, move and delete, an optional read-only POP3 server, and optional SMTP submission), plus a `systemd --user` unit for `serve`. Sending is **not end-to-end encrypted** — see "SMTP submission" below.
+Status: M0–M6 implemented for a single account (login, status/logout, dump, minimal state, sync, live event watching, an IMAP server with read/unread, move and delete, an optional read-only POP3 server, optional SMTP submission, and optional read-only CardDAV and CalDAV servers), plus a `systemd --user` unit for `serve`. Sending is **not end-to-end encrypted** — see "SMTP submission" below.
 
 ## Credentials
 
@@ -329,6 +329,208 @@ smtp_port = 9925
 - Not carried over from the submitted message: custom headers,
   `In-Reply-To`/`References` (Tuta builds its own threading headers),
   and the `Date:` (Tuta stamps the send time).
+
+## CardDAV server (optional)
+
+`serve` can serve your Tuta address book read-only over CardDAV, for
+Thunderbird's address book and its address auto-complete. It is off
+unless the config file names a port:
+
+```toml
+carddav_port = 9932
+```
+
+- Same listener rules as IMAP: `127.0.0.1` only (implicit TLS, the same
+  self-signed certificate), HTTP Basic with the account address and the
+  bridge password, the failed-login delay shared with IMAP/POP3/SMTP, at
+  most 16 connections.
+- The address book is loaded in the background when `serve` starts and
+  kept fresh by the event stream: a contact changed in the Tuta web
+  client is updated on the client's next refresh. Only metadata (ids and
+  ETags) is cached in the state database; vCards are decrypted and
+  rendered on demand.
+
+### Thunderbird
+
+1. Address Book → *New Address Book* → *Add CardDAV Address Book*.
+2. Username: your Tuta address. Location: `https://127.0.0.1:9932/`
+   (Thunderbird finds the address book through `/.well-known/carddav`).
+3. Thunderbird first asks to accept the bridge's self-signed
+   certificate: confirm the security exception for `127.0.0.1:9932`
+   (if the dialog does not appear, open *Settings → Privacy & Security →
+   Certificates → Manage Certificates → Servers → Add Exception* and
+   enter `https://127.0.0.1:9932`). Then enter the bridge password.
+4. Pick *Tuta contacts*. The book is read-only in Thunderbird.
+
+### URL layout
+
+| URL                                    | Resource                         |
+|----------------------------------------|----------------------------------|
+| `/`, `/.well-known/carddav`            | entry points (→ the principal)   |
+| `/principal/`                          | current-user-principal           |
+| `/addressbooks/`                       | addressbook-home-set             |
+| `/addressbooks/contacts/`              | the address book                 |
+| `/addressbooks/contacts/<id>.vcf`      | one contact                      |
+
+### Field mapping (vCard 4.0)
+
+| Tuta                                   | vCard                                       |
+|----------------------------------------|---------------------------------------------|
+| contact id                             | `UID` (`tuta-contact-<id>`)                 |
+| title, first, middle, last name, suffix| `N` (and composed into `FN`)                |
+| nickname                               | `NICKNAME`                                  |
+| email addresses                        | `EMAIL;TYPE=home/work`                      |
+| phone numbers                          | `TEL;TYPE=home/work/cell/fax`               |
+| postal addresses (free text)           | `ADR;TYPE=home/work`, as the street part    |
+| company, department                    | `ORG`                                       |
+| job title (role)                       | `TITLE`                                     |
+| birthday                               | `BDAY` (`--MMDD` without a year)            |
+| first anniversary                      | `ANNIVERSARY`                               |
+| websites                               | `URL;TYPE=home/work`                        |
+| relationships                          | `RELATED;VALUE=text` with a `TYPE`          |
+| comment                                | `NOTE`                                      |
+
+`FN` falls back to the nickname, company, first email or first phone
+number when a contact has no name. "Other" and custom-labelled values
+carry no `TYPE`; the custom label text is not exported.
+
+Dropped (no clean vCard equivalent or not loaded): the photo, social
+network ids, messenger handles, pronouns, phonetic names, custom dates
+other than the first anniversary, custom type labels, and the
+preshared password.
+
+### Limits of v1
+
+- Read-only: `PUT`, `DELETE`, `PROPPATCH` and `MKCOL` answer `403`;
+  edit contacts in the Tuta client.
+- One address book: the user's own contacts. Shared contact lists and
+  contact groups are not served.
+- `PROPFIND` serves depth 0 and 1; `Depth: infinity` (or no `Depth`) is
+  answered as depth 1.
+- Reports: `addressbook-multiget`, `addressbook-query` and
+  `sync-collection`. Query filters support `prop-filter` on `FN`, `N`,
+  `NICKNAME`, `EMAIL`, `TEL`, `ORG` and `NOTE` with `text-match`
+  (equals/contains/starts-with/ends-with, negation; collations
+  `i;unicode-casemap` (default), `i;ascii-casemap` and `i;octet`) or
+  `is-not-defined`, matched against the values as rendered (`FN` with
+  its fallbacks and suffix). Another collation answers `403` with
+  `supported-collation`; anything else (`param-filter`, other
+  properties) `403` with `supported-filter`.
+- Only vCard 4.0 is produced: an `address-data` asking explicitly for
+  another version or type answers `403` with `supported-address-data`.
+- `addressbook-query` honours `limit` by truncating (marked with a `507`
+  response). `sync-collection` does not truncate: if a `DAV:limit` is
+  smaller than the changes due, it answers `507`
+  (`number-of-matches-within-limits`) and the client syncs without one.
+- A contact that exists but fails to decrypt keeps its last cached
+  entry (it is not reported deleted) but is not served until it
+  decrypts again; it is counted as skipped in the console output.
+- Filtered queries and multigets of more than a few cards load the
+  whole address book from Tuta.
+
+## CalDAV server (optional)
+
+`serve` can also publish your Tuta calendars, read-only, over CalDAV
+(HTTPS) so Thunderbird and other calendar clients can show them. It is
+off unless the config file names a port:
+
+```toml
+caldav_port = 9933
+```
+
+`serve` then prints `serving CalDAV on https://127.0.0.1:9933/
+(read-only)`. Same listener rules as IMAP: `127.0.0.1` only, the same
+self-signed certificate, the same bridge password (HTTP Basic over
+TLS), the same failed-login delay shared with IMAP/POP3/SMTP. A port
+another process holds stops `serve` with exit code 10.
+
+### Thunderbird
+
+1. Accept the self-signed certificate once. The calendar dialog cannot
+   show the exception prompt, so add it by hand: *Settings → Privacy &
+   Security → Certificates → Manage Certificates → Servers → Add
+   Exception…*, enter `https://127.0.0.1:9933/`, *Get Certificate*,
+   *Confirm Security Exception* (keep "Permanently store" checked).
+2. *New Calendar → On the Network*. Username: the Tuta address of the
+   logged-in account. Location: `https://127.0.0.1:9933/`. Leave "This
+   location doesn't require credentials" unchecked.
+3. *Find Calendars*, enter the bridge password when asked, and
+   subscribe to the calendars you want. Each Tuta calendar is its own
+   collection, with its Tuta name and colour. The server advertises
+   read access only, and every write is refused.
+
+### URL layout
+
+| URL | What |
+|---|---|
+| `/`, `/caldav/` | entry points; name the principal and the home set |
+| `/.well-known/caldav` | redirects to the principal |
+| `/caldav/principal/` | the account's principal |
+| `/caldav/calendars/` | the calendar home set |
+| `/caldav/calendars/<calendar>/` | one Tuta calendar |
+| `/caldav/calendars/<calendar>/<event>.ics` | one event (with its moved occurrences) |
+
+`<calendar>` is the Tuta calendar id, `<event>` a hash of the event's
+UID. A series split in Tuta with "edit this and all future events"
+(two series sharing one UID) is served as two `.ics`: the original
+half keeps its URL and UID, the later half gets its own URL and a UID
+ending in `-split-<hash>`. Tuta's birthday calendar is not served: Tuta builds it in the
+client from your contacts, it is not a calendar on the server.
+
+### How events are mapped
+
+- `SUMMARY`, `DESCRIPTION`, `LOCATION`, `ORGANIZER`, `ATTENDEE` (with
+  `PARTSTAT`: accepted, declined, tentative, needs action) and the UID
+  come from the Tuta event. Tuta descriptions are HTML: `DESCRIPTION`
+  carries a plain-text version, `X-ALT-DESC` the original.
+- Reminders: your own Tuta alarms become `VALARM`s (display alarms,
+  minutes to weeks before the start), so Thunderbird rings them.
+  Other attendees' alarms are not visible to you and are not served.
+- Time zones: a single event is written in UTC — Tuta stores UTC
+  instants, so this is exact and every client shows it in its own
+  zone. All-day events are dates (`VALUE=DATE`, exclusive end). A
+  repeating event is written in the time zone its Tuta repeat rule
+  uses (`DTSTART;TZID=Europe/Berlin` plus a `VTIMEZONE`), so it keeps
+  its wall-clock time across daylight-saving changes exactly as in
+  Tuta.
+- Repeating events become an `RRULE` (daily/weekly/monthly/yearly,
+  interval, end after a count or on a date, the advanced "by
+  weekday/month day/…" options), removed occurrences `EXDATE`s, and
+  occurrences moved in Tuta are served in the same `.ics` as the
+  series (`RECURRENCE-ID`). Where Tuta and RFC 5545 disagree, the rule
+  is rewritten to match what Tuta shows: a monthly event on the 29th–31st
+  falls on the last day of shorter months, a yearly one on Feb 29 on
+  Feb 28. "Ends after N occurrences" counts removed occurrences too,
+  as in the Tuta app.
+- **Degradation.** A repeat rule that cannot be expressed in iCalendar
+  (an unknown repeat type, or a combination RFC 5545 forbids) is never
+  approximated: the event is served as its first occurrence only, its
+  description starts with *"[tuta-bridge: this event repeats in Tuta,
+  but its repeat rule cannot be expressed in iCalendar …]"*, and it
+  carries `X-TUTA-BRIDGE-RECURRENCE:UNSUPPORTED`.
+
+### Freshness
+
+On start `serve` loads every calendar and the events from two years
+back to two years ahead (every repeating event that has not ended
+yet, whatever its start), and keeps them current from the Tuta event
+stream: an event created or changed in the Tuta app is visible on
+Thunderbird's next refresh. Unchanged events keep their ETags and the
+calendar its `getctag`, so a refresh with no change transfers nothing.
+Event bodies are not stored: they are decrypted and rendered on demand.
+
+### Limits of v1
+
+- Read-only: `PUT`, `DELETE`, `PROPPATCH`, `MKCALENDAR`, … answer
+  `403`. Events are created and edited in the Tuta app.
+- Events starting more than two years in the past or in the future
+  are not served (repeating events excepted).
+- Reports: `calendar-query` (the first `time-range` of the filter is
+  applied; `expand` is ignored, clients expand rules themselves) and
+  `calendar-multiget`. No `sync-collection` (WebDAV sync): clients
+  use `getctag`/`getetag`. `Depth: infinity` is answered as `Depth: 1`.
+- No scheduling (iTIP): invitations are answered in the Tuta app.
+- No tasks (`VTODO`) — Tuta has none.
 
 ## Running as a service
 

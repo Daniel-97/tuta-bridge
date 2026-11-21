@@ -452,3 +452,111 @@ from the review:
 - `ImapBackend::pending_loads` counts the requested uids whose FETCH would load content from Tuta: every body item, and a size or structure only when the row lacks it (or is stale). It shares the `Wants::needs_enrichment` predicate with `fetch`, so the count and the actual loads cannot drift apart. It reads the store only, never the network.
 - The session asks for the count only when the request selects at least `SessionLimits::alert_threshold` (default 25) messages and the mailbox has not been alerted on this connection yet; at or above the threshold it writes `* OK [ALERT] loading N messages from Tuta; this may take a while` and flushes before the first FETCH line. A failed count skips the ALERT.
 - Thunderbird presents ALERT text as a notification, hence once per mailbox and connection. `NOTIFY` (RFC 5435) is for events, not progress, and is not used. POP3 has no equivalent and stays silent.
+
+## DAV foundation
+
+- `src/adapters/dav` is the protocol-agnostic half of the CardDAV (#7) and CalDAV (#8) listeners; each feature adds its own handler, schema step, `*_port` config key and `serve` wiring (suggested ports 9932 CardDAV, 9933 CalDAV; no default constant here).
+- Plugging in: implement `DavHandler` (`well_known`, `handle`, optionally `label`, `compliance_classes`, `extra_methods`) and run `serve_dav(listener, tls, auth, handler, limits)` with the shared certificate/acceptor, the `ImapBackend` as `auth` (only `login` is used), and a clone of the `DavServeLimits` from `shared_listener_limits()` so the failed-login gate stays shared with IMAP/POP3/SMTP.
+- Generic, never reaching the handler: Basic auth on every request (`401` + `WWW-Authenticate: Basic realm="tuta-bridge"`; a missing header is free, a wrong one waits `login_failure_delay` under the shared gate, three close the connection; an unauthenticated connection closes after 60 s), `OPTIONS` (`DAV: 1, 3, <classes>`, `Allow`), `/.well-known/{carddav,caldav}` → `301` to `well_known()`, `403` for `PUT DELETE PROPPATCH MKCOL MKCALENDAR MOVE COPY LOCK UNLOCK POST ACL`, `405` for `TRACE CONNECT PATCH`, `501` for the rest, `400` for malformed XML or `Depth`. `HEAD` reaches the handler as `Get` and loses its body; a `200` `GET` whose `ETag` matches `If-None-Match` becomes `304`. Handler errors answer a fixed-text `503` (`Error::Network`, with `Retry-After`) or `500` and close the connection.
+- HTTP/1.1 is hand-written (no hyper): request line + headers capped at 16 KiB / 64 fields (`431`), `Content-Length` bodies capped at 1 MiB (`413`), any `Transfer-Encoding` refused (`411`), `Expect: 100-continue` honoured, keep-alive with a 120 s idle timeout and a 30 s per-request read bound, the shared `StallGuard` on writes. Responses always carry `Content-Length` (none on `304`). Rejections close the connection, since the stream may be out of step.
+- XML: `quick-xml` 0.41 (no default features, MSRV 1.79). It is the most widely used Rust XML reader, mature and streaming, with a namespace resolver (`NsReader`) — the one thing WebDAV parsing cannot do without — and no transitive dependencies. A DOCTYPE is refused, so no entity is ever declared; only the predefined entities and character references resolve. Depth (32) and element count (10 000) are bounded. Output is rendered by hand with fixed prefixes `d` / `card` / `cal` / `cs` / `ical` and an inline `xmlns` for anything else.
+- Privacy: log lines carry the handler's fixed label, fixed text and counters (`attempt`, `requests`, `status`). Paths, user names, bodies and handler error texts are never logged or echoed; the `authorization` header is stripped before the request reaches the handler.
+- Left to the features: URL layout and principal/home-set properties, which properties `allprop` returns (`PropRequest::names` tells whether an expensive one was named explicitly), `Depth: infinity` policy, report support (`supported-report-set`, `403`/`501` for unknown reports), filters beyond the CalDAV `time-range` convenience field, ETag/ctag/sync-token minting, and percent-encoding of the hrefs they hand out.
+
+## CardDAV (#7)
+
+- Layout: `src/adapters/carddav` (`handler.rs` the `DavHandler`,
+  `vcard.rs` the renderer), `src/app/contacts.rs` (`ContactBook`: cache
+  freshness, rendering, event refresh), `src/adapters/sqlite_contacts.rs`
+  (the `ContactStore` impl and schema step 7), ports `contact_source`
+  (SDK seam, `Session::shared_contacts`, default `NoContacts`) and
+  `contact_store` (reached through `StateStore::contact_store()`, default
+  `None`, so `FakeStateStore` and every other store stay untouched),
+  `src/adapters/tuta/contact_source.rs` (the SDK adapter).
+- Schema step 7 (`CONTACT_SCHEMA_STATEMENTS`, `CREATE … IF NOT EXISTS`,
+  idempotent): `contact_books(account_id PK, epoch, revision, loaded,
+  list_id)` and `contacts(account_id, element_id PK, list_id, etag,
+  revision, deleted)` + index `(account_id, revision)`, both cascading
+  with the account. Metadata only: no names, addresses or vCard bodies.
+- ETag: the first 128 bits of SHA-256 over the rendered vCard (the SDK's
+  `crypto_primitives::sha::sha256`, no new dependency), strong. The
+  renderer is deterministic, so a full reload of an unchanged contact
+  keeps its ETag and its revision. A renderer change changes ETags once.
+- Revision: every inserted/changed/tombstoned row takes `++revision` of
+  its book, inside one `BEGIN IMMEDIATE` transaction. `getctag` is
+  `<epoch>-<revision>`; `sync-token` is
+  `urn:tuta-bridge:carddav:sync:<epoch>-<revision>`. Deletions are kept
+  as tombstones so `sync-collection` can report them as `404`; a token
+  from another epoch or from the future answers `403 valid-sync-token`.
+  The random epoch makes tokens from a recreated database invalid.
+- Freshness: `serve` spawns a full load at start (in the background, IMAP
+  is not delayed). Each applied event batch passes its `Contact` events
+  (type id 64, `CONTACT_TYPE_ID`) to `ContactBook::apply_batch`:
+  create/update reloads that contact through the crypto entity client,
+  delete tombstones it; events of another contact list than the loaded
+  one are ignored. The mail processor still counts them as skipped and
+  touches no mailbox, so IDLE/IMAP hear nothing. A failed refresh, and
+  every index recovery (missed events), only mark the book stale; the
+  next listing request reloads it (a never-loaded book that cannot load
+  answers `503`; a stale one that cannot reload serves the cache). Every
+  render heals the cache when it finds a different ETag, so a client
+  never loops on an ETag mismatch.
+- Undecryptable contacts: `ContactSource::contact` answers
+  `ContactLookup::{Found, Gone, Undecryptable}` and the listing carries
+  `skipped` plus the element ids of the existing-but-undecryptable
+  contacts. Only `Gone` (an SDK `NotFound`) or absence from a full
+  listing tombstones a row; an undecryptable contact keeps its cached
+  row and ETag (full load and event refresh alike) and is counted in
+  `ContactReloadReport::skipped` / `ContactEventReport::skipped`, printed
+  as a counter only. A fetch of it answers `404` without touching the
+  cache.
+- XML: `dav::xml::escape` writes CR as `&#xD;`. A raw CR would be
+  folded into LF by the client's XML parser (XML 1.0 §2.11), breaking
+  the CRLF that vCard/iCalendar require and the byte identity between a
+  multiget's `address-data`/`calendar-data` and `GET`; both are tested
+  after a real (quick-xml) parse. The request parser normalizes line
+  ends the same way.
+- Filters evaluate `FN` as `vcard::formatted_name` (fallbacks, `, suffix`)
+  and `N` as its five rendered components, so a query matches what the
+  client displays. Collations: `supported-collation-set` advertises
+  `i;ascii-casemap`, `i;octet`, `i;unicode-casemap` (approximated by
+  Unicode lowercase); another one is `403 CARDDAV:supported-collation`.
+- `address-data` with an explicit `content-type` other than
+  `text/vcard` or `version` other than `4.0` is `403
+  CARDDAV:supported-address-data`; without attributes (whose RFC default
+  is 3.0) the 4.0 card is served, as every client expects.
+- Limits: `addressbook-query` truncates at `card:limit` and appends a
+  `507` response for the collection with `DAV:error`
+  `number-of-matches-within-limits` (RFC 6352 §8.6.1). `sync-collection`
+  does not truncate (that would need intermediate tokens): when the
+  changes due exceed `DAV:limit` the whole report is `507` with the same
+  condition, as RFC 6578 §3.7 allows.
+- Rendering on demand: `GET` and small multigets (≤ 4) load contacts one
+  by one; larger ones, filtered queries and `address-data` in queries
+  load the whole book once (which also refreshes the cache).
+- Thunderbird flow: discovery via `/.well-known/carddav` →
+  `current-user-principal` → `addressbook-home-set` → depth-1 PROPFIND
+  for `resourcetype`/`current-user-privilege-set` (only `read` →
+  read-only book); sync is `PROPFIND Depth: 1` (`getctag`, `getetag`)
+  then `addressbook-multiget`, or `sync-collection` when it holds a
+  sync token. Both paths are covered by `tests/carddav.rs`, but no live
+  Thunderbird or Tuta account has been run against it yet.
+- Privacy: the SDK's contact path (`ContactFacade`, crypto entity
+  client loads of `Contact`) does not log, so no new `tracing` directive
+  is needed. Console output is fixed text plus counters ("address book
+  loaded: N contacts", "contacts updated: …"). Domain contact types have
+  no `Debug`.
+
+## CalDAV (#8)
+
+- Pieces: `src/adapters/caldav` (`CalDavHandler` on the DAV foundation, `ical` renderer, `timezone` VTIMEZONE builder), `src/adapters/tuta/calendar_source.rs` (`TutaCalendarSource`, the `CalendarSource` port in `src/ports/calendar.rs`, handed out by `Session::shared_calendar`), `src/adapters/sqlite_calendar.rs` (`CalendarStore` on `SqliteStateStore`, reached through `StateStore::calendar_store`), `src/app/calendar_sync.rs` (`CalendarSync`: baseline reload + batch updates), domain types in `src/domain/calendar.rs`. Opt-in via `caldav_port`; `serve` binds it with `bind_loopback`, the shared acceptor and a clone of the shared `DavServeLimits`.
+- **SDK use.** Calendar names/colours from `calendar_facade().get_calendars_render_data()`; the birthday calendar (`…#clientOnly_birthdays`, generated client-side from contacts) is dropped. Events are *not* loaded through `get_calendar_events`: it expands repeating events into instances (the rule is lost) and calls `UtcOffset::current_local_offset()`, which the `time` crate refuses in a multi-threaded process. Instead `CalendarGroupRoot` (by calendar group id) gives the `shortEvents`/`longEvents` lists; `longEvents` (every repeating event, and events ≥ 15 days) is loaded in full, `shortEvents` by id range: element ids are base64url of the decimal start timestamp shifted by up to `DAYS_SHIFTED_MS` (15 days), so the range is `[from − 15 d, to + 15 d]` and paging stops at the first id past the end. Alarms: `CalendarEvent.alarmInfos` are `sys/UserAlarmInfo` ids; only the user's own load (others answer NotAuthorized/decrypt errors and are skipped). The facade logs ids and titles: `tutasdk::date=off` in `main.rs`.
+- **Loading window**: two years back to two years ahead of the reload time; every repeating event whose `UNTIL` is not before the window (open or `COUNT` rules always). Anchored at the time of each (re)load; events arriving through the bus use the window at that moment.
+- **Schema step 8** (`CALENDAR_SCHEMA_STATEMENTS`, `IF NOT EXISTS`, guarded `version < 8`, after the CardDAV step 7): `calendars (account_id → accounts ON DELETE CASCADE, calendar_id, name, color, short_list_id, long_list_id, PK(account_id, calendar_id))` and `calendar_events (account_id, calendar_id, list_id, element_id, resource, recurrence_id_ms NULL = not an altered occurrence, start_ms, end_ms, recurring, series_end_ms NULL = open, fingerprint, modified_ms, PK(account_id, list_id, element_id), FK(account_id, calendar_id) → calendars ON DELETE CASCADE)` + index `(account_id, calendar_id, resource)`. No title, text, attendee or UID is stored (`resource` is the series name, a hash of the UID). The `recurrence_id_ms` column was added to step 8 before it was released: a database created by a pre-release build of the CalDAV branch needs its two calendar tables dropped and `user_version` set to 7 once (it is a cache; the next start reloads it). Same file/umask discipline as the rest of the state database (it is the same file).
+- **ETags.** `fingerprint` = SHA-256 (16 bytes hex) over a length-prefixed encoding of every field the rendering reads (alarm *ids* included: Tuta replaces alarm entities on change). `modified_ms` is the time the bridge first saw that fingerprint (the upsert keeps it when the fingerprint is unchanged) and is the `DTSTAMP`. Resource ETag = hash of `RENDER_VERSION` + sorted `(list, element, fingerprint, modified_ms)` of its rows: the body is a pure function of those, so equal ETag ⇒ byte-identical body. `getctag` = hash of the sorted `(resource, etag)` pairs; `sync-token` is the same value as a URI, but `sync-collection` is not offered. Bump `RENDER_VERSION` when the output changes for unchanged data.
+- **Resources.** One `.ics` per `(calendar, UID)` (per master when a UID has several, see below): a repeating event and its altered occurrences (separate Tuta events with `recurrenceId`, same UID) must share a resource (RFC 4791 §4.1). Tuta also lists an altered occurrence in the progenitor's `excludedDates`; that `EXDATE` is dropped when the override is in the same resource. Events without UID get a resource of their own (hash of list/element id). **Split series:** Tuta's "edit this and all future events" ends the series and creates a second progenitor with the *same* UID (the web app's `EventSeriesResolver` handles both). Two masters cannot share one `VCALENDAR` (clients index by UID + `RECURRENCE-ID`; one series would replace the other) nor one UID across resources (RFC 4791 §4.1 no-uid-conflict), so `group_resources` (domain) splits a UID with several masters (rows without `recurrence_id_ms`): masters ordered by `(start, list id, element id)`; the first keeps the UID and the UID's resource name (an unsplit series, and the original half of a split one, never change href); each later one gets `hash("split", series, list, element)` as resource name and `<uid>-split-<hash(list, element)>` as UID — stable while that master exists, no id in clear. An altered occurrence joins the latest master starting at or before its recurrence id whose known end (`series_end_ms`) is after it, else the latest started one, else the first: split series follow each other, so this is the series that generated it. Grouping needs only the rows, so listings, ETags and ctags stay render-free.
+- **Rendering on demand.** `GET` and every `calendar-data` a report names load the events again through the SDK; if the loaded fingerprint differs from the row (an edit the bus has not delivered yet), the row is upserted first so the served ETag describes the served body. Vanished events lose their row. Reports render up to 8 resources concurrently.
+- **Time zones.** Non-repeating timed events and altered occurrences in UTC; all-day (both bounds on UTC midnight, Tuta's representation) as `VALUE=DATE`. Repeating timed events use `repeatRule.timeZone`: `DTSTART;TZID=` + a generated `VTIMEZONE` (zone data from `time-tz`, already an SDK dependency; offsets scanned day by day and bisected to the second, one observance per kind of change, onsets as `RDATE`s, range from the year before the start to 11 years past max(start, modified_ms) so it is fixed by the ETag inputs). An unknown zone falls back to UTC (what the SDK expansion does too). `UNTIL` is UTC (`endValue − 1 ms`, Tuta's end is exclusive) or a date for all-day events; `EXDATE` in the form of `DTSTART` (`TZID=` local time, UTC for an unknown zone, or a date).
+- **Recurrence fidelity.** Tuta clamps monthly/yearly occurrences to the month's last day (anchored on the original day): rendered as `BYMONTHDAY=28..d;BYSETPOS=-1` (monthly, day > 28) and `BYMONTH=2;BYMONTHDAY=28,29;BYSETPOS=-1` (yearly on Feb 29) when no advanced rule is present. `COUNT` with excluded dates is emitted as plain RFC 5545 `COUNT` + `EXDATE` (excluded occurrences count): that is what the Tuta web app's expansion and its own iCal export do. The Rust SDK's expansion (`date/event_facade.rs`) skips excluded dates before counting; it is not what users see in the Tuta apps, so the bridge follows the web app. Advanced rules (types 0–8 = BYMINUTE…WKST) are validated (syntax, ranges, RFC 5545 §3.3.10 frequency combinations, no BYHOUR/BYMINUTE on all-day) and passed through. Anything else (unknown frequency, end type or rule type, invalid value) → first occurrence only, `X-TUTA-BRIDGE-RECURRENCE:UNSUPPORTED`, and a fixed note prepended to `DESCRIPTION`. Not verified: Tuta's expansion of unusual advanced-rule combinations may still differ from RFC semantics.
+- **Event bus.** `CALENDAR_EVENT_TYPE_ID` (tutanota 933) is recognized in `EventProcessor` and skipped (no mail state, no IMAP notification). The watch loop hands each applied batch to `CalendarSync::apply`: create/update reloads the event (upsert, or remove when gone/unreadable/outside the window), delete removes the row; `sys/User` (84), `sys/GroupInfo` (14), `tutanota/UserSettingsGroupRoot` (972) or `CalendarGroupRoot` (947) refresh the calendar list (new calendars get their events; vanished ones lose their rows); an event in a list no stored calendar owns refreshes the list once. Any failure marks the cache stale; the next batch reloads everything. The baseline reload runs at watch start (unless an index sync is due) and after every index sync (its re-stamped markers skip calendar events). Calendar failures are never fatal: fixed text + counters on stdout.
+- **DAV details.** Root/`/caldav/` and the principal name `current-user-principal` and `calendar-home-set`; the principal adds `calendar-user-address-set` (`mailto:` account). Collections: `resourcetype` collection+`cal:calendar`, `displayname` (empty Tuta name → "Calendar"), `ical:calendar-color` `#RRGGBB`, `supported-calendar-component-set` VEVENT, `supported-report-set` (calendar-query, calendar-multiget), `getctag`, `sync-token`, `owner`, `current-user-privilege-set` = read only (meant to make clients treat the calendar as read-only; not verified with Thunderbird). `Depth: infinity`/absent → 1. `calendar-query` honours the parsed `time-range` (overlap test generous by ±14 h for floating all-day dates; series without a known end always match) and a VTODO/VJOURNAL comp-filter answers an empty multistatus; other filters are ignored (clients filter again). Unknown reports → 403; `GET` on a collection → 405.

@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use crate::domain::{
     BatchCounts, EntityEvent, EntityOperation, EventBatch, MailPlacement, MailboxId, Result,
-    StateChange, MAIL_SET_ENTRY_TYPE_ID, MAIL_SET_TYPE_ID, MAIL_TYPE_ID, TUTANOTA_APP,
+    StateChange, CALENDAR_EVENT_TYPE_ID, MAIL_SET_ENTRY_TYPE_ID, MAIL_SET_TYPE_ID, MAIL_TYPE_ID,
+    TUTANOTA_APP,
 };
 use crate::ports::event_lookup::EventLookup;
 use crate::ports::state_store::StateStore;
@@ -168,6 +169,10 @@ impl EventProcessor {
                         lookup_failures += 1;
                     }
                 },
+                // Calendar events belong to the CalDAV cache, which the
+                // watch loop updates from the same batch
+                // (`CalendarSync::apply`); they change no mail state.
+                CALENDAR_EVENT_TYPE_ID => skipped += 1,
                 _ => skipped += 1,
             }
         }
@@ -333,4 +338,44 @@ fn action_changes(element_id: String, action: MailAction) -> Vec<StateChange> {
             changes
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Contacts (CardDAV)
+// ---------------------------------------------------------------------------
+
+/// The coalesced effect of one contact's events within a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactEventAction {
+    /// Created or updated: reload it.
+    Refresh,
+    /// Deleted: drop its row.
+    Remove,
+}
+
+/// The `Contact` events of `batch`, one action per contact in
+/// first-seen order; a later event of the same contact replaces the
+/// earlier action. The mail processor above counts these events as
+/// skipped and touches no mailbox for them, so IMAP hears nothing; the
+/// CardDAV contact cache ([`crate::app::contacts::ContactBook`])
+/// applies them after the batch.
+pub fn contact_events(batch: &EventBatch) -> Vec<(String, String, ContactEventAction)> {
+    let mut actions: Vec<(String, String, ContactEventAction)> = Vec::new();
+    for event in &batch.events {
+        if event.application != TUTANOTA_APP || event.type_id != crate::domain::CONTACT_TYPE_ID {
+            continue;
+        }
+        let action = match event.operation {
+            EntityOperation::Create | EntityOperation::Update => ContactEventAction::Refresh,
+            EntityOperation::Delete => ContactEventAction::Remove,
+        };
+        match actions
+            .iter_mut()
+            .find(|(list, element, _)| *list == event.list_id && *element == event.element_id)
+        {
+            Some(existing) => existing.2 = action,
+            None => actions.push((event.list_id.clone(), event.element_id.clone(), action)),
+        }
+    }
+    actions
 }

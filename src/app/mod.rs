@@ -1,3 +1,5 @@
+pub mod calendar_sync;
+pub mod contacts;
 pub mod dump;
 pub mod enrich;
 pub mod event_sync;

@@ -42,3 +42,5 @@ pub const MAIL_TYPE_ID: i64 = 97;
 pub const MAIL_SET_TYPE_ID: i64 = 429;
 /// Type id of a `MailSetEntry`.
 pub const MAIL_SET_ENTRY_TYPE_ID: i64 = 1450;
+/// Type id of a `Contact` (CardDAV).
+pub const CONTACT_TYPE_ID: i64 = 64;

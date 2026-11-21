@@ -63,6 +63,8 @@ fn main() {
         "secret_service=off",
         "zbus=off",
         "tutasdk::bindings::native_file_client=off",
+        // The calendar facade logs calendar ids and event titles.
+        "tutasdk::date=off",
     ] {
         filter = filter.add_directive(directive.parse().expect("valid directive"));
     }
@@ -191,6 +193,8 @@ fn main() {
                     connect_timeout: CONNECT_TIMEOUT,
                     lookup_failure_threshold: LOOKUP_FAILURE_THRESHOLD,
                     notifier: None,
+                    contacts: None,
+                    calendar: None,
                 };
                 uc.run().await?;
                 Ok(())

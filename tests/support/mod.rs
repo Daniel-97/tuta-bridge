@@ -12,6 +12,8 @@ use tuta_bridge::domain::{
     MailboxId, MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
     StoredCredentials, StoredMailbox, StoredMessage,
 };
+use tuta_bridge::domain::{CalendarEvent, CalendarInfo};
+use tuta_bridge::ports::calendar::{CalendarSource, CalendarStore};
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::event_lookup::EventLookup;
 use tuta_bridge::ports::event_stream::{EventHandles, EventStream};
@@ -133,6 +135,8 @@ pub struct FakeStateStore {
     /// When nonzero, the next this many `apply_batch` calls fail like a
     /// locked database, writing nothing.
     busy_apply_batches: Mutex<usize>,
+    /// The calendar cache `calendar_store` hands out (CalDAV tests).
+    pub calendar_cache: Mutex<Option<Arc<dyn CalendarStore>>>,
 }
 
 impl FakeStateStore {
@@ -147,6 +151,7 @@ impl FakeStateStore {
             next_mailbox_id: Mutex::new(1),
             uidvalidity_floors: Mutex::new(HashMap::new()),
             busy_apply_batches: Mutex::new(0),
+            calendar_cache: Mutex::new(None),
         }
     }
 
@@ -553,6 +558,10 @@ impl EventLookup for FakeEventLookup {
 
 #[async_trait::async_trait]
 impl StateStore for FakeStateStore {
+    fn calendar_store(self: Arc<Self>) -> Option<Arc<dyn CalendarStore>> {
+        self.calendar_cache.lock().unwrap().clone()
+    }
+
     async fn upsert_account(&self, mail_address: &str) -> Result<i64> {
         self.calls.lock().unwrap().push("upsert_account".into());
         let mut accounts = self.accounts.lock().unwrap();
@@ -1149,6 +1158,10 @@ pub struct FakeEventSession {
     pub marker_calls: Mutex<Vec<HashMap<String, String>>>,
     /// The write seam handed to `serve` through `shared_writer`.
     pub writer: Arc<FakeMailboxWriter>,
+    /// The address book handed to `serve` through `shared_contacts`.
+    pub contacts: Arc<FakeContactSource>,
+    /// The calendar seam handed to `serve` through `shared_calendar`.
+    pub calendar: Option<Arc<FakeCalendarSource>>,
 }
 
 impl FakeEventSession {
@@ -1164,7 +1177,15 @@ impl FakeEventSession {
             mail: Arc::new(FakeMailSource::new()),
             marker_calls: Mutex::new(Vec::new()),
             writer: Arc::new(FakeMailboxWriter::new()),
+            contacts: Arc::new(FakeContactSource::new(Vec::new())),
+            calendar: None,
         }
+    }
+
+    /// Hand out `calendar` through `shared_calendar`.
+    pub fn with_calendar(mut self, calendar: Arc<FakeCalendarSource>) -> Self {
+        self.calendar = Some(calendar);
+        self
     }
 
     /// Queue the frames the next `events()` call will replay.
@@ -1234,8 +1255,19 @@ impl Session for FakeEventSessionHandle {
         Arc::clone(&self.0.writer) as Arc<dyn MailboxWriter>
     }
 
+    fn shared_contacts(&self) -> Arc<dyn tuta_bridge::ports::contact_source::ContactSource> {
+        Arc::clone(&self.0.contacts) as Arc<dyn tuta_bridge::ports::contact_source::ContactSource>
+    }
+
     fn event_groups(&self) -> Vec<String> {
         self.0.groups.clone()
+    }
+
+    fn shared_calendar(&self) -> Option<Arc<dyn CalendarSource>> {
+        self.0
+            .calendar
+            .as_ref()
+            .map(|calendar| Arc::clone(calendar) as Arc<dyn CalendarSource>)
     }
 
     async fn events(
@@ -1821,5 +1853,237 @@ impl MailboxWriter for FakeMailboxWriter {
             folder.into(),
             element_ids(mails),
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeContactSource (CardDAV)
+// ---------------------------------------------------------------------------
+
+/// An in-memory address book. Contacts are keyed by element id; every
+/// load is counted, and loads can be made to fail with a network error.
+pub struct FakeContactSource {
+    pub cards: Mutex<Vec<tuta_bridge::domain::ContactCard>>,
+    pub fail: std::sync::atomic::AtomicBool,
+    pub full_loads: AtomicUsize,
+    pub single_loads: AtomicUsize,
+    /// Element ids of contacts that exist but do not decrypt.
+    pub undecryptable: Mutex<Vec<String>>,
+}
+
+impl FakeContactSource {
+    pub fn new(cards: Vec<tuta_bridge::domain::ContactCard>) -> Self {
+        Self {
+            cards: Mutex::new(cards),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            full_loads: AtomicUsize::new(0),
+            single_loads: AtomicUsize::new(0),
+            undecryptable: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Make the contact `element_id` fail to decrypt (or decrypt again).
+    pub fn set_undecryptable(&self, element_id: &str, undecryptable: bool) {
+        let mut ids = self.undecryptable.lock().unwrap();
+        ids.retain(|id| id != element_id);
+        if undecryptable {
+            ids.push(element_id.to_string());
+        }
+    }
+
+    /// Replace or add one contact.
+    pub fn put(&self, card: tuta_bridge::domain::ContactCard) {
+        let mut cards = self.cards.lock().unwrap();
+        cards.retain(|existing| existing.element_id != card.element_id);
+        cards.push(card);
+    }
+
+    pub fn remove(&self, element_id: &str) {
+        self.cards
+            .lock()
+            .unwrap()
+            .retain(|card| card.element_id != element_id);
+    }
+
+    pub fn set_failing(&self, failing: bool) {
+        self.fail.store(failing, Ordering::SeqCst);
+    }
+
+    pub fn full_loads(&self) -> usize {
+        self.full_loads.load(Ordering::SeqCst)
+    }
+
+    pub fn single_loads(&self) -> usize {
+        self.single_loads.load(Ordering::SeqCst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeCalendarSource
+// ---------------------------------------------------------------------------
+
+/// In-memory [`CalendarSource`]: calendars, events keyed by
+/// `(list, element)`, alarm triggers keyed by alarm id, and a count of
+/// calls to fail with a network error.
+#[derive(Default)]
+pub struct FakeCalendarSource {
+    pub calendars: Mutex<Vec<CalendarInfo>>,
+    pub events: Mutex<Vec<CalendarEvent>>,
+    pub alarms: Mutex<HashMap<(String, String), String>>,
+    /// The next this many calls fail with `Error::Network`.
+    pub failures: Mutex<usize>,
+    pub calls: Mutex<Vec<String>>,
+}
+
+impl FakeCalendarSource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_calendar(&self, calendar: CalendarInfo) {
+        self.calendars.lock().unwrap().push(calendar);
+    }
+
+    /// Insert or replace an event (by list and element id).
+    pub fn put_event(&self, event: CalendarEvent) {
+        let mut events = self.events.lock().unwrap();
+        events.retain(|e| !(e.list_id == event.list_id && e.element_id == event.element_id));
+        events.push(event);
+    }
+
+    pub fn remove_event(&self, list_id: &str, element_id: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .retain(|e| !(e.list_id == list_id && e.element_id == element_id));
+    }
+
+    pub fn put_alarm(&self, list_id: &str, element_id: &str, trigger: &str) {
+        self.alarms
+            .lock()
+            .unwrap()
+            .insert((list_id.into(), element_id.into()), trigger.into());
+    }
+
+    pub fn fail_next(&self, count: usize) {
+        *self.failures.lock().unwrap() = count;
+    }
+
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: &str) -> Result<()> {
+        self.calls.lock().unwrap().push(call.to_string());
+        let mut failures = self.failures.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(Error::Network("calendar data unavailable".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl tuta_bridge::ports::contact_source::ContactSource for FakeContactSource {
+    async fn contacts(&self) -> Result<tuta_bridge::ports::contact_source::ContactListing> {
+        self.full_loads.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(Error::Network("contacts unavailable".into()));
+        }
+        let undecryptable = self.undecryptable.lock().unwrap().clone();
+        let (skipped, cards): (Vec<_>, Vec<_>) = self
+            .cards
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .partition(|card| undecryptable.contains(&card.element_id));
+        Ok(tuta_bridge::ports::contact_source::ContactListing {
+            cards,
+            skipped: skipped.len(),
+            undecryptable: skipped.into_iter().map(|card| card.element_id).collect(),
+        })
+    }
+
+    async fn contact(
+        &self,
+        list_id: &str,
+        element_id: &str,
+    ) -> Result<tuta_bridge::ports::contact_source::ContactLookup> {
+        use tuta_bridge::ports::contact_source::ContactLookup;
+        self.single_loads.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(Error::Network("contacts unavailable".into()));
+        }
+        let found = self
+            .cards
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|card| card.list_id == list_id && card.element_id == element_id)
+            .cloned();
+        Ok(match found {
+            Some(_)
+                if self
+                    .undecryptable
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == element_id) =>
+            {
+                ContactLookup::Undecryptable
+            }
+            Some(card) => ContactLookup::Found(Box::new(card)),
+            None => ContactLookup::Gone,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl CalendarSource for FakeCalendarSource {
+    async fn calendars(&self) -> Result<Vec<CalendarInfo>> {
+        self.record("calendars")?;
+        Ok(self.calendars.lock().unwrap().clone())
+    }
+
+    async fn events(
+        &self,
+        calendar: &CalendarInfo,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<CalendarEvent>> {
+        self.record("events")?;
+        Ok(self
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.list_id == calendar.short_list_id || e.list_id == calendar.long_list_id)
+            .filter(|e| e.may_overlap(from_ms, to_ms))
+            .cloned()
+            .collect())
+    }
+
+    async fn event(&self, list_id: &str, element_id: &str) -> Result<Option<CalendarEvent>> {
+        self.record("event")?;
+        Ok(self
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.list_id == list_id && e.element_id == element_id)
+            .cloned())
+    }
+
+    async fn alarm_triggers(&self, alarm_ids: &[(String, String)]) -> Result<Vec<String>> {
+        self.record("alarm_triggers")?;
+        let alarms = self.alarms.lock().unwrap();
+        let mut triggers: Vec<String> = alarm_ids
+            .iter()
+            .filter_map(|id| alarms.get(id).cloned())
+            .collect();
+        triggers.sort();
+        Ok(triggers)
     }
 }

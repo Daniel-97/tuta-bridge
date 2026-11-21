@@ -34,6 +34,9 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 
+use crate::adapters::caldav::CalDavHandler;
+use crate::adapters::carddav::CardDavHandler;
+use crate::adapters::dav::{serve_dav, DavHandler, DavServeLimits};
 use crate::adapters::imap::backend::TutaImapBackend;
 use crate::adapters::imap::server::{self, ensure_certificate, tls_acceptor, ServeLimits};
 use crate::adapters::mime::MimeRenderer;
@@ -44,6 +47,8 @@ use crate::adapters::tuta::event_wire::is_invalid_event;
 use crate::adapters::tuta::generated_id::{
     batch_is_expired, generated_id_timestamp, timestamp_to_generated_id,
 };
+use crate::app::calendar_sync::CalendarSync;
+use crate::app::contacts::ContactBook;
 use crate::app::enrich::EnvelopeEnricher;
 use crate::app::event_sync::{deletes_folder, EventProcessor, EventReport};
 use crate::app::state_sync::{current_uidvalidity, sync_with};
@@ -172,9 +177,24 @@ pub struct WatchUseCase {
     /// default — publishes nothing; send errors from a closed channel
     /// are ignored because they only mean nobody idles.
     pub notifier: Option<MailboxEventSender>,
+    /// The CardDAV address book: `Contact` events of every applied
+    /// batch refresh its cache, and an index recovery marks it stale.
+    /// `None` — the default — leaves contacts alone.
+    pub contacts: Option<Arc<ContactBook>>,
+    /// The CalDAV metadata cache to keep fresh: loaded once the
+    /// session is up and after every index sync, updated from the
+    /// calendar events of each applied batch. `None` (`watch`, or
+    /// `serve` without `caldav_port`) touches no calendar.
+    pub calendar: Option<Arc<CalendarSync>>,
 }
 
 impl WatchUseCase {
+    /// Attach the CardDAV address book.
+    pub fn with_contacts(mut self, contacts: Arc<ContactBook>) -> Self {
+        self.contacts = Some(contacts);
+        self
+    }
+
     /// Attach a mailbox-change broadcaster.
     ///
     /// Additive: construction sites without a notifier keep their
@@ -232,6 +252,15 @@ impl WatchUseCase {
         //    before the stream can be trusted to bring it up to date.
         let (mut batches, mut needs_sync) = self.stored_markers(account_id, &groups).await?;
 
+        // The CalDAV cache loads its baseline now, unless the index
+        // sync below is about to (it reloads the calendars as well).
+        if !needs_sync && self.calendar.is_some() {
+            let refresh = self.refresh_calendar(None);
+            if unless_stopped(&mut stop, refresh).await.is_none() {
+                return Ok(());
+            }
+        }
+
         // 4. Sync-and-reconnect loop: network errors retry with the
         //    backoff, everything else is fatal.
         let processor = EventProcessor::new(Arc::clone(&self.state));
@@ -258,6 +287,14 @@ impl WatchUseCase {
                         needs_sync = false;
                         // The sync reconciled the folder list as well.
                         folders_stale = false;
+                        // The new markers skip every calendar event
+                        // since the old ones: reload the calendars too.
+                        if self.calendar.is_some() {
+                            let refresh = self.refresh_calendar(None);
+                            if unless_stopped(&mut stop, refresh).await.is_none() {
+                                return Ok(());
+                            }
+                        }
                     }
                     Err(e) if is_fatal(&e) => return Err(e),
                     Err(_) => {
@@ -348,6 +385,14 @@ impl WatchUseCase {
                                 break;
                             };
                             batches.insert(batch.owner_group_id.clone(), batch.batch_id.clone());
+                            // Calendar updates go to the CalDAV cache
+                            // only; IMAP hears nothing of them.
+                            if self.calendar.is_some() {
+                                let refresh = self.refresh_calendar(Some(&batch));
+                                if unless_stopped(&mut stop, refresh).await.is_none() {
+                                    return Ok(());
+                                }
+                            }
                             // Counts by kind only: no subject, address or id.
                             if !report.counts.is_empty() {
                                 println!("{}", report.counts.summary());
@@ -359,6 +404,17 @@ impl WatchUseCase {
                                 for mailbox in &report.touched_mailboxes {
                                     let _ = notifier.send(MailboxChanged(*mailbox));
                                 }
+                            }
+                            // Contact events refresh the CardDAV cache;
+                            // IMAP hears nothing of them. A failure only
+                            // marks the book stale.
+                            if let Some(contacts) = &self.contacts {
+                                let refresh = contacts.apply_batch(&batch);
+                                let Some(refreshed) = unless_stopped(&mut stop, refresh).await
+                                else {
+                                    return Ok(());
+                                };
+                                print_contact_report(&refreshed);
                             }
                             // A deleted folder cannot be resolved from
                             // its event, and no `sync` can run beside
@@ -413,6 +469,31 @@ impl WatchUseCase {
             let sleep = tokio::time::sleep(Duration::from_millis(delay));
             if unless_stopped(&mut stop, sleep).await.is_none() {
                 return Ok(());
+            }
+        }
+    }
+
+    /// Bring the CalDAV cache up to date: a full reload without a
+    /// batch, the batch's calendar updates with one. Never fatal: a
+    /// failure leaves the cache stale and the next batch reloads it.
+    /// The output is fixed text and counters.
+    async fn refresh_calendar(&self, batch: Option<&EventBatch>) {
+        let Some(calendar) = &self.calendar else {
+            return;
+        };
+        let refreshed = match batch {
+            Some(batch) => calendar.apply(batch).await,
+            None => calendar.reload().await,
+        };
+        match refreshed {
+            Ok(report) => {
+                if let Some(line) = report.summary() {
+                    println!("{line}");
+                }
+            }
+            Err(_) => {
+                calendar.mark_stale();
+                println!("calendar refresh failed; retrying with the next event batch");
             }
         }
     }
@@ -472,6 +553,11 @@ impl WatchUseCase {
         )
         .await?;
         print_sync_report(&report);
+        // Contact events may have been missed as well: the next CardDAV
+        // request reloads the address book.
+        if let Some(contacts) = &self.contacts {
+            contacts.mark_stale();
+        }
 
         let mut batches = HashMap::new();
         for group in groups {
@@ -645,6 +731,21 @@ where
     }
 }
 
+/// Print what an event batch did to the address book; counts only.
+fn print_contact_report(report: &crate::app::contacts::ContactEventReport) {
+    if report.failed {
+        println!("contact refresh failed; the address book reloads on the next CardDAV request");
+    } else if !report.counts.is_empty() {
+        println!(
+            "contacts updated: {} added, {} changed, {} removed",
+            report.counts.added, report.counts.updated, report.counts.removed
+        );
+    }
+    if report.skipped > 0 {
+        println!("contacts skipped: {} did not decrypt", report.skipped);
+    }
+}
+
 /// Print the counters of an index sync; counts only, never mail data.
 fn print_sync_report(report: &SyncReport) {
     println!(
@@ -774,6 +875,53 @@ impl ServeUseCase {
             writer: session.shared_writer(),
         });
         let mail_sender = session.shared_sender();
+        // CardDAV is opt-in: the address book exists only when the
+        // config names a port. Its port is validated before anything
+        // is opened, like the others.
+        let carddav = match config.carddav_port {
+            Some(carddav_port) => {
+                validate_imap_port(carddav_port).map_err(|_| {
+                    Error::Config("carddav_port must be between 1 and 65535".into())
+                })?;
+                let book = ContactBook::new(
+                    account_id,
+                    Arc::clone(&self.state),
+                    session.shared_contacts(),
+                )?;
+                Some((carddav_port, Arc::new(book)))
+            }
+            None => None,
+        };
+
+        // CalDAV is opt-in like POP3 and SMTP. Its cache is wired here,
+        // before the watch starts, so the watch keeps it fresh.
+        let caldav = match config.caldav_port {
+            Some(caldav_port) => {
+                validate_imap_port(caldav_port)
+                    .map_err(|_| Error::Config("caldav_port must be between 1 and 65535".into()))?;
+                let source = session.shared_calendar().ok_or_else(|| {
+                    Error::Unsupported("calendars are not available for this session".into())
+                })?;
+                let store = Arc::clone(&self.state).calendar_store().ok_or_else(|| {
+                    Error::Unsupported("the state store keeps no calendar cache".into())
+                })?;
+                let sync = Arc::new(CalendarSync::new(
+                    account_id,
+                    Arc::clone(&store),
+                    Arc::clone(&source),
+                    Arc::clone(&self.clock),
+                ));
+                let handler: Arc<dyn crate::adapters::dav::DavHandler> = Arc::new(CalDavHandler {
+                    account_id,
+                    user_address: session.account().mail_address,
+                    store,
+                    source,
+                    clock: Arc::clone(&self.clock),
+                });
+                Some((caldav_port, sync, handler))
+            }
+            None => None,
+        };
         let _session = session;
 
         // 5. The watch task feeds the same store and broadcasts every
@@ -794,8 +942,14 @@ impl ServeUseCase {
             connect_timeout: self.connect_timeout,
             lookup_failure_threshold: self.lookup_failure_threshold,
             notifier: None,
+            contacts: None,
+            calendar: caldav.as_ref().map(|(_, sync, _)| Arc::clone(sync)),
         }
         .with_notifier(sender.clone());
+        let watch = match &carddav {
+            Some((_, book)) => watch.with_contacts(Arc::clone(book)),
+            None => watch,
+        };
         let mut watch_task = tokio::spawn(async move {
             watch
                 .run_until(async move {
@@ -835,6 +989,47 @@ impl ServeUseCase {
             }
             None => None,
         };
+        // CardDAV listens on its own port; the baseline load of the
+        // address book runs in the background so IMAP is not delayed.
+        let carddav_listener = match &carddav {
+            Some((carddav_port, book)) => {
+                let carddav_listener = bind_loopback("carddav", *carddav_port).await?;
+                println!("serving CardDAV on 127.0.0.1:{carddav_port} (read-only)");
+                Some((carddav_listener, Arc::clone(book)))
+            }
+            None => None,
+        };
+        let baseline = carddav.as_ref().map(|(_, book)| {
+            let book = Arc::clone(book);
+            tokio::spawn(async move {
+                match book.reload().await {
+                    Ok(report) => {
+                        match book.listing().await {
+                            Ok(contacts) => {
+                                println!("address book loaded: {} contacts", contacts.len())
+                            }
+                            Err(_) => println!("address book loaded"),
+                        }
+                        if report.skipped > 0 {
+                            println!("contacts skipped: {} did not decrypt", report.skipped);
+                        }
+                    }
+                    Err(_) => {
+                        println!("address book load failed; retrying on the next CardDAV request")
+                    }
+                }
+            })
+        });
+        // CalDAV: read-only calendars over HTTPS with the same
+        // certificate and bridge password.
+        let caldav_listener = match &caldav {
+            Some((caldav_port, _, handler)) => {
+                let caldav_listener = bind_loopback("caldav", *caldav_port).await?;
+                println!("serving CalDAV on https://127.0.0.1:{caldav_port}/ (read-only)");
+                Some((caldav_listener, Arc::clone(handler)))
+            }
+            None => None,
+        };
         println!("serving IMAP on 127.0.0.1:{port}; press Ctrl-C to stop");
 
         // 7. Accept until the stop future resolves, then end the
@@ -842,7 +1037,37 @@ impl ServeUseCase {
         //    its own — only a fatal error can — ends serve with that
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
-        let (imap_limits, pop3_limits, smtp_limits) = shared_listener_limits();
+        let (imap_limits, pop3_limits, smtp_limits, dav_limits) = shared_listener_limits();
+        let carddav_auth = Arc::clone(&backend);
+        let carddav_tls = tls.clone();
+        let carddav_limits = dav_limits.clone();
+        let mut carddav_accepting = pin!(async move {
+            match carddav_listener {
+                Some((carddav_listener, book)) => {
+                    let handler: Arc<dyn DavHandler> = Arc::new(CardDavHandler::new(book));
+                    serve_dav(
+                        carddav_listener,
+                        carddav_tls,
+                        carddav_auth,
+                        handler,
+                        carddav_limits,
+                    )
+                    .await
+                }
+                None => std::future::pending().await,
+            }
+        });
+        let caldav_auth = Arc::clone(&backend);
+        let caldav_tls = tls.clone();
+        let caldav_limits = dav_limits.clone();
+        let mut caldav_accepting = pin!(async move {
+            match caldav_listener {
+                Some((listener, handler)) => {
+                    serve_dav(listener, caldav_tls, caldav_auth, handler, caldav_limits).await
+                }
+                None => std::future::pending().await,
+            }
+        });
         let smtp_auth = Arc::clone(&backend);
         let smtp_tls = tls.clone();
         let mut smtp_accepting = pin!(async move {
@@ -876,6 +1101,11 @@ impl ServeUseCase {
             () = &mut accepting => {}
             () = &mut pop3_accepting => {}
             () = &mut smtp_accepting => {}
+            () = &mut carddav_accepting => {}
+            () = &mut caldav_accepting => {}
+        }
+        if let Some(baseline) = baseline {
+            baseline.abort();
         }
         let _ = stop_watch.send(());
         match watch_task.await {
@@ -885,19 +1115,28 @@ impl ServeUseCase {
     }
 }
 
-/// The limits of the three listeners, sharing one failed-login gate:
-/// IMAP, POP3 and SMTP check the same bridge password, so their
-/// failed-login delays must queue behind each other, or a local process
-/// would get one guessing channel per protocol.
-pub fn shared_listener_limits() -> (ServeLimits, Pop3ServeLimits, SmtpServeLimits) {
+/// The limits of the listeners, sharing one failed-login gate: IMAP,
+/// POP3, SMTP and the DAV listeners check the same bridge password, so
+/// their failed-login delays must queue behind each other, or a local
+/// process would get one guessing channel per protocol. Every DAV
+/// listener (CardDAV, CalDAV) uses a clone of the one `DavServeLimits`,
+/// which keeps the gate shared.
+pub fn shared_listener_limits() -> (
+    ServeLimits,
+    Pop3ServeLimits,
+    SmtpServeLimits,
+    DavServeLimits,
+) {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let mut imap = ServeLimits::default();
     imap.session.login_gate = Arc::clone(&gate);
     let mut pop3 = Pop3ServeLimits::default();
     pop3.session.login_gate = Arc::clone(&gate);
     let mut smtp = SmtpServeLimits::default();
-    smtp.session.login_gate = gate;
-    (imap, pop3, smtp)
+    smtp.session.login_gate = Arc::clone(&gate);
+    let mut dav = DavServeLimits::default();
+    dav.session.login_gate = gate;
+    (imap, pop3, smtp, dav)
 }
 
 #[cfg(test)]
@@ -906,7 +1145,7 @@ mod tests {
 
     #[test]
     fn every_listener_shares_one_login_gate() {
-        let (imap, pop3, smtp) = shared_listener_limits();
+        let (imap, pop3, smtp, dav) = shared_listener_limits();
         assert!(Arc::ptr_eq(
             &imap.session.login_gate,
             &pop3.session.login_gate
@@ -914,6 +1153,16 @@ mod tests {
         assert!(Arc::ptr_eq(
             &imap.session.login_gate,
             &smtp.session.login_gate
+        ));
+        assert!(Arc::ptr_eq(
+            &imap.session.login_gate,
+            &dav.session.login_gate
+        ));
+        // A second DAV listener gets a clone: still the same gate.
+        let caldav = dav.clone();
+        assert!(Arc::ptr_eq(
+            &imap.session.login_gate,
+            &caldav.session.login_gate
         ));
     }
 

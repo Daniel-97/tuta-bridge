@@ -27,6 +27,15 @@ pub struct Config {
     /// without this key `serve` does not accept mail to send.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smtp_port: Option<u16>,
+    /// The CardDAV (implicit TLS) listen port. CardDAV is opt-in:
+    /// without this key `serve` does not serve contacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carddav_port: Option<u16>,
+    /// The CalDAV (HTTPS, read-only) listen port. CalDAV is opt-in:
+    /// without this key `serve` does not serve calendars. Suggested:
+    /// 9933.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caldav_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -37,6 +46,8 @@ impl Default for Config {
             imap_port: None,
             pop3_port: None,
             smtp_port: None,
+            carddav_port: None,
+            caldav_port: None,
         }
     }
 }
@@ -305,6 +316,8 @@ mod tests {
             imap_port: None,
             pop3_port: None,
             smtp_port: None,
+            carddav_port: None,
+            caldav_port: None,
         };
         assert_eq!(
             resolve_base_url(Some(""), Some(""), &cfg),
@@ -348,6 +361,8 @@ mod tests {
             imap_port: None,
             pop3_port: None,
             smtp_port: None,
+            carddav_port: None,
+            caldav_port: None,
         };
         cfg.save(&path).unwrap();
         assert!(Config::load(&path).unwrap() == cfg);
@@ -378,6 +393,8 @@ mod tests {
             imap_port: Some(10143),
             pop3_port: None,
             smtp_port: None,
+            carddav_port: None,
+            caldav_port: None,
             ..Config::default()
         };
         cfg.save(&path).unwrap();
@@ -392,6 +409,17 @@ mod tests {
         plain.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap().imap_port, None);
         assert_eq!(resolve_imap_port(&plain), DEFAULT_IMAP_PORT);
+    }
+
+    #[test]
+    fn caldav_port_is_opt_in_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().caldav_port, None);
+        assert!(!fs::read_to_string(&path).unwrap().contains("caldav_port"));
+        fs::write(&path, "caldav_port = 9933\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().caldav_port, Some(9933));
     }
 
     #[test]
