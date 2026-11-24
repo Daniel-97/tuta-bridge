@@ -398,10 +398,13 @@ writer, and a logged-in session always hands one out.
 number when a contact has no name. "Other" and custom-labelled values
 carry no `TYPE`; the custom label text is not exported.
 
-Dropped (no clean vCard equivalent or not loaded): the photo, social
-network ids, messenger handles, pronouns, phonetic names, custom dates
-other than the first anniversary, custom type labels, and the
-preshared password.
+Dropped from the served card (no clean vCard equivalent or not
+loaded): the photo, social network ids, messenger handles, pronouns,
+phonetic names, custom dates other than the first anniversary, custom
+type labels, and the preshared password. A matched `PUT` still keeps
+a row's custom label and every non-anniversary custom date; a second
+stored anniversary does not survive, because one anniversary is
+served at most (see the residuals under "Writes").
 
 ### Writes (PUT and DELETE)
 
@@ -418,7 +421,22 @@ preshared password.
   the server-generated id, plus the new `ETag`. The id in the client's
   made-up href is never stored — the client re-lists or follows
   `Location`.
-- Update: `204` with the new `ETag`.
+- Update: `204` with the new `ETag`. The update merges into the
+  loaded entity: each rewritten aggregate row (email, phone, address,
+  website, relation) is matched against the loaded rows by trimmed
+  value and by the kind the reader maps the Tuta type to, so a match
+  keeps its id, Tuta type and custom label byte for byte; an
+  anniversary matches by trimmed date alone. The Other/Custom
+  collapse is tolerated because both render without a `TYPE`; the
+  loaded row's type still wins. A field without a match
+  becomes a new row whose id the server assigns, as on create; a
+  loaded row without a counterpart is removed. Custom dates that are
+  not anniversaries (a name day) are kept untouched, and the legacy
+  birthday aggregate is cleared so a removed `BDAY` stays removed.
+  Two residuals of the served card remain: it carries one anniversary
+  at most, so a second stored anniversary cannot survive an echoed
+  `PUT`, and a scheme-less stored website is rewritten because its
+  served value carries the added `https://`.
 - The remote write holds before the cache is touched: a remote failure
   answers the fixed `503` (with `Retry-After`) and leaves the cache and
   its ETag untouched, so the client retries. Bodies are parsed in
@@ -446,7 +464,8 @@ preshared password.
 - Other and Custom: the renderer writes no `TYPE` for either, so an
   exported Other field re-imports as Custom, and only an explicit
   `TYPE=other` reaches Other. The exporter serves one anniversary at
-  most; the importer accepts every `ANNIVERSARY`.
+  most; the importer accepts every `ANNIVERSARY`, and a `PUT` keeps
+  every other stored custom date.
 - `DELETE`: a card that never existed answers `404` (no tombstone for a
   nonexistent row) and `If-Match` is enforced. The remote delete runs
   first (already-gone counts as success), then the row is tombstoned so

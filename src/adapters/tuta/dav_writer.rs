@@ -24,12 +24,17 @@
 //! access token; a 404 answers `Gone`, auth rejections map to the
 //! session error, everything else to the fixed write failure.
 //!
-//! One deliberate simplification of the web client's edit: rewritten
-//! aggregate rows (mail addresses, phones, ...) get fresh ids instead
-//! of keeping the ids of value-identical rows. Nothing observable
-//! keys on aggregate ids - the domain card is flat, and the server
-//! stores whatever ids the client sends, as it must for the rows the
-//! web client itself adds.
+//! Updates merge into the loaded contact, like the web client's edit:
+//! every rewritten aggregate row is matched against the loaded rows
+//! by value and by the kind the reader maps its Tuta type to (the
+//! Other/Custom collapse included), and a match keeps the loaded row
+//! byte for byte - id, Tuta type and custom label. A field without a
+//! match becomes a new row whose id the server assigns, as on create
+//! (the bridge never stamps aggregate ids); a loaded row without a
+//! counterpart is removed. Custom dates that are not anniversaries are
+//! kept untouched (the exporter never serves them, so no imported
+//! field can name them), and the legacy birthday aggregate is cleared
+//! so a removed birthday cannot return through the reader's fallback.
 //!
 //! Errors are fixed strings: no id, name, address or title ever
 //! appears in one.
@@ -55,7 +60,7 @@ use tutasdk::{
     CustomId, GeneratedId, IdTupleCustom, IdTupleGenerated, LoggedInSdk, CLIENT_VERSION,
 };
 
-use super::generated_id::timestamp_to_generated_id;
+use super::contact_source::{address_kind, phone_kind, relation_kind};
 use crate::adapters::caldav::ical::html_to_text;
 use crate::adapters::smtp::outgoing::text_to_html;
 use crate::domain::{ContactFieldKind, ContactRelationKind, Error, RepeatRule, Result};
@@ -96,14 +101,6 @@ pub struct SessionKeyMaterial {
     pub owner_key_version: i64,
 }
 
-/// Wall-clock milliseconds, for the ids and uids a write stamps.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|since| since.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// A Tuta `DateTime`, clamped to the epoch like the reader clamps on
 /// the way out (times before 1970 cannot be stored).
 fn date_time(ms: i64) -> DateTime {
@@ -120,21 +117,6 @@ where
         .into_iter()
         .find(|membership| membership.groupType == CONTACT_GROUP_TYPE)
         .map(|membership| membership.group.0.clone())
-}
-
-/// Fresh ids for rewritten aggregate rows, stamped from the wall clock
-/// the way the web client stamps its added rows; every id of one call
-/// is unique because each row advances the tick.
-struct FreshIds {
-    next_ms: i64,
-}
-
-impl FreshIds {
-    fn next(&mut self) -> CustomId {
-        let id = CustomId(timestamp_to_generated_id(self.next_ms));
-        self.next_ms = self.next_ms.saturating_add(1);
-        id
-    }
 }
 
 /// A text field Tuta keeps nullable: `None` when unset, the way the
@@ -189,9 +171,9 @@ fn relation_code(kind: ContactRelationKind) -> i64 {
 /// The `anniversary` kind of Tuta's custom dates (the reader's filter).
 const ANNIVERSARY_TYPE: i64 = 0;
 
-fn mail_address(field: &crate::domain::ContactField, id: Option<CustomId>) -> ContactMailAddress {
+fn mail_address(field: &crate::domain::ContactField) -> ContactMailAddress {
     ContactMailAddress {
-        _id: id,
+        _id: None,
         r#type: address_code(field.kind),
         address: field.value.clone(),
         customTypeName: String::new(),
@@ -199,9 +181,9 @@ fn mail_address(field: &crate::domain::ContactField, id: Option<CustomId>) -> Co
     }
 }
 
-fn phone_number(field: &crate::domain::ContactField, id: Option<CustomId>) -> ContactPhoneNumber {
+fn phone_number(field: &crate::domain::ContactField) -> ContactPhoneNumber {
     ContactPhoneNumber {
-        _id: id,
+        _id: None,
         r#type: phone_code(field.kind),
         number: field.value.clone(),
         customTypeName: String::new(),
@@ -209,9 +191,9 @@ fn phone_number(field: &crate::domain::ContactField, id: Option<CustomId>) -> Co
     }
 }
 
-fn postal_address(field: &crate::domain::ContactField, id: Option<CustomId>) -> ContactAddress {
+fn postal_address(field: &crate::domain::ContactField) -> ContactAddress {
     ContactAddress {
-        _id: id,
+        _id: None,
         r#type: address_code(field.kind),
         address: field.value.clone(),
         customTypeName: String::new(),
@@ -219,9 +201,9 @@ fn postal_address(field: &crate::domain::ContactField, id: Option<CustomId>) -> 
     }
 }
 
-fn website(field: &crate::domain::ContactField, id: Option<CustomId>) -> ContactWebsite {
+fn website(field: &crate::domain::ContactField) -> ContactWebsite {
     ContactWebsite {
-        _id: id,
+        _id: None,
         r#type: address_code(field.kind),
         customTypeName: String::new(),
         url: field.value.clone(),
@@ -229,12 +211,9 @@ fn website(field: &crate::domain::ContactField, id: Option<CustomId>) -> Contact
     }
 }
 
-fn relationship(
-    relation: &crate::domain::ContactRelation,
-    id: Option<CustomId>,
-) -> ContactRelationship {
+fn relationship(relation: &crate::domain::ContactRelation) -> ContactRelationship {
     ContactRelationship {
-        _id: id,
+        _id: None,
         r#type: relation_code(relation.kind),
         customTypeName: String::new(),
         person: relation.person.clone(),
@@ -242,9 +221,9 @@ fn relationship(
     }
 }
 
-fn anniversary(date_iso: &str, id: Option<CustomId>) -> ContactCustomDate {
+fn anniversary(date_iso: &str) -> ContactCustomDate {
     ContactCustomDate {
-        _id: id,
+        _id: None,
         r#type: ANNIVERSARY_TYPE,
         customTypeName: String::new(),
         dateIso: date_iso.to_string(),
@@ -256,8 +235,9 @@ fn anniversary(date_iso: &str, id: Option<CustomId>) -> ContactCustomDate {
 /// writable fields applied, the rest at their documented defaults
 /// (empty strings, nulls, empty lists), the owner-encrypted session
 /// key and owner group set, and the id prepared for the server to
-/// fill. The aggregate rows carry no ids: the server assigns them on
-/// create, exactly as it does for the web client's null-id rows.
+/// fill. Aggregate rows carry no ids: the server assigns them, on
+/// create and for a new row of an update alike, exactly as it does for
+/// the web client's null-id rows.
 pub fn contact_entity(
     fields: &ContactFields,
     list_id: &str,
@@ -291,51 +271,77 @@ pub fn contact_entity(
         phoneticMiddle: None,
         phoneticLast: None,
         department: opt_text(&fields.department),
-        mailAddresses: fields
-            .emails
-            .iter()
-            .map(|field| mail_address(field, None))
-            .collect(),
-        phoneNumbers: fields
-            .phones
-            .iter()
-            .map(|field| phone_number(field, None))
-            .collect(),
-        addresses: fields
-            .addresses
-            .iter()
-            .map(|field| postal_address(field, None))
-            .collect(),
+        mailAddresses: fields.emails.iter().map(mail_address).collect(),
+        phoneNumbers: fields.phones.iter().map(phone_number).collect(),
+        addresses: fields.addresses.iter().map(postal_address).collect(),
         socialIds: Vec::new(),
         oldBirthdayAggregate: None,
         photo: None,
         customDate: fields
             .anniversaries
             .iter()
-            .map(|iso| anniversary(iso, None))
+            .map(|iso| anniversary(iso))
             .collect(),
-        websites: fields
-            .websites
-            .iter()
-            .map(|field| website(field, None))
-            .collect(),
-        relationships: fields
-            .relations
-            .iter()
-            .map(|relation| relationship(relation, None))
-            .collect(),
+        websites: fields.websites.iter().map(website).collect(),
+        relationships: fields.relations.iter().map(relationship).collect(),
         messengerHandles: Vec::new(),
         pronouns: Vec::new(),
         _errors: Default::default(),
     }
 }
 
+/// Whether a loaded row's kind and the incoming kind may name the same
+/// row. Equal kinds always agree; Other and Custom agree with each
+/// other because the renderer writes no `TYPE` for either and the
+/// importer maps a TYPE-less property to Custom, so an echoed Other
+/// row arrives as Custom (pinned by
+/// `the_render_never_distinguishes_other_from_custom`). The loaded
+/// row's type and label still win.
+fn field_kinds_agree(loaded: ContactFieldKind, incoming: ContactFieldKind) -> bool {
+    loaded == incoming
+        || (matches!(loaded, ContactFieldKind::Other | ContactFieldKind::Custom)
+            && matches!(incoming, ContactFieldKind::Other | ContactFieldKind::Custom))
+}
+
+/// Whether a loaded field row and an incoming field are the same
+/// property: equal after trim, with a compatible reader-mapped kind.
+fn same_field(
+    row_value: &str,
+    row_kind: ContactFieldKind,
+    field: &crate::domain::ContactField,
+) -> bool {
+    row_value.trim() == field.value.trim() && field_kinds_agree(row_kind, field.kind)
+}
+
+/// Merge one aggregate list: each incoming field takes the first
+/// not-yet-consumed loaded row the predicate accepts and emits that
+/// row untouched, else becomes a new row. Loaded rows no field names
+/// are dropped.
+fn merge_rows<Row, Field>(
+    mut loaded: Vec<Row>,
+    fields: &[Field],
+    matches: impl Fn(&Row, &Field) -> bool,
+    new_row: impl Fn(&Field) -> Row,
+) -> Vec<Row> {
+    let mut merged = Vec::with_capacity(fields.len());
+    for field in fields {
+        match loaded.iter().position(|row| matches(row, field)) {
+            Some(index) => merged.push(loaded.remove(index)),
+            None => merged.push(new_row(field)),
+        }
+    }
+    merged
+}
+
 /// Apply the writable fields onto a loaded contact (the update path).
-/// The ids, owner encryption, permissions and the legacy birthday
-/// aggregate stay as loaded - the latter is never rewritten: the
-/// reader prefers the ISO date and the legacy form cannot be written
-/// back. Rewritten aggregate rows get fresh ids (see the module doc).
-pub fn apply_contact_fields(contact: &mut Contact, fields: &ContactFields, now_ms: i64) {
+/// Scalars replace their stored value. Aggregate rows merge instead:
+/// an incoming field takes the first loaded row with the same trimmed
+/// value and a compatible reader-mapped kind and keeps it byte for
+/// byte (id, Tuta type and custom label survive), an unmatched field
+/// becomes a new row with no id, and a loaded row no field names is
+/// removed. Custom dates of other kinds are kept untouched, and the
+/// legacy birthday aggregate is always cleared (see the module doc).
+pub fn apply_contact_fields(contact: &mut Contact, fields: &ContactFields) {
     contact.firstName = fields.first_name.clone();
     contact.lastName = fields.last_name.clone();
     contact.company = fields.company.clone();
@@ -347,37 +353,71 @@ pub fn apply_contact_fields(contact: &mut Contact, fields: &ContactFields, now_m
     contact.nameSuffix = opt_text(&fields.name_suffix);
     contact.department = opt_text(&fields.department);
     contact.birthdayIso = fields.birthday.clone();
-    let mut ids = FreshIds { next_ms: now_ms };
-    contact.mailAddresses = fields
-        .emails
-        .iter()
-        .map(|field| mail_address(field, Some(ids.next())))
-        .collect();
-    contact.phoneNumbers = fields
-        .phones
-        .iter()
-        .map(|field| phone_number(field, Some(ids.next())))
-        .collect();
-    contact.addresses = fields
-        .addresses
-        .iter()
-        .map(|field| postal_address(field, Some(ids.next())))
-        .collect();
-    contact.customDate = fields
-        .anniversaries
-        .iter()
-        .map(|iso| anniversary(iso, Some(ids.next())))
-        .collect();
-    contact.websites = fields
-        .websites
-        .iter()
-        .map(|field| website(field, Some(ids.next())))
-        .collect();
-    contact.relationships = fields
-        .relations
-        .iter()
-        .map(|relation| relationship(relation, Some(ids.next())))
-        .collect();
+    // The reader falls back to the legacy birthday aggregate whenever
+    // `birthdayIso` is empty, so a stale aggregate would resurrect a
+    // removed birthday with a changed ETag. The web client clears it
+    // when it migrates such contacts; every update clears it too.
+    contact.oldBirthdayAggregate = None;
+    contact.mailAddresses = merge_rows(
+        std::mem::take(&mut contact.mailAddresses),
+        &fields.emails,
+        |row, field| same_field(&row.address, address_kind(row.r#type), field),
+        mail_address,
+    );
+    contact.phoneNumbers = merge_rows(
+        std::mem::take(&mut contact.phoneNumbers),
+        &fields.phones,
+        |row, field| same_field(&row.number, phone_kind(row.r#type), field),
+        phone_number,
+    );
+    contact.addresses = merge_rows(
+        std::mem::take(&mut contact.addresses),
+        &fields.addresses,
+        |row, field| same_field(&row.address, address_kind(row.r#type), field),
+        postal_address,
+    );
+    contact.websites = merge_rows(
+        std::mem::take(&mut contact.websites),
+        &fields.websites,
+        |row, field| same_field(&row.url, address_kind(row.r#type), field),
+        website,
+    );
+    contact.relationships = merge_rows(
+        std::mem::take(&mut contact.relationships),
+        &fields.relations,
+        |row, relation| {
+            row.person.trim() == relation.person.trim()
+                && relation_kind(row.r#type) == relation.kind
+        },
+        relationship,
+    );
+    // Anniversaries match only the anniversary-kind rows the reader
+    // serves; every other custom date (a name day) is kept untouched,
+    // since the exporter never serves it and no imported field can
+    // name it.
+    let loaded_dates = std::mem::take(&mut contact.customDate);
+    let mut anniversaries = Vec::new();
+    let mut other_dates = Vec::new();
+    for date in loaded_dates {
+        if date.r#type == ANNIVERSARY_TYPE {
+            anniversaries.push(date);
+        } else {
+            other_dates.push(date);
+        }
+    }
+    let mut merged = Vec::with_capacity(fields.anniversaries.len() + other_dates.len());
+    for iso in &fields.anniversaries {
+        let wanted = iso.trim();
+        match anniversaries
+            .iter()
+            .position(|date| date.dateIso.trim() == wanted)
+        {
+            Some(index) => merged.push(anniversaries.remove(index)),
+            None => merged.push(anniversary(iso)),
+        }
+    }
+    merged.extend(other_dates);
+    contact.customDate = merged;
 }
 
 /// The time zones a write stores on an event: none for an all-day one
@@ -678,7 +718,7 @@ impl ContactWriter for TutaDavWriter {
                 GeneratedId(existing.element_id.clone()),
             );
             let mut contact: Contact = crypto_client.load(&id).await.map_err(|_| write_failed())?;
-            apply_contact_fields(&mut contact, fields, now_ms());
+            apply_contact_fields(&mut contact, fields);
             crypto_client
                 .update_instance(contact)
                 .await
@@ -746,6 +786,9 @@ impl CalendarWriter for TutaDavWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::carddav::import::parse_vcard;
+    use crate::adapters::carddav::vcard::render_vcard;
+    use crate::adapters::tuta::contact_source::contact_card;
     use crate::domain::{ContactField, ContactRelation, EventPerson};
     use tutasdk::entities::generated::tutanota::{Birthday, CalendarEventAttendee};
 
@@ -892,13 +935,426 @@ mod tests {
         assert!(contact.messengerHandles.is_empty());
         assert!(contact.pronouns.is_empty());
         assert!(contact.mailAddresses.is_empty());
-        // The aggregate rows carry no ids: the server assigns them.
+        // The aggregate rows carry no ids: the server assigns them on
+        // create.
         assert!(contact._errors.is_empty());
     }
 
+    /// The update the review's Thunderbird case describes: an edit of
+    /// one property must not rewrite the rows the exporter cannot
+    /// serve, and every rewritten row the exporter does serve must
+    /// come back byte for byte.
     #[test]
-    fn applying_fields_rewrites_the_aggregates_with_fresh_ids() {
+    fn a_note_only_edit_keeps_every_unserved_field() {
         let mut contact = contact_entity(&fields(), "list", "group", &key());
+        contact.mailAddresses = vec![ContactMailAddress {
+            _id: Some(CustomId("mail-1".into())),
+            r#type: 3,
+            address: "gym@x.example".into(),
+            customTypeName: "Gym".into(),
+            _errors: Default::default(),
+        }];
+        contact.phoneNumbers = vec![ContactPhoneNumber {
+            _id: Some(CustomId("tel-1".into())),
+            r#type: 5,
+            number: "555-0100".into(),
+            customTypeName: "Signal".into(),
+            _errors: Default::default(),
+        }];
+        contact.customDate = vec![
+            ContactCustomDate {
+                _id: Some(CustomId("date-1".into())),
+                r#type: 0,
+                customTypeName: String::new(),
+                dateIso: "2001-02-03".into(),
+                _errors: Default::default(),
+            },
+            ContactCustomDate {
+                _id: Some(CustomId("date-2".into())),
+                r#type: 1,
+                customTypeName: "Name day".into(),
+                dateIso: "--05-09".into(),
+                _errors: Default::default(),
+            },
+        ];
+        contact.relationships = vec![ContactRelationship {
+            _id: Some(CustomId("rel-1".into())),
+            r#type: 2,
+            customTypeName: String::new(),
+            person: "Sis".into(),
+            _errors: Default::default(),
+        }];
+        // The labels on the Home address and the Other website are
+        // synthetic: only a row emitted as loaded keeps them, which is
+        // what these two lists now pin.
+        contact.addresses = vec![ContactAddress {
+            _id: Some(CustomId("addr-1".into())),
+            r#type: 0,
+            address: "Street 1".into(),
+            customTypeName: "Address label".into(),
+            _errors: Default::default(),
+        }];
+        contact.websites = vec![ContactWebsite {
+            _id: Some(CustomId("site-1".into())),
+            r#type: 2,
+            customTypeName: "Site label".into(),
+            url: "https://x.example".into(),
+            _errors: Default::default(),
+        }];
+        let mut put = parse_vcard(&render_vcard(&contact_card(&contact).unwrap())).unwrap();
+        put.comment = "Edited note".into();
+        apply_contact_fields(&mut contact, &put);
+        assert_eq!(contact.comment, "Edited note");
+        assert_eq!(contact.mailAddresses.len(), 1);
+        let mail = &contact.mailAddresses[0];
+        assert!(mail._id.as_ref().is_some_and(|id| id.0 == "mail-1"));
+        assert_eq!(mail.r#type, 3);
+        assert_eq!(mail.customTypeName, "Gym");
+        assert_eq!(mail.address, "gym@x.example");
+        assert_eq!(contact.phoneNumbers.len(), 1);
+        let phone = &contact.phoneNumbers[0];
+        assert!(phone._id.as_ref().is_some_and(|id| id.0 == "tel-1"));
+        assert_eq!(phone.r#type, 5);
+        assert_eq!(phone.customTypeName, "Signal");
+        assert_eq!(phone.number, "555-0100");
+        assert_eq!(contact.customDate.len(), 2);
+        let anniversary = &contact.customDate[0];
+        assert!(anniversary._id.as_ref().is_some_and(|id| id.0 == "date-1"));
+        assert_eq!(anniversary.r#type, 0);
+        assert_eq!(anniversary.customTypeName, "");
+        assert_eq!(anniversary.dateIso, "2001-02-03");
+        let name_day = &contact.customDate[1];
+        assert!(name_day._id.as_ref().is_some_and(|id| id.0 == "date-2"));
+        assert_eq!(name_day.r#type, 1);
+        assert_eq!(name_day.customTypeName, "Name day");
+        assert_eq!(name_day.dateIso, "--05-09");
+        assert_eq!(contact.relationships.len(), 1);
+        let relation = &contact.relationships[0];
+        assert!(relation._id.as_ref().is_some_and(|id| id.0 == "rel-1"));
+        assert_eq!(relation.r#type, 2);
+        assert_eq!(relation.person, "Sis");
+        assert_eq!(contact.addresses.len(), 1);
+        let address = &contact.addresses[0];
+        assert!(address._id.as_ref().is_some_and(|id| id.0 == "addr-1"));
+        assert_eq!(address.r#type, 0);
+        assert_eq!(address.customTypeName, "Address label");
+        assert_eq!(address.address, "Street 1");
+        assert_eq!(contact.websites.len(), 1);
+        let site = &contact.websites[0];
+        assert!(site._id.as_ref().is_some_and(|id| id.0 == "site-1"));
+        assert_eq!(site.r#type, 2, "the Other type survives the Custom echo");
+        assert_eq!(site.customTypeName, "Site label");
+        assert_eq!(site.url, "https://x.example");
+    }
+
+    #[test]
+    fn every_relationship_type_round_trips() {
+        let mut contact = contact_entity(&ContactFields::default(), "list", "group", &key());
+        let mut rows: Vec<ContactRelationship> = (0..=11_i64)
+            .map(|code| ContactRelationship {
+                _id: Some(CustomId(format!("rel-{code}"))),
+                r#type: code,
+                customTypeName: format!("label{code}"),
+                person: format!("p{code}"),
+                _errors: Default::default(),
+            })
+            .collect();
+        // The renderer skips a person-less relation, so the round trip
+        // can never name this row: it must be dropped. That is what
+        // makes a no-op merge fail.
+        rows.push(ContactRelationship {
+            _id: Some(CustomId("rel-empty".into())),
+            r#type: 0,
+            customTypeName: String::new(),
+            person: String::new(),
+            _errors: Default::default(),
+        });
+        contact.relationships = rows;
+        let mut put = parse_vcard(&render_vcard(&contact_card(&contact).unwrap())).unwrap();
+        assert_eq!(put.relations.len(), 12);
+        // A person none of the loaded rows has: a new row, not a match.
+        put.relations.push(ContactRelation {
+            kind: ContactRelationKind::Parent,
+            person: "new".into(),
+        });
+        apply_contact_fields(&mut contact, &put);
+        assert_eq!(contact.relationships.len(), 13);
+        for code in 0..=11_i64 {
+            let row = &contact.relationships[code as usize];
+            assert_eq!(row.r#type, code, "the loaded type {code} survives");
+            assert!(row
+                ._id
+                .as_ref()
+                .is_some_and(|id| id.0 == format!("rel-{code}")));
+            assert_eq!(row.customTypeName, format!("label{code}"));
+            assert_eq!(row.person, format!("p{code}"));
+        }
+        assert!(contact
+            .relationships
+            .iter()
+            .all(|row| !row._id.as_ref().is_some_and(|id| id.0 == "rel-empty")));
+        let new = &contact.relationships[12];
+        assert_eq!(new.r#type, relation_code(ContactRelationKind::Parent));
+        assert!(new._id.is_none());
+        assert_eq!(new.customTypeName, "");
+        assert_eq!(new.person, "new");
+    }
+
+    #[test]
+    fn every_field_kind_round_trips_with_the_other_custom_collapse() {
+        let mut contact = contact_entity(&ContactFields::default(), "list", "group", &key());
+        contact.mailAddresses = (0..=3_i64)
+            .map(|code| ContactMailAddress {
+                _id: Some(CustomId(format!("mail-{code}"))),
+                r#type: code,
+                address: format!("mail-{code}@x.example"),
+                customTypeName: format!("label{code}"),
+                _errors: Default::default(),
+            })
+            .collect();
+        // The renderer skips an empty address, so the round trip can
+        // never name this row: it must be dropped.
+        contact.mailAddresses.push(ContactMailAddress {
+            _id: Some(CustomId("mail-empty".into())),
+            r#type: 0,
+            address: String::new(),
+            customTypeName: String::new(),
+            _errors: Default::default(),
+        });
+        contact.phoneNumbers = (0..=5_i64)
+            .map(|code| ContactPhoneNumber {
+                _id: Some(CustomId(format!("tel-{code}"))),
+                r#type: code,
+                number: format!("555-{code:04}"),
+                customTypeName: format!("label{code}"),
+                _errors: Default::default(),
+            })
+            .collect();
+        contact.addresses = (0..=3_i64)
+            .map(|code| ContactAddress {
+                _id: Some(CustomId(format!("addr-{code}"))),
+                r#type: code,
+                address: format!("Street {code}"),
+                customTypeName: format!("label{code}"),
+                _errors: Default::default(),
+            })
+            .collect();
+        contact.websites = (0..=3_i64)
+            .map(|code| ContactWebsite {
+                _id: Some(CustomId(format!("site-{code}"))),
+                r#type: code,
+                customTypeName: format!("label{code}"),
+                url: format!("https://x.invalid/w{code}"),
+                _errors: Default::default(),
+            })
+            .collect();
+        let put = parse_vcard(&render_vcard(&contact_card(&contact).unwrap())).unwrap();
+        apply_contact_fields(&mut contact, &put);
+        assert_eq!(contact.mailAddresses.len(), 4);
+        for code in 0..=3_i64 {
+            let row = &contact.mailAddresses[code as usize];
+            assert_eq!(row.r#type, code, "the loaded mail type {code} wins");
+            assert!(row
+                ._id
+                .as_ref()
+                .is_some_and(|id| id.0 == format!("mail-{code}")));
+            assert_eq!(row.customTypeName, format!("label{code}"));
+            assert_eq!(row.address, format!("mail-{code}@x.example"));
+        }
+        assert!(contact
+            .mailAddresses
+            .iter()
+            .all(|row| !row._id.as_ref().is_some_and(|id| id.0 == "mail-empty")));
+        assert_eq!(contact.phoneNumbers.len(), 6);
+        for code in 0..=5_i64 {
+            let row = &contact.phoneNumbers[code as usize];
+            assert_eq!(row.r#type, code, "the loaded phone type {code} wins");
+            assert!(row
+                ._id
+                .as_ref()
+                .is_some_and(|id| id.0 == format!("tel-{code}")));
+            assert_eq!(row.customTypeName, format!("label{code}"));
+            assert_eq!(row.number, format!("555-{code:04}"));
+        }
+        assert_eq!(contact.addresses.len(), 4);
+        for code in 0..=3_i64 {
+            let row = &contact.addresses[code as usize];
+            assert_eq!(row.r#type, code, "the loaded address type {code} wins");
+            assert!(row
+                ._id
+                .as_ref()
+                .is_some_and(|id| id.0 == format!("addr-{code}")));
+            assert_eq!(row.customTypeName, format!("label{code}"));
+            assert_eq!(row.address, format!("Street {code}"));
+        }
+        assert_eq!(contact.websites.len(), 4);
+        for code in 0..=3_i64 {
+            let row = &contact.websites[code as usize];
+            assert_eq!(row.r#type, code, "the loaded website type {code} wins");
+            assert!(row
+                ._id
+                .as_ref()
+                .is_some_and(|id| id.0 == format!("site-{code}")));
+            assert_eq!(row.customTypeName, format!("label{code}"));
+            assert_eq!(row.url, format!("https://x.invalid/w{code}"));
+        }
+    }
+
+    #[test]
+    fn unmatched_rows_are_replaced_and_new_rows_carry_no_id() {
+        let mut contact = contact_entity(&ContactFields::default(), "list", "group", &key());
+        contact.mailAddresses = vec![
+            ContactMailAddress {
+                _id: Some(CustomId("mail-old-1".into())),
+                r#type: 1,
+                address: "old-one@x.example".into(),
+                customTypeName: String::new(),
+                _errors: Default::default(),
+            },
+            ContactMailAddress {
+                _id: Some(CustomId("mail-old-2".into())),
+                r#type: 1,
+                address: "old-two@x.example".into(),
+                customTypeName: String::new(),
+                _errors: Default::default(),
+            },
+        ];
+        contact.phoneNumbers = vec![ContactPhoneNumber {
+            _id: Some(CustomId("tel-old".into())),
+            r#type: 2,
+            number: "111".into(),
+            customTypeName: String::new(),
+            _errors: Default::default(),
+        }];
+        contact.relationships = vec![ContactRelationship {
+            _id: Some(CustomId("rel-old".into())),
+            r#type: 1,
+            customTypeName: String::new(),
+            person: "Old".into(),
+            _errors: Default::default(),
+        }];
+        contact.customDate = vec![ContactCustomDate {
+            _id: Some(CustomId("date-old".into())),
+            r#type: 0,
+            customTypeName: String::new(),
+            dateIso: "1999-01-01".into(),
+            _errors: Default::default(),
+        }];
+        let next = ContactFields {
+            // An unset nullable text clears the stored value.
+            title: "New".into(),
+            emails: vec![ContactField {
+                kind: ContactFieldKind::Work,
+                value: "new@x.example".into(),
+            }],
+            phones: vec![ContactField {
+                kind: ContactFieldKind::Mobile,
+                value: "222".into(),
+            }],
+            relations: vec![ContactRelation {
+                kind: ContactRelationKind::Sibling,
+                person: "New".into(),
+            }],
+            anniversaries: vec!["2001-02-03".into()],
+            ..ContactFields::default()
+        };
+        apply_contact_fields(&mut contact, &next);
+        assert_eq!(contact.title.as_deref(), Some("New"));
+        assert_eq!(contact.nickname, None);
+        assert_eq!(contact.mailAddresses.len(), 1);
+        let mail = &contact.mailAddresses[0];
+        assert!(mail._id.is_none());
+        assert_eq!(mail.customTypeName, "");
+        assert_eq!(mail.address, "new@x.example");
+        assert!(contact.mailAddresses.iter().all(|row| !row
+            ._id
+            .as_ref()
+            .is_some_and(|id| id.0 == "mail-old-1" || id.0 == "mail-old-2")));
+        assert_eq!(contact.phoneNumbers.len(), 1);
+        assert!(contact.phoneNumbers[0]._id.is_none());
+        assert_eq!(contact.phoneNumbers[0].customTypeName, "");
+        assert_eq!(contact.relationships.len(), 1);
+        assert!(contact.relationships[0]._id.is_none());
+        assert_eq!(contact.relationships[0].customTypeName, "");
+        assert_eq!(contact.customDate.len(), 1);
+        assert!(contact.customDate[0]._id.is_none());
+        assert_eq!(contact.customDate[0].customTypeName, "");
+        assert_eq!(contact.customDate[0].dateIso, "2001-02-03");
+        // The Other/Custom tolerance is not a free pass: a loaded Home
+        // row and an incoming Custom field with the SAME value differ
+        // in kind and must not match.
+        let mut contact = contact_entity(&ContactFields::default(), "list", "group", &key());
+        contact.mailAddresses = vec![ContactMailAddress {
+            _id: Some(CustomId("mail-home".into())),
+            r#type: address_code(ContactFieldKind::Home),
+            address: "same@x.example".into(),
+            customTypeName: String::new(),
+            _errors: Default::default(),
+        }];
+        let next = ContactFields {
+            emails: vec![ContactField {
+                kind: ContactFieldKind::Custom,
+                value: "same@x.example".into(),
+            }],
+            ..ContactFields::default()
+        };
+        apply_contact_fields(&mut contact, &next);
+        assert_eq!(contact.mailAddresses.len(), 1);
+        let mail = &contact.mailAddresses[0];
+        assert!(mail._id.is_none());
+        assert_eq!(mail.r#type, address_code(ContactFieldKind::Custom));
+        // Same once more, with an incoming Other field.
+        let mut contact = contact_entity(&ContactFields::default(), "list", "group", &key());
+        contact.mailAddresses = vec![ContactMailAddress {
+            _id: Some(CustomId("mail-home-2".into())),
+            r#type: address_code(ContactFieldKind::Home),
+            address: "same@x.example".into(),
+            customTypeName: String::new(),
+            _errors: Default::default(),
+        }];
+        let next = ContactFields {
+            emails: vec![ContactField {
+                kind: ContactFieldKind::Other,
+                value: "same@x.example".into(),
+            }],
+            ..ContactFields::default()
+        };
+        apply_contact_fields(&mut contact, &next);
+        assert_eq!(contact.mailAddresses.len(), 1);
+        let mail = &contact.mailAddresses[0];
+        assert!(mail._id.is_none());
+        assert_eq!(mail.r#type, address_code(ContactFieldKind::Other));
+    }
+
+    #[test]
+    fn applying_fields_clears_the_legacy_birthday_aggregate() {
+        let mut contact = contact_entity(&fields(), "list", "group", &key());
+        // A legacy contact keeps the birthday only in the aggregate.
+        contact.birthdayIso = None;
+        contact.oldBirthdayAggregate = Some(Birthday {
+            _id: None,
+            day: 2,
+            month: 9,
+            year: Some(2000),
+        });
+        // The fallback really supplies the birthday before the update.
+        assert_eq!(
+            contact_card(&contact).unwrap().birthday,
+            Some("2000-09-02".into())
+        );
+        let loaded_id = contact._id.clone();
+        apply_contact_fields(&mut contact, &ContactFields::default());
+        assert!(contact.oldBirthdayAggregate.is_none());
+        // The update keeps the identity and owner encryption it loaded.
+        assert_eq!(contact._id, loaded_id);
+        assert_eq!(
+            contact._ownerEncSessionKey.as_deref(),
+            Some(&b"owner-enc"[..])
+        );
+        assert_eq!(contact._ownerKeyVersion, Some(7));
+        // The reader falls back to the aggregate when `birthdayIso` is
+        // empty: clearing it is what keeps a removed `BDAY` removed.
+        assert_eq!(contact_card(&contact).unwrap().birthday, None);
         contact.oldBirthdayAggregate = Some(Birthday {
             _id: None,
             day: 2,
@@ -906,40 +1362,11 @@ mod tests {
             year: Some(2000),
         });
         let next = ContactFields {
-            title: "New".into(),
-            emails: vec![
-                ContactField {
-                    kind: ContactFieldKind::Home,
-                    value: "one@x.example".into(),
-                },
-                ContactField {
-                    kind: ContactFieldKind::Home,
-                    value: "two@x.example".into(),
-                },
-            ],
+            birthday: Some("2000-01-02".into()),
             ..ContactFields::default()
         };
-        apply_contact_fields(&mut contact, &next, 1_700_000_000_000);
-        assert_eq!(contact.title.as_deref(), Some("New"));
-        assert_eq!(contact.firstName, "");
-        // An unset nullable text clears the stored value.
-        assert_eq!(contact.nickname, None);
-        assert_eq!(contact.mailAddresses.len(), 2);
-        let first = contact.mailAddresses[0]._id.clone();
-        let second = contact.mailAddresses[1]._id.clone();
-        assert!(first.is_some());
-        assert!(
-            first.as_ref().unwrap().0 != second.as_ref().unwrap().0,
-            "every rewritten row gets its own id"
-        );
-        // The legacy birthday aggregate is never rewritten.
-        assert!(contact.oldBirthdayAggregate.is_some());
-        // The ids and owner encryption stay as loaded.
-        assert!(contact._id.is_some());
-        assert_eq!(
-            contact._ownerEncSessionKey.as_deref(),
-            Some(&b"owner-enc"[..])
-        );
+        apply_contact_fields(&mut contact, &next);
+        assert!(contact.oldBirthdayAggregate.is_none());
     }
 
     fn event_fields() -> EventFields {

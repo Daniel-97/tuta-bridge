@@ -205,7 +205,7 @@ fn field(kind: ContactFieldKind, value: &str) -> ContactField {
 
 /// `ContactAddressType` / `ContactWebsiteType`: PRIVATE 0, WORK 1,
 /// OTHER 2, CUSTOM 3.
-fn address_kind(code: i64) -> ContactFieldKind {
+pub(crate) fn address_kind(code: i64) -> ContactFieldKind {
     match code {
         0 => ContactFieldKind::Home,
         1 => ContactFieldKind::Work,
@@ -216,7 +216,7 @@ fn address_kind(code: i64) -> ContactFieldKind {
 
 /// `ContactPhoneNumberType`: PRIVATE 0, WORK 1, MOBILE 2, FAX 3,
 /// OTHER 4, CUSTOM 5.
-fn phone_kind(code: i64) -> ContactFieldKind {
+pub(crate) fn phone_kind(code: i64) -> ContactFieldKind {
     match code {
         0 => ContactFieldKind::Home,
         1 => ContactFieldKind::Work,
@@ -230,7 +230,7 @@ fn phone_kind(code: i64) -> ContactFieldKind {
 /// `ContactRelationshipType`: PARENT 0, BROTHER 1, SISTER 2, CHILD 3,
 /// FRIEND 4, RELATIVE 5, SPOUSE 6, PARTNER 7, ASSISTANT 8, MANAGER 9,
 /// OTHER 10, CUSTOM 11.
-fn relation_kind(code: i64) -> ContactRelationKind {
+pub(crate) fn relation_kind(code: i64) -> ContactRelationKind {
     match code {
         0 => ContactRelationKind::Parent,
         1 | 2 => ContactRelationKind::Sibling,
