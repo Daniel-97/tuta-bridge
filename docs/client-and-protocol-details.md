@@ -598,13 +598,14 @@ client from your contacts, it is not a calendar on the server.
   which maps back onto Tuta's clamp to each month's last day. Anything
   else — `BYMONTH`, an ordinal `BYDAY`, a second `RRULE` — refuses the
   whole event with `400`: a rule that cannot be mapped is never
-  accepted and then mangled. The renderer itself emits three shapes the
-  importer refuses with the same `400`: advanced rule parts, the yearly
-  Feb-29 clamp (it carries a `BYMONTH`), and the degraded
-  single-occurrence form, which carries no `RRULE` at all — a `PUT` of
-  it parses as a non-recurring event and would clear the repetition in
-  Tuta. Such events are read-only in practice; edit them in the Tuta
-  client.
+  accepted and then mangled. The renderer itself emits two rule shapes
+  the importer refuses with the same `400`: advanced rule parts and the
+  yearly Feb-29 clamp (it carries a `BYMONTH`). The degraded
+  single-occurrence form is refused with `403` instead: it carries
+  `X-TUTA-BRIDGE-RECURRENCE` (whatever its value), which the importer
+  refuses, and a handler backstop refuses a stored repeating master
+  whose body carries no `RRULE` at all, so a degraded form can never
+  clear the repetition in Tuta. Edit such events in the Tuta client.
 - `EXDATE`, `RDATE` or `RECURRENCE-ID` refuses the event
   (occurrence-level editing is out of scope); the refusal outranks the
   one-event rule, so the body a client writes back after editing one

@@ -52,9 +52,12 @@
 //!   person when it serves one. Everything the renderer never
 //!   serves — `PRODID`, `VERSION`, `CALSCALE`, `METHOD`, `SEQUENCE`,
 //!   `CREATED`, `LAST-MODIFIED`, `DTSTAMP`, `STATUS`, `TRANSP`,
-//!   `CLASS`, `PRIORITY`, every `X-` property and every unrecognized
-//!   name — is dropped silently, and an unknown property never fails
-//!   the import.
+//!   `CLASS`, `PRIORITY`, every `X-` property save the bridge's own
+//!   recurrence marker and every unrecognized name — is dropped
+//!   silently, and an unknown property never fails the import.
+//!   `X-TUTA-BRIDGE-RECURRENCE`, whatever its value, refuses the
+//!   import: the degraded single-occurrence form must never be
+//!   written back as a non-recurring event.
 //! - [`ImportError`] carries fixed messages only — no title, zone
 //!   name, address or rule ever reaches an error — and this module
 //!   never logs. The body is parsed in memory and never written
@@ -91,6 +94,15 @@ pub enum ImportError {
     /// `EXDATE`, `RDATE` or `RECURRENCE-ID`: occurrence-level editing
     /// is out of scope.
     PerOccurrence,
+    /// The bridge's own recurrence marker: the degraded single
+    /// occurrence form cannot be written back as a non-recurring
+    /// event.
+    RecurrenceMarker,
+    /// `DTEND` is before `DTSTART`.
+    EndBeforeStart,
+    /// An all-day event's `DTEND` equals its `DTSTART`: the renderer
+    /// would read that back as a timed event at midnight.
+    EmptyAllDay,
 }
 
 impl ImportError {
@@ -110,6 +122,12 @@ cannot send invitations for"
                 "the event edits or lists single occurrences of a series, which the \
 bridge does not support"
             }
+            ImportError::RecurrenceMarker => {
+                "the event carries a bridge recurrence marker: the series shape cannot be \
+written back"
+            }
+            ImportError::EndBeforeStart => "the event's end is before its start",
+            ImportError::EmptyAllDay => "an all-day event's end must be after its start",
         }
     }
 }
@@ -121,9 +139,9 @@ impl fmt::Display for ImportError {
 }
 
 /// Import the `VEVENT` of `body` (a client sends one event per
-/// `PUT`). An unrecognized property is dropped silently; a time,
-/// zone, rule or attendee that cannot be mapped refuses the whole
-/// import.
+/// `PUT`). An unrecognized property is dropped silently, save the
+/// bridge's own recurrence marker; a time, zone, rule or attendee that
+/// cannot be mapped refuses the whole import.
 pub fn parse_event(body: &str) -> Result<EventFields, ImportError> {
     let scanned = scan(body);
     let Some(block) = scanned.blocks.first() else {
@@ -159,7 +177,8 @@ pub fn parse_event(body: &str) -> Result<EventFields, ImportError> {
             (ms, end_ms, true, None, day)
         }
         (Some(TimeForm::Utc { ms, day }), Some(TimeForm::Utc { ms: end_ms, .. })) => {
-            (ms, end_ms, false, Some("UTC".to_string()), day)
+            // The UTC form names no zone: the body carried no TZID.
+            (ms, end_ms, false, None, day)
         }
         (
             Some(TimeForm::Zoned { ms, day, name }),
@@ -171,6 +190,15 @@ pub fn parse_event(body: &str) -> Result<EventFields, ImportError> {
         ) if name == end_name => (ms, end_ms, false, Some(name), day),
         _ => return Err(ImportError::BadTimes),
     };
+    // The renderer reads an all-day event back from its bounds: an
+    // end before its start (or an empty all-day event) would change
+    // the event's shape.
+    if end_ms < start_ms {
+        return Err(ImportError::EndBeforeStart);
+    }
+    if all_day && end_ms == start_ms {
+        return Err(ImportError::EmptyAllDay);
+    }
 
     // An attendee is the organizer's own address or the event is
     // refused: no invitation is ever lost silently.
@@ -359,6 +387,10 @@ fn apply(parts: &mut Parts, property: &Property) -> Result<(), ImportError> {
         // pre-scan refuses it for every block, this arm keeps the
         // refusal true if only the first block is mapped.
         "EXDATE" | "RECURRENCE-ID" | "RDATE" => return Err(ImportError::PerOccurrence),
+        // The bridge's own marker names a series shape it cannot write
+        // back: refusing it is what keeps a degraded form from
+        // clearing the stored repetition.
+        "X-TUTA-BRIDGE-RECURRENCE" => return Err(ImportError::RecurrenceMarker),
         _ => {}
     }
     Ok(())
@@ -805,7 +837,7 @@ mod tests {
             start_ms: MONDAY_8_UTC,
             end_ms: MONDAY_8_UTC + HOUR,
             all_day: false,
-            time_zone: Some("UTC".into()),
+            time_zone: None,
             repeat: None,
             uid: Some("uid-1@tuta".into()),
             organizer: None,
@@ -1069,10 +1101,11 @@ mod tests {
         assert!(body.contains("RRULE:FREQ=DAILY;INTERVAL=2;COUNT=5\r\n"));
 
         // A zone the bundled data does not know repeats in UTC when
-        // served; the import maps what the body says.
+        // served; the import maps what the body says. A UTC-form body
+        // names no zone, so the fields carry none.
         fields.repeat.as_mut().unwrap().time_zone = "Nowhere/Special".into();
         let parsed = parse_event(&render_fields(&fields)).unwrap();
-        assert!(parsed.time_zone.as_deref() == Some("UTC"));
+        assert!(parsed.time_zone.is_none());
         assert!(parsed
             .repeat
             .as_ref()
@@ -1551,5 +1584,61 @@ bridge cannot send invitations for"
         assert!(parsed.time_zone.as_deref() == Some("Europe/Berlin"));
         assert_eq!(parsed.start_ms, MONDAY_8_UTC);
         assert!(parsed.repeat.is_none());
+    }
+
+    #[test]
+    fn the_bridge_recurrence_marker_refuses_the_body() {
+        for marker in [
+            "X-TUTA-BRIDGE-RECURRENCE:UNSUPPORTED\r\n",
+            "X-TUTA-BRIDGE-RECURRENCE:anything at all\r\n",
+            "x-tuta-bridge-recurrence:\r\n",
+        ] {
+            let inner = format!("{TIMES}{marker}");
+            let error = refused(&body(&inner));
+            assert!(error == ImportError::RecurrenceMarker, "{marker:?}");
+            assert_eq!(
+                error.message(),
+                "the event carries a bridge recurrence marker: the series shape cannot be \
+written back"
+            );
+        }
+        // Another X- property is still dropped silently.
+        let inner = format!("{TIMES}X-CUSTOM-THING:whatever\r\n");
+        let parsed = parse_event(&body(&inner)).unwrap();
+        assert_eq!(parsed.start_ms, MONDAY_8_UTC);
+    }
+
+    #[test]
+    fn bounds_that_run_backwards_are_refused() {
+        let inner = "DTSTART:20250106T090000Z\r\nDTEND:20250106T080000Z\r\n";
+        let error = refused(&body(inner));
+        assert!(error == ImportError::EndBeforeStart);
+        assert_eq!(error.message(), "the event's end is before its start");
+
+        let inner = "DTSTART;VALUE=DATE:20250106\r\nDTEND;VALUE=DATE:20250106\r\n";
+        let error = refused(&body(inner));
+        assert!(error == ImportError::EmptyAllDay);
+        assert_eq!(
+            error.message(),
+            "an all-day event's end must be after its start"
+        );
+
+        // A timed empty event stays accepted: only `end < start` is
+        // refused.
+        let inner = "DTSTART:20250106T080000Z\r\nDTEND:20250106T080000Z\r\n";
+        let parsed = parse_event(&body(inner)).unwrap();
+        assert_eq!(parsed.start_ms, parsed.end_ms);
+    }
+
+    #[test]
+    fn a_utc_body_names_no_zone_and_a_tzid_does() {
+        let utc = parse_event(&body(TIMES)).unwrap();
+        assert!(utc.time_zone.is_none());
+        let zoned = parse_event(&body(
+            "DTSTART;TZID=Europe/Berlin:20250106T090000\r\n\
+DTEND;TZID=Europe/Berlin:20250106T100000\r\n",
+        ))
+        .unwrap();
+        assert!(zoned.time_zone.as_deref() == Some("Europe/Berlin"));
     }
 }

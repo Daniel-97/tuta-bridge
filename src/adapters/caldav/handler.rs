@@ -65,6 +65,7 @@ use crate::adapters::dav::{
     etag_matches, strong_etag_matches, DavHandler, DavMethod, DavRequest, DavResponse, Depth,
     WellKnown,
 };
+use crate::adapters::tuta::dav_writer::choose_event_list;
 use crate::app::calendar_sync::CalendarSync;
 use crate::domain::calendar::{
     collection_tag, group_resources, resource_etag, split_uid, Resource,
@@ -601,7 +602,22 @@ impl CalDavHandler {
         };
         let fields = match parse_event(body) {
             Ok(fields) => fields,
+            // The bridge's own recurrence marker names a series shape
+            // the importer cannot write back: a degraded form must
+            // never clear a stored series, so it answers `403` like a
+            // creation rather than the ordinary `400` rule refusal.
+            Err(ImportError::RecurrenceMarker) => {
+                return Ok(DavResponse::text(
+                    403,
+                    ImportError::RecurrenceMarker.message(),
+                ))
+            }
             Err(error) => return Ok(DavResponse::text(400, error.message())),
+        };
+        let calendar_ref = CalendarRef {
+            group_id: calendar.calendar_id.clone(),
+            short_list_id: calendar.short_list_id.clone(),
+            long_list_id: calendar.long_list_id.clone(),
         };
         // An event may only be organized by one of the account's own
         // addresses; an event without an organizer is a personal one.
@@ -614,15 +630,62 @@ impl CalDavHandler {
                 return Ok(organizer_refused());
             }
         }
+        // Backstop for a stored series: a body without an `RRULE` and
+        // without the bridge's marker would flatten the series. This
+        // also catches clients that hand-write such a body.
+        if master.recurring && fields.repeat.is_none() {
+            return Ok(series_backstop_refused());
+        }
+        // An in-place update cannot move an event's start. A short
+        // event's id derives from its start time, and both the Tuta web
+        // client and this bridge's reader load short events by id
+        // range, so an update with the stale id would make the event
+        // invisible in the Tuta apps. A long event has no start-derived
+        // id, but the bridge still refuses a retime: the Tuta web
+        // client deletes and re-creates the event on a start change
+        // (the plan's decision 9 blocks that here), and the writer
+        // never rewrites `alarmInfos`, so a retime would leave the
+        // stored reminders stale. Refuse with the fixed creation
+        // answer.
+        //
+        // iCalendar times are second-granular and the renderer's UTC
+        // formatting truncates sub-second milliseconds: floor the
+        // stored start so a PUT-back of the served body never looks
+        // like a start move.
+        let stored_start = master.start_ms.div_euclid(1000) * 1000;
+        if fields.start_ms != stored_start {
+            return Ok(creation_refused());
+        }
+        // The body's rule decides the event list: moving the event
+        // between the short and long lists is a creation-shaped change,
+        // not an in-place update. Refuse it with the fixed creation
+        // answer too.
+        //
+        // One stored shape is not a state change: `series_end_ms` is
+        // `Some` exactly when the series end is known from the data
+        // (a non-recurring row, or a series bounded by `UNTIL`), so a
+        // stored master in the long list with a known series end is
+        // already bounded (or non-recurring) and merely lives there.
+        // A body whose rule also maps to the short list therefore does
+        // not change its long/short state, and writing it in place is
+        // safe because long-list rows are always fetched in full (no
+        // id-range visibility problem). It also covers a non-recurring
+        // row stored in the long list: neither its list nor its repeat
+        // state changes, and long-list rows are fetched in full.
+        // A `COUNT`-bounded series in the
+        // long list has `series_end_ms == None` and is still refused:
+        // Tuta's own split flow only produces `UNTIL` bounds.
+        let chosen = choose_event_list(&calendar_ref, &fields);
+        let bounded_in_long_list = master.list_id == calendar_ref.long_list_id
+            && master.series_end_ms.is_some()
+            && chosen == calendar_ref.short_list_id.as_str();
+        if chosen != master.list_id.as_str() && !bounded_in_long_list {
+            return Ok(creation_refused());
+        }
         // Remote first: an error propagates untouched, the cache is not
         // touched. The writer keeps the event's identity — uid,
         // sequence, recurrence, alarms, attendees — to itself; the
         // handler hands it the parsed fields and the existing ref only.
-        let calendar_ref = CalendarRef {
-            group_id: calendar.calendar_id.clone(),
-            short_list_id: calendar.short_list_id.clone(),
-            long_list_id: calendar.long_list_id.clone(),
-        };
         let existing = EventRef {
             list_id: master.list_id.clone(),
             element_id: master.element_id.clone(),
@@ -766,6 +829,14 @@ fn creation_refused() -> DavResponse {
         403,
         "creating events is not supported: create them in the Tuta client, then edit them here",
     )
+}
+
+/// The fixed refusal of a body that would flatten a stored series.
+/// This also catches clients that hand-write a body without the
+/// bridge's recurrence marker: a stored series must never be
+/// flattened.
+fn series_backstop_refused() -> DavResponse {
+    DavResponse::text(403, "the stored series repeats but the body does not")
 }
 
 /// The fixed refusal of an organizer that is not one of the

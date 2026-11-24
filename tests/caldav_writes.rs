@@ -493,6 +493,147 @@ async fn put_on_a_row_that_does_not_exist_refuses_creation() {
 }
 
 #[tokio::test]
+async fn put_that_moves_the_start_refuses_like_creation() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    // The stored short event's id derives from its start: an in-place
+    // update cannot move it.
+    let mut moved = plain_event("e1", "uid-1", NOW_MS + DAY_MS + HOUR);
+    moved.summary = "Edited summary".into();
+    let response = wire.request("PUT", &href, &[], &body_of(&moved)).await;
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.body,
+        "creating events is not supported: create them in the Tuta client, then edit them here\n"
+    );
+    assert!(writer.put_calls().is_empty());
+}
+
+#[tokio::test]
+async fn putting_an_unbounded_rule_on_a_short_event_refuses_like_creation() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    // The row is the non-recurring short event; the body's unbounded
+    // rule would file it into the long list.
+    let mut recurring = plain_event("e1", "uid-1", NOW_MS + DAY_MS);
+    recurring.repeat = Some(weekly());
+    let response = wire.request("PUT", &href, &[], &body_of(&recurring)).await;
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.body,
+        "creating events is not supported: create them in the Tuta client, then edit them here\n"
+    );
+    assert!(writer.put_calls().is_empty());
+}
+
+#[tokio::test]
+async fn putting_a_bounded_rule_on_a_long_event_refuses_like_creation() {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let mut master = plain_event("series", "series-uid", NOW_MS);
+    master.list_id = "work-long".into();
+    master.repeat = Some(weekly());
+    source.put_event(master.clone());
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    // The row is the unbounded long event; the body's bounded rule
+    // would file it into the short list.
+    let mut bounded = plain_event("series", "series-uid", NOW_MS);
+    bounded.list_id = "work-long".into();
+    let mut rule = weekly();
+    rule.end_type = 1;
+    rule.end_value = Some(5);
+    bounded.repeat = Some(rule);
+    let response = wire.request("PUT", &href, &[], &body_of(&bounded)).await;
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.body,
+        "creating events is not supported: create them in the Tuta client, then edit them here\n"
+    );
+    assert!(writer.put_calls().is_empty());
+}
+
+#[tokio::test]
+async fn putting_back_a_degraded_recurrence_form_is_refused() {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    // A rule the renderer cannot express: the served body carries the
+    // marker instead of an RRULE.
+    let mut master = plain_event("series", "series-uid", NOW_MS);
+    master.list_id = "work-long".into();
+    let mut odd = weekly();
+    odd.frequency = 7;
+    master.repeat = Some(odd);
+    source.put_event(master.clone());
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    // The review's plain-title edit of the served degraded form.
+    let mut edited = master.clone();
+    edited.summary = "Edited summary".into();
+    let body = body_of(&edited);
+    assert!(
+        body.contains("X-TUTA-BRIDGE-RECURRENCE:UNSUPPORTED"),
+        "the fixture is the degraded form"
+    );
+    let response = wire.request("PUT", &href, &[], &body).await;
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.body,
+        "the event carries a bridge recurrence marker: the series shape cannot be written back\n"
+    );
+    assert!(writer.put_calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_series_body_without_a_rule_is_refused_by_the_backstop() {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let mut master = plain_event("series", "series-uid", NOW_MS);
+    master.list_id = "work-long".into();
+    master.repeat = Some(weekly());
+    source.put_event(master);
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    // A hand-written body with the row's own bounds, no RRULE and no
+    // marker: the stored series must not be flattened.
+    let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:series-uid\r\n\
+DTSTART:20250106T080000Z\r\nDTEND:20250106T090000Z\r\nSUMMARY:Hand-written\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+    let response = wire.request("PUT", &href, &[], body).await;
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.body,
+        "the stored series repeats but the body does not\n"
+    );
+    assert!(writer.put_calls().is_empty());
+}
+
+#[tokio::test]
 async fn put_preconditions_run_against_the_stored_row() {
     let fixture = fixture().await;
     let writer = Arc::new(FakeCalendarWriter::new());
@@ -780,6 +921,201 @@ async fn put_on_a_split_series_second_href_updates_its_own_master() {
     assert_eq!(fetched.status, 200);
     assert_eq!(fetched.header("ETag"), Some(etag.as_str()));
     assert_eq!(listing(&mut wire, "work").await.len(), 2);
+}
+
+#[tokio::test]
+async fn put_on_a_split_progenitor_with_a_bounded_rule_updates_in_place() {
+    // Tuta's "edit this and all future events" leaves the original
+    // series UNTIL-bounded in the long list: a title-only PUT of that
+    // same bounded rule must not look like a short/long state change.
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let mut original = plain_event("original", "series-uid", NOW_MS);
+    original.list_id = "work-long".into();
+    let mut bounded = weekly();
+    bounded.end_type = 2;
+    bounded.end_value = Some(NOW_MS + 4 * 7 * DAY_MS);
+    original.repeat = Some(bounded);
+    let mut future = plain_event("future", "series-uid", NOW_MS + 4 * 7 * DAY_MS + HOUR);
+    future.list_id = "work-long".into();
+    future.repeat = Some(weekly());
+    source.put_event(original.clone());
+    source.put_event(future.clone());
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let href = format!("/caldav/calendars/work/{}.ics", original.resource_name());
+    let listed = listing(&mut wire, "work").await;
+    assert!(listed.iter().any(|(listed, _)| *listed == href));
+
+    let mut edited = original.clone();
+    edited.summary = "Edited summary".into();
+    fixture.source.put_event(edited.clone());
+
+    let response = wire.request("PUT", &href, &[], &body_of(&edited)).await;
+    assert_eq!(response.status, 204);
+    assert!(
+        response.header("ETag").is_some(),
+        "the resource keeps serving an ETag"
+    );
+    assert!(writer.put_calls() == [(calendar_ref(), Some(event_ref("work-long", "original")))]);
+    let row = row_of(&fixture, "original").await.unwrap();
+    assert_eq!(row.fingerprint, edited.fingerprint());
+}
+
+#[tokio::test]
+async fn put_on_a_bounded_series_in_the_short_list_updates_in_place() {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let mut bounded = plain_event("bounded", "bounded-uid", NOW_MS + DAY_MS);
+    let mut rule = weekly();
+    rule.end_type = 2;
+    rule.end_value = Some(NOW_MS + 3 * 7 * DAY_MS);
+    bounded.repeat = Some(rule);
+    source.put_event(bounded.clone());
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    let mut edited = bounded.clone();
+    edited.summary = "Edited summary".into();
+    fixture.source.put_event(edited.clone());
+
+    let response = wire.request("PUT", &href, &[], &body_of(&edited)).await;
+    assert_eq!(response.status, 204);
+    assert!(response.header("ETag").is_some());
+    assert!(writer.put_calls() == [(calendar_ref(), Some(event_ref("work-short", "bounded")))]);
+    let row = row_of(&fixture, "bounded").await.unwrap();
+    assert_eq!(row.fingerprint, edited.fingerprint());
+}
+
+#[tokio::test]
+async fn put_on_a_count_bounded_series_in_the_long_list_is_refused() {
+    // The exemption's residual, pinned: a COUNT-bounded series stored
+    // in the long list has `series_end_ms == None`, so it still counts
+    // as a list change and answers the creation refusal. The shape is
+    // accepted rather than exempted because Tuta's split flow only
+    // produces UNTIL bounds; this test keeps an exemption tweak from
+    // silently changing that.
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let mut counted = plain_event("counted", "counted-uid", NOW_MS);
+    counted.list_id = "work-long".into();
+    let mut rule = weekly();
+    rule.end_type = 1;
+    rule.end_value = Some(5);
+    counted.repeat = Some(rule);
+    source.put_event(counted.clone());
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    let mut edited = counted.clone();
+    edited.summary = "Edited summary".into();
+    let response = wire.request("PUT", &href, &[], &body_of(&edited)).await;
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.body,
+        "creating events is not supported: create them in the Tuta client, then edit them here\n"
+    );
+    assert!(writer.put_calls().is_empty());
+}
+
+#[tokio::test]
+async fn put_on_a_non_recurring_long_list_row_updates_in_place() {
+    // The exemption's other edge: a non-recurring event that merely
+    // lives in the long list changes neither its list nor its repeat
+    // state, so the in-place write is accepted.
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let mut loose = plain_event("loose", "loose-uid", NOW_MS + DAY_MS);
+    loose.list_id = "work-long".into();
+    source.put_event(loose.clone());
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    let mut edited = loose.clone();
+    edited.summary = "Edited summary".into();
+    fixture.source.put_event(edited.clone());
+
+    let response = wire.request("PUT", &href, &[], &body_of(&edited)).await;
+    assert_eq!(response.status, 204);
+    assert!(response.header("ETag").is_some());
+    assert!(writer.put_calls() == [(calendar_ref(), Some(event_ref("work-long", "loose")))]);
+    let row = row_of(&fixture, "loose").await.unwrap();
+    assert_eq!(row.fingerprint, edited.fingerprint());
+}
+
+#[tokio::test]
+async fn an_all_day_master_updates_in_place() {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let day = NOW_MS - NOW_MS.rem_euclid(DAY_MS);
+    let mut all_day = plain_event("day", "day-uid", day);
+    all_day.end_ms = day + DAY_MS;
+    assert!(all_day.is_all_day(), "the fixture is all-day");
+    source.put_event(all_day.clone());
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    let mut edited = all_day.clone();
+    edited.summary = "Edited summary".into();
+    fixture.source.put_event(edited.clone());
+
+    let response = wire.request("PUT", &href, &[], &body_of(&edited)).await;
+    assert_eq!(response.status, 204);
+    assert!(response.header("ETag").is_some());
+    assert!(writer.put_calls() == [(calendar_ref(), Some(event_ref("work-short", "day")))]);
+    let row = row_of(&fixture, "day").await.unwrap();
+    assert_eq!(row.fingerprint, edited.fingerprint());
+}
+
+#[tokio::test]
+async fn a_sub_second_start_does_not_look_like_a_start_move() {
+    // The served body is second-granular: a stored start with a
+    // sub-second residue must still round-trip as the same start.
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let start = NOW_MS + DAY_MS + 500;
+    let event = plain_event("sub", "sub-uid", start);
+    source.put_event(event.clone());
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    let mut edited = event.clone();
+    edited.summary = "Edited summary".into();
+    fixture.source.put_event(edited.clone());
+
+    let response = wire.request("PUT", &href, &[], &body_of(&edited)).await;
+    assert_eq!(response.status, 204);
+    assert!(response.header("ETag").is_some());
+    assert!(writer.put_calls() == [(calendar_ref(), Some(event_ref("work-short", "sub")))]);
+    assert_eq!(
+        writer.fields_of_put(0).unwrap().start_ms,
+        start.div_euclid(1000) * 1000,
+        "the body carries the floored start"
+    );
+    let row = row_of(&fixture, "sub").await.unwrap();
+    assert_eq!(row.fingerprint, edited.fingerprint());
 }
 
 #[tokio::test]

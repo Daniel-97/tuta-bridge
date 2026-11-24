@@ -1,14 +1,20 @@
-//! Write contacts and calendar events through the SDK's generic
-//! encrypted-entity path, and delete them the way the web client does.
+//! Write contacts through the SDK's generic encrypted-entity path,
+//! update calendar events in place, and delete both the way the web
+//! client does.
 //!
-//! Creates go through `CryptoEntityClient::create_instance`: the
-//! session key is generated here, owner-encrypted with the owner
+//! Contacts are created through `CryptoEntityClient::create_instance`:
+//! the session key is generated here, owner-encrypted with the owner
 //! group's current key the same way [`super::mail_sender`] encrypts a
 //! draft's session key, and handed to the SDK alongside the entity.
 //! The SDK encrypts the payload and posts it; the server fills in the
-//! element id. Updates load the stored instance (the SDK resolves the
-//! session key from its `_ownerEncSessionKey`), apply the fields in
-//! place and `update_instance` it back.
+//! element id. Contact updates, and calendar-event updates, load the
+//! stored instance (the SDK resolves the session key from its
+//! `_ownerEncSessionKey`), apply the fields in place and
+//! `update_instance` it back.
+//!
+//! Calendar events are never created here: the handler refuses an
+//! event creation before the writer is called, and the writer's create
+//! branch answers `Unsupported` as well.
 //!
 //! Deletions cannot use the SDK's `erase_list_element`: at the pinned
 //! rev it is a `todo!()`. The web client's `entityClient.erase` is a
@@ -34,6 +40,7 @@ use std::sync::Arc;
 use crypto_primitives::aes::{Aes256Key, InitializationVector};
 use crypto_primitives::key::GenericAesKey;
 use crypto_primitives::randomizer_facade::RandomizerFacade;
+use crypto_primitives::sha::sha256;
 use rand_core::OsRng;
 use tutasdk::bindings::rest_client::{HttpMethod, RestClient, RestClientOptions};
 use tutasdk::bindings::suspendable_rest_client::SuspensionBehavior;
@@ -49,6 +56,8 @@ use tutasdk::{
 };
 
 use super::generated_id::timestamp_to_generated_id;
+use crate::adapters::caldav::ical::html_to_text;
+use crate::adapters::smtp::outgoing::text_to_html;
 use crate::domain::{ContactFieldKind, ContactRelationKind, Error, RepeatRule, Result};
 use crate::ports::dav_writer::{
     CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DeleteOutcome,
@@ -111,12 +120,6 @@ where
         .into_iter()
         .find(|membership| membership.groupType == CONTACT_GROUP_TYPE)
         .map(|membership| membership.group.0.clone())
-}
-
-/// The uid of a new event that carries none, the way the web client
-/// generates one: `{calendar group id}{timestamp}@tuta.com`.
-fn generated_event_uid(group_id: &str, now_ms: i64) -> String {
-    format!("{group_id}{now_ms}@tuta.com")
 }
 
 /// Fresh ids for rewritten aggregate rows, stamped from the wall clock
@@ -377,14 +380,18 @@ pub fn apply_contact_fields(contact: &mut Contact, fields: &ContactFields, now_m
         .collect();
 }
 
-/// The time zones stored on an event: none for an all-day one (its
-/// bounds sit on UTC midnight), the fields' zone for a timed one —
-/// the web client importer's rule.
-fn event_zones(fields: &EventFields) -> (Option<String>, Option<String>) {
+/// The time zones a write stores on an event: none for an all-day one
+/// (its bounds sit on UTC midnight), the fields' zone for a timed one,
+/// and `None` when a timed body carried no `TZID` — a UTC-form body
+/// names no zone, so the loaded zones stay untouched.
+fn event_zones(fields: &EventFields) -> Option<(Option<String>, Option<String>)> {
     if fields.all_day {
-        (None, None)
+        Some((None, None))
     } else {
-        (fields.time_zone.clone(), fields.time_zone.clone())
+        fields
+            .time_zone
+            .as_ref()
+            .map(|zone| (Some(zone.clone()), Some(zone.clone())))
     }
 }
 
@@ -431,50 +438,25 @@ fn event_organizer(person: &crate::domain::EventPerson) -> EncryptedMailAddress 
     }
 }
 
-/// A new `CalendarEvent` in the web client editor's create shape: the
-/// writable fields applied, the sequence at zero, no attendees, alarms
-/// or recurrence (the importer refuses those events before a write),
-/// the owner-encrypted session key and owner group set, and the id
-/// prepared for the server to fill.
-pub fn event_entity(
-    fields: &EventFields,
-    list_id: &str,
-    owner_group: &str,
-    uid: &str,
-    key: &SessionKeyMaterial,
-) -> CalendarEvent {
-    let (start_zone, end_zone) = event_zones(fields);
-    CalendarEvent {
-        _id: Some(IdTupleCustom {
-            list_id: GeneratedId(list_id.to_string()),
-            element_id: Default::default(),
-        }),
-        _permissions: Default::default(),
-        _format: 0,
-        _ownerGroup: Some(GeneratedId(owner_group.to_string())),
-        _ownerEncSessionKey: Some(key.owner_enc_session_key.clone()),
-        _ownerKeyVersion: Some(key.owner_key_version),
-        _kdfNonce: None,
-        summary: fields.summary.clone(),
-        description: fields.description.clone(),
-        startTime: date_time(fields.start_ms),
-        endTime: date_time(fields.end_ms),
-        location: fields.location.clone(),
-        uid: Some(uid.to_string()),
-        hashedUid: None,
-        sequence: 0,
-        invitedConfidentially: Some(false),
-        recurrenceId: None,
-        sender: None,
-        pendingInvitation: Some(false),
-        startTimeZone: start_zone,
-        endTimeZone: end_zone,
-        repeatRule: fields.repeat.as_ref().map(|rule| repeat_rule(rule, None)),
-        alarmInfos: Vec::new(),
-        attendees: Vec::new(),
-        organizer: fields.organizer.as_ref().map(event_organizer),
-        _errors: Default::default(),
+/// Whether the loaded event carries an attendee other than its
+/// organizer. The served body carries the attendees, and the importer
+/// refuses any attendee other than the organizer, so an accepted body
+/// never carries them — refusing updates to events that have stored
+/// guests guarantees a client can never silently drop or desync them.
+fn attendee_gate(event: &CalendarEvent) -> Result<()> {
+    let organizer = event
+        .organizer
+        .as_ref()
+        .map(|person| person.address.as_str());
+    let foreign = event.attendees.iter().any(|attendee| {
+        organizer.is_none_or(|address| !attendee.address.address.eq_ignore_ascii_case(address))
+    });
+    if foreign {
+        return Err(Error::Unsupported(
+            "events with attendees cannot be edited through the bridge".into(),
+        ));
     }
+    Ok(())
 }
 
 /// Apply the writable fields onto a loaded event (the update path).
@@ -486,23 +468,70 @@ pub fn event_entity(
 /// repeat rule keeps its id when the loaded event had one.
 pub fn apply_event_fields(event: &mut CalendarEvent, fields: &EventFields) {
     event.summary = fields.summary.clone();
-    event.description = fields.description.clone();
+    // `DESCRIPTION` is the plain rendering of the stored HTML, so a
+    // description echoed back means the client did not touch it: keep
+    // the stored HTML. A different description is regenerated from
+    // its plain text, the way the web client's editor writes it.
+    if html_to_text(&event.description) != fields.description {
+        event.description = text_to_html(&fields.description);
+    }
     event.location = fields.location.clone();
     event.startTime = date_time(fields.start_ms);
     event.endTime = date_time(fields.end_ms);
-    let (start_zone, end_zone) = event_zones(fields);
-    event.startTimeZone = start_zone;
-    event.endTimeZone = end_zone;
-    event.organizer = fields.organizer.as_ref().map(event_organizer);
+    // A timed body without a `TZID` (the UTC form) names no zone: the
+    // stored zones stay. An all-day event stores none.
+    if let Some((start_zone, end_zone)) = event_zones(fields) {
+        event.startTimeZone = start_zone;
+        event.endTimeZone = end_zone;
+    }
+    // The importer only ever maps the organizer's address. Keep a
+    // stored display name when the same address stays the organizer.
+    let preserved_name = fields.organizer.as_ref().and_then(|person| {
+        event
+            .organizer
+            .as_ref()
+            .filter(|stored| {
+                !stored.name.is_empty() && stored.address.eq_ignore_ascii_case(&person.address)
+            })
+            .map(|stored| stored.name.clone())
+    });
+    event.organizer = fields.organizer.as_ref().map(|person| {
+        let mut organizer = event_organizer(person);
+        if let Some(name) = &preserved_name {
+            organizer.name = name.clone();
+        }
+        organizer
+    });
     if event.uid.is_none() {
         event.uid = fields.uid.clone();
+        // Web-client parity (`CalendarFacade.hashUid`): the hash is the
+        // SHA-256 of the uid's UTF-8 bytes, stored as the raw 32
+        // bytes. A repaired legacy event gets both, so a later edit in
+        // the Tuta client matches it.
+        if let Some(uid) = &event.uid {
+            event.hashedUid = Some(sha256(uid.as_bytes()));
+        }
     }
-    // The progenitor's rule is updated, not replaced: keep its id.
+    // The progenitor's rule is updated, not replaced: keep its id. A
+    // UTC-form body carries no `TZID`, so a body echoing absolute
+    // instants must not flip the series' wall-clock anchor: a timed
+    // rule keeps the loaded rule's zone. Without a stored zone the
+    // incoming zone stays (one is never invented).
     let rule_id = event.repeatRule.as_ref().and_then(|rule| rule._id.clone());
-    event.repeatRule = fields
-        .repeat
+    let loaded_rule_zone = event
+        .repeatRule
         .as_ref()
-        .map(|rule| repeat_rule(rule, rule_id));
+        .map(|rule| rule.timeZone.clone())
+        .filter(|zone| !zone.is_empty());
+    event.repeatRule = fields.repeat.as_ref().map(|rule| {
+        let mut mapped = repeat_rule(rule, rule_id);
+        if !fields.all_day && fields.time_zone.is_none() {
+            if let Some(zone) = &loaded_rule_zone {
+                mapped.timeZone = zone.clone();
+            }
+        }
+        mapped
+    });
     event.sequence = event.sequence.saturating_add(1);
 }
 
@@ -514,6 +543,19 @@ pub fn choose_event_list<'a>(calendar: &'a CalendarRef, fields: &EventFields) ->
         Some(rule) if rule.end_type == REPEAT_END_NEVER => &calendar.long_list_id,
         _ => &calendar.short_list_id,
     }
+}
+
+/// The event a `put_event` updates: a create is refused with the same
+/// fixed sentence the handler answers a creation `PUT` with. Creating
+/// events is upstream-blocked, since the pinned SDK cannot create
+/// Tuta's custom-id events.
+fn update_target(existing: Option<&EventRef>) -> Result<&EventRef> {
+    existing.ok_or_else(|| {
+        Error::Unsupported(
+            "creating events is not supported: create them in the Tuta client, then edit them here"
+                .into(),
+        )
+    })
 }
 
 /// The URL of the raw entity DELETE the web client's
@@ -672,45 +714,27 @@ impl ContactWriter for TutaDavWriter {
 impl CalendarWriter for TutaDavWriter {
     async fn put_event(
         &self,
-        calendar: &CalendarRef,
+        _calendar: &CalendarRef,
         fields: &EventFields,
         existing: Option<&EventRef>,
     ) -> Result<EventRef> {
+        let existing = update_target(existing)?;
         let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
-        if let Some(existing) = existing {
-            let id = IdTupleCustom::new(
-                GeneratedId(existing.list_id.clone()),
-                CustomId(existing.element_id.clone()),
-            );
-            let mut event: CalendarEvent =
-                crypto_client.load(&id).await.map_err(|_| write_failed())?;
-            apply_event_fields(&mut event, fields);
-            crypto_client
-                .update_instance(event)
-                .await
-                .map_err(|_| write_failed())?;
-            Ok(EventRef {
-                list_id: existing.list_id.clone(),
-                element_id: existing.element_id.clone(),
-            })
-        } else {
-            let list_id = choose_event_list(calendar, fields);
-            let (key, session_key) = self.owner_key_material(&calendar.group_id).await?;
-            let uid = fields
-                .uid
-                .clone()
-                .unwrap_or_else(|| generated_event_uid(&calendar.group_id, now_ms()));
-            let event = event_entity(fields, list_id, &calendar.group_id, &uid, &key);
-            let created = crypto_client
-                .create_instance(event, Some(session_key))
-                .await
-                .map_err(|_| write_failed())?;
-            let element_id = created.generatedId.ok_or_else(write_failed)?.0;
-            Ok(EventRef {
-                list_id: list_id.to_string(),
-                element_id,
-            })
-        }
+        let id = IdTupleCustom::new(
+            GeneratedId(existing.list_id.clone()),
+            CustomId(existing.element_id.clone()),
+        );
+        let mut event: CalendarEvent = crypto_client.load(&id).await.map_err(|_| write_failed())?;
+        attendee_gate(&event)?;
+        apply_event_fields(&mut event, fields);
+        crypto_client
+            .update_instance(event)
+            .await
+            .map_err(|_| write_failed())?;
+        Ok(EventRef {
+            list_id: existing.list_id.clone(),
+            element_id: existing.element_id.clone(),
+        })
     }
 
     async fn delete_event(&self, _calendar: &CalendarRef, id: &EventRef) -> Result<DeleteOutcome> {
@@ -944,66 +968,223 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_new_event_maps_every_field_one_by_one() {
-        let event = event_entity(&event_fields(), "list", "group", "uid-1", &key());
-        assert_eq!(
-            event._id,
-            Some(IdTupleCustom {
+    /// A loaded event fixture shaped like the update path sees one: the
+    /// fields of `event_fields()` as stored, with `uid` as the stored
+    /// identity.
+    fn stored_event(uid: &str) -> CalendarEvent {
+        let fields = event_fields();
+        let (start_zone, end_zone) = event_zones(&fields).unwrap_or_default();
+        CalendarEvent {
+            _id: Some(IdTupleCustom {
                 list_id: GeneratedId("list".into()),
-                element_id: CustomId(String::new()),
-            })
-        );
-        assert_eq!(event._ownerGroup, Some(GeneratedId("group".into())));
-        assert_eq!(
-            event._ownerEncSessionKey.as_deref(),
-            Some(&b"owner-enc"[..])
-        );
-        assert_eq!(event._ownerKeyVersion, Some(7));
-        assert_eq!(event._format, 0);
-        assert_eq!(event.summary, "Summary");
-        assert_eq!(event.description, "Description");
-        assert_eq!(event.location, "Location");
-        assert_eq!(event.startTime.as_millis(), 1_700_000_000_000);
-        assert_eq!(event.endTime.as_millis(), 1_700_003_600_000);
-        assert_eq!(event.startTimeZone.as_deref(), Some("Europe/Rome"));
-        assert_eq!(event.endTimeZone.as_deref(), Some("Europe/Rome"));
-        assert_eq!(event.uid.as_deref(), Some("uid-1"));
-        assert_eq!(event.sequence, 0);
-        assert_eq!(event.hashedUid, None);
-        assert_eq!(event.recurrenceId, None);
-        assert_eq!(event.sender, None);
-        assert_eq!(event.invitedConfidentially, Some(false));
-        assert_eq!(event.pendingInvitation, Some(false));
-        assert!(event.alarmInfos.is_empty());
-        assert!(event.attendees.is_empty());
-        assert_eq!(
-            event
-                .organizer
-                .as_ref()
-                .map(|organizer| organizer.address.clone()),
-            Some("me@tuta.example".into())
-        );
-        let rule = event.repeatRule.unwrap();
-        assert_eq!(rule.frequency, 1);
-        assert_eq!(rule.endType, 1);
-        assert_eq!(rule.endValue, Some(5));
-        assert_eq!(rule.interval, 2);
-        assert_eq!(rule.timeZone, "Europe/Rome");
-        assert_eq!(rule.excludedDates.len(), 1);
-        assert_eq!(rule.excludedDates[0].date.as_millis(), 1_700_000_000_000);
-        assert_eq!(rule.advancedRules.len(), 1);
-        assert_eq!(rule.advancedRules[0].ruleType, 2);
-        assert_eq!(rule.advancedRules[0].interval, "MO");
+                element_id: CustomId("element".into()),
+            }),
+            _permissions: Default::default(),
+            _format: 0,
+            _ownerGroup: Some(GeneratedId("group".into())),
+            _ownerEncSessionKey: Some(b"owner-enc".to_vec()),
+            _ownerKeyVersion: Some(7),
+            _kdfNonce: None,
+            summary: "Stored summary".into(),
+            description: "Stored description".into(),
+            startTime: date_time(fields.start_ms),
+            endTime: date_time(fields.end_ms),
+            location: "Stored location".into(),
+            uid: Some(uid.to_string()),
+            hashedUid: None,
+            sequence: 0,
+            invitedConfidentially: Some(false),
+            recurrenceId: None,
+            sender: None,
+            pendingInvitation: Some(false),
+            startTimeZone: start_zone,
+            endTimeZone: end_zone,
+            repeatRule: fields.repeat.as_ref().map(|rule| repeat_rule(rule, None)),
+            alarmInfos: Vec::new(),
+            attendees: Vec::new(),
+            organizer: fields.organizer.as_ref().map(event_organizer),
+            _errors: Default::default(),
+        }
+    }
+
+    fn attendee(address: &str) -> CalendarEventAttendee {
+        CalendarEventAttendee {
+            _id: None,
+            status: 1,
+            address: EncryptedMailAddress {
+                _id: None,
+                name: "Guest".into(),
+                address: address.into(),
+                _errors: Default::default(),
+            },
+            _errors: Default::default(),
+        }
     }
 
     #[test]
-    fn an_all_day_event_stores_no_zone_and_times_clamp_to_the_epoch() {
+    fn an_event_create_is_refused_with_the_creation_sentence() {
+        let error = update_target(None).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "unsupported: creating events is not supported: create them in the Tuta client, \
+then edit them here"
+        );
+        let existing = EventRef {
+            list_id: "list".into(),
+            element_id: "element".into(),
+        };
+        assert_eq!(
+            update_target(Some(&existing)).unwrap().element_id,
+            "element"
+        );
+    }
+
+    #[test]
+    fn a_loaded_event_with_a_foreign_attendee_is_refused() {
+        let mut event = stored_event("uid-1");
+        // Without an organizer every attendee counts.
+        event.organizer = None;
+        event.attendees = vec![attendee("guest@x.example")];
+        let error = attendee_gate(&event).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "unsupported: events with attendees cannot be edited through the bridge"
+        );
+
+        // The organizer itself, only letter case differing, is not
+        // foreign.
+        event.organizer = Some(EncryptedMailAddress {
+            _id: None,
+            name: String::new(),
+            address: "me@tuta.example".into(),
+            _errors: Default::default(),
+        });
+        event.attendees = vec![attendee("ME@TUTA.EXAMPLE")];
+        assert!(attendee_gate(&event).is_ok());
+
+        // Any other address is foreign, even beside the organizer.
+        event.attendees.push(attendee("guest@x.example"));
+        assert!(matches!(attendee_gate(&event), Err(Error::Unsupported(_))));
+
+        // No attendees at all: the ordinary update path.
+        event.attendees.clear();
+        assert!(attendee_gate(&event).is_ok());
+    }
+
+    #[test]
+    fn an_echoed_description_keeps_the_stored_html() {
+        let mut event = stored_event("stored-uid");
+        event.description = "<p>Description</p>".into();
+        let mut fields = event_fields();
+        fields.summary = "Edited title".into();
+        // A title-only edit leaves the stored HTML untouched.
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.description, "<p>Description</p>");
+
+        // A changed description is regenerated as HTML.
+        fields.description = "one\ntwo".into();
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.description, text_to_html("one\ntwo"));
+        assert!(event.description.contains("<br>"));
+
+        // An empty stored description takes the incoming text.
+        event.description = String::new();
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.description, text_to_html("one\ntwo"));
+    }
+
+    #[test]
+    fn a_utc_form_body_keeps_the_stored_zones() {
+        let mut event = stored_event("stored-uid");
+        event.startTimeZone = Some("Europe/Berlin".into());
+        event.endTimeZone = Some("Europe/Berlin".into());
+        let mut fields = event_fields();
+        fields.time_zone = None;
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.startTimeZone.as_deref(), Some("Europe/Berlin"));
+        assert_eq!(event.endTimeZone.as_deref(), Some("Europe/Berlin"));
+
+        fields.time_zone = Some("Europe/Rome".into());
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.startTimeZone.as_deref(), Some("Europe/Rome"));
+        assert_eq!(event.endTimeZone.as_deref(), Some("Europe/Rome"));
+    }
+
+    #[test]
+    fn a_utc_form_body_keeps_the_loaded_rule_zone() {
+        let mut event = stored_event("stored-uid");
+        event.repeatRule.as_mut().unwrap().timeZone = "Europe/Berlin".into();
+        let mut fields = event_fields();
+        // The UTC form names no zone: the applied rule keeps the
+        // series' wall-clock anchor.
+        fields.time_zone = None;
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.repeatRule.as_ref().unwrap().timeZone, "Europe/Berlin");
+
+        // An explicit TZID uses the fields' zone as before.
+        fields.time_zone = Some("Europe/Rome".into());
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.repeatRule.as_ref().unwrap().timeZone, "Europe/Rome");
+    }
+
+    #[test]
+    fn a_same_address_organizer_keeps_the_stored_name() {
+        let mut event = stored_event("stored-uid");
+        event.organizer = Some(EncryptedMailAddress {
+            _id: None,
+            name: "Stored Name".into(),
+            address: "me@tuta.example".into(),
+            _errors: Default::default(),
+        });
+        let mut fields = event_fields();
+        fields.organizer = Some(EventPerson {
+            name: String::new(),
+            address: "ME@TUTA.EXAMPLE".into(),
+        });
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.organizer.as_ref().unwrap().name, "Stored Name");
+        assert_eq!(event.organizer.as_ref().unwrap().address, "ME@TUTA.EXAMPLE");
+
+        // A different address keeps the fields' (empty) name.
+        fields.organizer = Some(EventPerson {
+            name: String::new(),
+            address: "other@tuta.example".into(),
+        });
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.organizer.as_ref().unwrap().name, "");
+        assert_eq!(
+            event.organizer.as_ref().unwrap().address,
+            "other@tuta.example"
+        );
+    }
+
+    #[test]
+    fn a_legacy_uid_repair_hashes_the_uid_like_the_web_client() {
+        let mut event = stored_event("filled-later");
+        event.uid = None;
+        event.hashedUid = None;
+        let mut fields = event_fields();
+        fields.uid = Some("client-uid".into());
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.uid.as_deref(), Some("client-uid"));
+        assert_eq!(event.hashedUid, Some(sha256(b"client-uid")));
+
+        // A stored uid is identity: neither it nor its hash changes.
+        let mut stored = stored_event("stored-uid");
+        stored.hashedUid = Some(vec![1, 2, 3]);
+        apply_event_fields(&mut stored, &fields);
+        assert_eq!(stored.uid.as_deref(), Some("stored-uid"));
+        assert_eq!(stored.hashedUid, Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn an_all_day_edit_clears_the_zones_and_times_clamp_to_the_epoch() {
+        let mut event = stored_event("stored-uid");
         let mut fields = event_fields();
         fields.all_day = true;
         fields.time_zone = Some("Europe/Rome".into());
         fields.start_ms = -1;
-        let event = event_entity(&fields, "list", "group", "uid-1", &key());
+        apply_event_fields(&mut event, &fields);
         assert_eq!(event.startTimeZone, None);
         assert_eq!(event.endTimeZone, None);
         assert_eq!(event.startTime.as_millis(), 0);
@@ -1011,23 +1192,13 @@ mod tests {
 
     #[test]
     fn applying_event_fields_keeps_identity_and_bumps_the_sequence() {
-        let mut event = event_entity(&event_fields(), "list", "group", "stored-uid", &key());
+        let mut event = stored_event("stored-uid");
         event.sequence = 3;
         event.alarmInfos = vec![IdTupleGenerated::new(
             GeneratedId("alarms".into()),
             GeneratedId("alarm".into()),
         )];
-        event.attendees = vec![CalendarEventAttendee {
-            _id: None,
-            status: 1,
-            address: EncryptedMailAddress {
-                _id: None,
-                name: "Guest".into(),
-                address: "guest@x.example".into(),
-                _errors: Default::default(),
-            },
-            _errors: Default::default(),
-        }];
+        event.attendees = vec![attendee("guest@x.example")];
         event.repeatRule.as_mut().unwrap()._id = Some(CustomId("rule-id".into()));
 
         let mut fields = event_fields();
@@ -1066,16 +1237,6 @@ mod tests {
         apply_event_fields(&mut event, &cleared);
         assert!(event.repeatRule.is_none());
         assert_eq!(event.sequence, 5);
-    }
-
-    #[test]
-    fn a_legacy_event_without_a_uid_takes_the_fields_one() {
-        let mut event = event_entity(&event_fields(), "list", "group", "filled-later", &key());
-        event.uid = None;
-        let mut fields = event_fields();
-        fields.uid = Some("client-uid".into());
-        apply_event_fields(&mut event, &fields);
-        assert_eq!(event.uid.as_deref(), Some("client-uid"));
     }
 
     #[test]
@@ -1144,10 +1305,5 @@ mod tests {
             delete_outcome(500).unwrap_err().to_string(),
             "network error: dav write failed"
         );
-    }
-
-    #[test]
-    fn a_generated_uid_follows_the_web_client_shape() {
-        assert_eq!(generated_event_uid("group-id", 5), "group-id5@tuta.com");
     }
 }
