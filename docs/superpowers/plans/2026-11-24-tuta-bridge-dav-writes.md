@@ -10,7 +10,7 @@ DAV equivalent of what M6 did for IMAP.
 `CryptoEntityClient::create_instance` / `update_instance` (the SDK derives
 the session key and owner-encrypts it, the same way the web client writes
 these entities - no hand-rolled cryptography, unlike the SMTP draft path)
-and `EntityClient::erase_list_element` for deletions. The DAV handlers gain
+and a raw authenticated DELETE on the entity REST endpoint for deletions (decision 8: the SDK's `erase_list_element` is a `todo!()` at the pinned rev). The DAV handlers gain
 `PUT` and `DELETE` dispatch with RFC preconditions (`If-Match`,
 `If-None-Match: *`); every other write method stays the existing fixed
 `403`. After the remote write succeeds, the handler applies an optimistic
@@ -64,6 +64,19 @@ calendar rows already carry everything the write path needs).
    calendars, alarms carried to Tuta, photo import, per-occurrence
    edits, address-book or calendar creation and deletion (`MKCOL` stays
    the fixed 403).
+
+8. **Deletions go through the raw entity DELETE, mirroring the web
+   client.** The pinned SDK's `EntityClient::erase_list_element` (and
+   `erase_element`) is a `todo!()` - calling it would panic at runtime, and
+   no facade or generated service deletes single instances. The web
+   client's `entityClient.erase` is a plain authenticated
+   `DELETE /rest/tutanota/{contact|calendarevent}/{listId}/{elementId}`
+   with no cryptography involved, and the bridge already speaks that
+   dialect (the `SecondFactorAuthService` cancellation in
+   `pre_session.rs`). The writer issues the same DELETE through the
+   session's `RestClient` with `cv`, `v` (type model version 118 for both
+   types) and `accessToken`; a 404 maps to "already gone", auth failures
+   to the session error, everything else to the fixed network error.
 
 ## Global Constraints
 
