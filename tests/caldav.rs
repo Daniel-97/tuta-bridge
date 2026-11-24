@@ -137,13 +137,7 @@ async fn over(source: Arc<FakeCalendarSource>, store: Arc<SqliteStateStore>) -> 
         Arc::clone(&clock) as Arc<dyn Clock>,
     ));
     sync.reload().await.unwrap();
-    let handler = Arc::new(CalDavHandler {
-        account_id,
-        user_address: USER.into(),
-        store: Arc::clone(&store) as Arc<dyn CalendarStore>,
-        source: Arc::clone(&source) as _,
-        clock: Arc::clone(&clock) as Arc<dyn Clock>,
-    });
+    let handler = Arc::new(CalDavHandler::new(Arc::clone(&sync), USER.into()));
     Fixture {
         source,
         store,
@@ -422,7 +416,7 @@ async fn thunderbird_discovery_finds_every_calendar() {
         "<cal:supported-calendar-component-set><cal:comp name=\"VEVENT\"/></cal:supported-calendar-component-set>"
     ));
     assert!(work.contains(
-        "<d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set>"
+        "<d:current-user-privilege-set><d:privilege><d:read/></d:privilege><d:privilege><d:read-current-user-privilege-set/></d:privilege><d:privilege><d:write/></d:privilege></d:current-user-privilege-set>"
     ));
     assert!(work.contains("<cal:calendar-multiget/>"));
     assert!(work.contains("<cal:calendar-query/>"));

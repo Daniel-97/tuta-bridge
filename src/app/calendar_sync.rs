@@ -15,6 +15,11 @@
 //! refreshes the list. A lookup that fails marks the cache stale and
 //! the next batch reloads it in full instead.
 //!
+//! The DAV write path lands an accepted remote change through
+//! [`CalendarSync::apply_written`] and [`CalendarSync::apply_deleted`]:
+//! the same upsert and removal a batch applies, so the echo of the
+//! same change is a no-op against them.
+//!
 //! Reports carry counters only.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,8 +30,8 @@ use crate::domain::calendar::{
     USER_SETTINGS_GROUP_ROOT_TYPE_ID, USER_TYPE_ID,
 };
 use crate::domain::{
-    CalendarInfo, EntityEvent, EntityOperation, EventBatch, Result, CALENDAR_EVENT_TYPE_ID,
-    TUTANOTA_APP,
+    CalendarInfo, CalendarRow, EntityEvent, EntityOperation, EventBatch, Result,
+    CALENDAR_EVENT_TYPE_ID, TUTANOTA_APP,
 };
 use crate::ports::calendar::{CalendarSource, CalendarStore};
 use crate::ports::clock::Clock;
@@ -286,6 +291,35 @@ impl CalendarSync {
         }
         report.calendars = calendars.len();
         Ok(calendars)
+    }
+
+    /// Apply one event write the remote side has already accepted: the
+    /// row the reader derives from the reloaded event (fingerprint and
+    /// all), upserted the same way a refresh upserts it.
+    /// An unchanged fingerprint keeps the stored row as it is — the echo
+    /// of the same change counts once. The loading window a batch
+    /// applies is deliberately absent: a write that moves an event
+    /// beyond the window keeps its row until the echo removes it,
+    /// exactly as an edit made in the Tuta client does, so the client
+    /// sees the write it just made. A store failure marks the cache
+    /// stale so the next batch reloads and heals it.
+    pub async fn apply_written(&self, row: &CalendarRow) -> Result<CalendarRow> {
+        self.store
+            .upsert_calendar_row(self.account_id, row)
+            .await
+            .inspect_err(|_| self.mark_stale())
+    }
+
+    /// Apply one event deletion the remote side has already confirmed:
+    /// the row is removed the same way a delete event removes it — the
+    /// calendar cache keeps no tombstones. A store failure marks the
+    /// cache stale so the next batch reloads and heals it.
+    pub async fn apply_deleted(&self, list_id: &str, element_id: &str) -> Result<()> {
+        self.store
+            .remove_calendar_row(self.account_id, list_id, element_id)
+            .await
+            .inspect_err(|_| self.mark_stale())
+            .map(|_| ())
     }
 }
 

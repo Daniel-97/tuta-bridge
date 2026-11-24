@@ -907,17 +907,13 @@ impl ServeUseCase {
                 })?;
                 let sync = Arc::new(CalendarSync::new(
                     account_id,
-                    Arc::clone(&store),
-                    Arc::clone(&source),
-                    Arc::clone(&self.clock),
-                ));
-                let handler: Arc<dyn crate::adapters::dav::DavHandler> = Arc::new(CalDavHandler {
-                    account_id,
-                    user_address: session.account().mail_address,
                     store,
                     source,
-                    clock: Arc::clone(&self.clock),
-                });
+                    Arc::clone(&self.clock),
+                ));
+                let handler: Arc<dyn crate::adapters::dav::DavHandler> = Arc::new(
+                    CalDavHandler::new(Arc::clone(&sync), session.account().mail_address),
+                );
                 Some((caldav_port, sync, handler))
             }
             None => None,
