@@ -3,6 +3,7 @@
 //! ([`vcard`]).
 
 pub mod handler;
+pub mod import;
 pub mod vcard;
 
 pub use handler::CardDavHandler;
