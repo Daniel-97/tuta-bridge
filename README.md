@@ -12,8 +12,8 @@ Rust SDK, decrypts locally, and serves everything over standard protocols on
 | **IMAP** (TLS) | `9930` | always on | folders, mail, attachments, read/unread, **move**, **delete**, search, IDLE push |
 | **POP3S** | `9950` | `pop3_port` | read-only Inbox download; mail always stays on the server |
 | **SMTP submission** | `9925` | `smtp_port` | send mail: attachments, Bcc, aliases — see the warning below |
-| **CardDAV** | `9932` | `carddav_port` | read-only contacts (vCard 4.0), address auto-complete |
-| **CalDAV** | `9933` | `caldav_port` | read-only calendars: recurring events, time zones, reminders |
+| **CardDAV** | `9932` | `carddav_port` | read/write contacts (vCard 4.0), address auto-complete |
+| **CalDAV** | `9933` | `caldav_port` | read/write calendars: recurring events, time zones, reminders |
 
 All listeners share the same design: `127.0.0.1` only, one self-signed
 certificate, one bridge password, bounded connections, and live updates
@@ -91,9 +91,23 @@ other standard clients work too — see the detailed reference.
   operations yet.)
 - **`dump` writes plaintext.** The `.eml` files are your decrypted mail;
   put them somewhere private and delete them when done.
-- **CardDAV and CalDAV are read-only**: edits in your client are refused
-  (`403`), the same way IMAP writes once were. POP3 never deletes from the
-  server.
+- **What the DAV writes cannot do**: contacts get full create, update
+  and delete (contact creation is the one DAV write not yet exercised
+  against the live server — see the acceptance checklist in NOTES.md);
+  calendars accept edits and deletions of existing events but cannot
+  create events (the pinned SDK cannot create them — create them in the
+  Tuta client, then edit them here). Editing a single occurrence of a
+  series (`RECURRENCE-ID`, `EXDATE`) is refused, and so is any
+  recurrence shape the exporter never emits: a rule is never accepted
+  and then mangled. Three shapes the bridge itself serves also cannot be
+  written back — advanced recurrence options, the leap-year
+  end-of-February clamp, and events whose repeat rule cannot be
+  expressed in iCalendar (served as a single occurrence); saving the
+  last kind in a client would drop the repetition. Edit these in the
+  Tuta client. Reminders set by clients are not carried to Tuta
+  (`VALARM` is accepted and ignored). An event's organizer must be an
+  address of the account; aliases are refused with `403`. POP3 never
+  deletes from the server.
 
 One account at a time. Exit codes, per-protocol limits, field mappings and
 troubleshooting live in the

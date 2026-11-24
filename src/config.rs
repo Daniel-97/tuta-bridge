@@ -31,7 +31,7 @@ pub struct Config {
     /// without this key `serve` does not serve contacts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub carddav_port: Option<u16>,
-    /// The CalDAV (HTTPS, read-only) listen port. CalDAV is opt-in:
+    /// The CalDAV (HTTPS) listen port. CalDAV is opt-in:
     /// without this key `serve` does not serve calendars. Suggested:
     /// 9933.
     #[serde(skip_serializing_if = "Option::is_none")]
