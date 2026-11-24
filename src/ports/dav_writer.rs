@@ -10,6 +10,8 @@
 //! Like every data-carrying port type, these types do not implement
 //! `Debug`: they hold personal data.
 
+use std::sync::Arc;
+
 use crate::domain::{ContactField, ContactRelation, EventPerson, RepeatRule, Result};
 
 /// The `(list id, element id)` of a `Contact`, exactly as the store
@@ -141,4 +143,14 @@ pub trait CalendarWriter: Send + Sync {
     /// Delete one event; [`DeleteOutcome::Gone`] when it had already
     /// vanished remotely.
     async fn delete_event(&self, calendar: &CalendarRef, id: &EventRef) -> Result<DeleteOutcome>;
+}
+
+/// The DAV write seams of one session, handed to `serve` together:
+/// one writer per listener, both backed by the same logged-in state.
+///
+/// Like every data-carrying port type, this one does not implement
+/// `Debug`: it hands out personal data.
+pub struct DavWriters {
+    pub contacts: Arc<dyn ContactWriter>,
+    pub calendar: Arc<dyn CalendarWriter>,
 }

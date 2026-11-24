@@ -31,6 +31,16 @@ pub trait ContactSource: Send + Sync {
     /// The whole address book.
     async fn contacts(&self) -> Result<ContactListing>;
 
+    /// The id of the account's own contact list, resolved
+    /// structurally — never learned from a rendered card, so an
+    /// empty address book knows its list too.
+    ///
+    /// `Ok(None)` when the source cannot resolve it (the book falls
+    /// back to the id of the first card); an error means the
+    /// resolution was attempted and failed, and never fails the
+    /// load that asked for it.
+    async fn contact_list_id(&self) -> Result<Option<String>>;
+
     /// One contact: found, gone, or present but undecryptable.
     async fn contact(&self, list_id: &str, element_id: &str) -> Result<ContactLookup>;
 }
@@ -41,6 +51,12 @@ pub struct NoContacts;
 #[async_trait::async_trait]
 impl ContactSource for NoContacts {
     async fn contacts(&self) -> Result<ContactListing> {
+        Err(Error::Unsupported(
+            "contacts are not supported by this session".into(),
+        ))
+    }
+
+    async fn contact_list_id(&self) -> Result<Option<String>> {
         Err(Error::Unsupported(
             "contacts are not supported by this session".into(),
         ))

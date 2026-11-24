@@ -5,6 +5,7 @@ use secrecy::SecretString;
 
 use super::calendar::CalendarSource;
 use super::contact_source::{ContactSource, NoContacts};
+use super::dav_writer::DavWriters;
 use super::event_stream::EventHandles;
 use super::mail_sender::{MailSender, OutgoingMail};
 use super::mail_source::MailSource;
@@ -58,6 +59,14 @@ pub trait Session: Send + Sync {
     /// The calendar seam `serve` hands to the CalDAV listener. Defaults
     /// to none: adapters without calendars serve no CalDAV.
     fn shared_calendar(&self) -> Option<Arc<dyn CalendarSource>> {
+        None
+    }
+
+    /// The DAV write seams `serve` hands to the CardDAV and CalDAV
+    /// listeners together. Defaults to none: adapters without DAV
+    /// write support keep both listeners read-only (every `PUT` and
+    /// `DELETE` answers the fixed refusal).
+    fn shared_dav_writer(&self) -> Option<DavWriters> {
         None
     }
 

@@ -25,8 +25,8 @@ use tuta_bridge::ports::renderer::MessageRenderer;
 use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
 use tuta_bridge::ports::state_store::StateStore;
 use tuta_bridge::ports::{
-    CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DeleteOutcome,
-    EventFields, EventRef,
+    CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DavWriters,
+    DeleteOutcome, EventFields, EventRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1166,9 @@ pub struct FakeEventSession {
     pub contacts: Arc<FakeContactSource>,
     /// The calendar seam handed to `serve` through `shared_calendar`.
     pub calendar: Option<Arc<FakeCalendarSource>>,
+    /// The DAV write seams handed to `serve` through
+    /// `shared_dav_writer`; `None` keeps both listeners read-only.
+    pub dav_writers: Option<(Arc<FakeContactWriter>, Arc<FakeCalendarWriter>)>,
 }
 
 impl FakeEventSession {
@@ -1183,12 +1186,23 @@ impl FakeEventSession {
             writer: Arc::new(FakeMailboxWriter::new()),
             contacts: Arc::new(FakeContactSource::new(Vec::new())),
             calendar: None,
+            dav_writers: None,
         }
     }
 
     /// Hand out `calendar` through `shared_calendar`.
     pub fn with_calendar(mut self, calendar: Arc<FakeCalendarSource>) -> Self {
         self.calendar = Some(calendar);
+        self
+    }
+
+    /// Hand out both DAV write seams through `shared_dav_writer`.
+    pub fn with_dav_writers(
+        mut self,
+        contact_writer: Arc<FakeContactWriter>,
+        calendar_writer: Arc<FakeCalendarWriter>,
+    ) -> Self {
+        self.dav_writers = Some((contact_writer, calendar_writer));
         self
     }
 
@@ -1272,6 +1286,16 @@ impl Session for FakeEventSessionHandle {
             .calendar
             .as_ref()
             .map(|calendar| Arc::clone(calendar) as Arc<dyn CalendarSource>)
+    }
+
+    fn shared_dav_writer(&self) -> Option<DavWriters> {
+        self.0
+            .dav_writers
+            .as_ref()
+            .map(|(contacts, calendar)| DavWriters {
+                contacts: Arc::clone(contacts) as Arc<dyn ContactWriter>,
+                calendar: Arc::clone(calendar) as Arc<dyn CalendarWriter>,
+            })
     }
 
     async fn events(
@@ -1873,6 +1897,9 @@ pub struct FakeContactSource {
     pub single_loads: AtomicUsize,
     /// Element ids of contacts that exist but do not decrypt.
     pub undecryptable: Mutex<Vec<String>>,
+    /// The id `contact_list_id` resolves; `None` (the default) keeps
+    /// the book's legacy inference from the first card.
+    pub list_id: Mutex<Option<String>>,
 }
 
 impl FakeContactSource {
@@ -1883,7 +1910,13 @@ impl FakeContactSource {
             full_loads: AtomicUsize::new(0),
             single_loads: AtomicUsize::new(0),
             undecryptable: Mutex::new(Vec::new()),
+            list_id: Mutex::new(None),
         }
+    }
+
+    /// Make `contact_list_id` resolve to `list_id`.
+    pub fn set_list_id(&self, list_id: &str) {
+        *self.list_id.lock().unwrap() = Some(list_id.to_string());
     }
 
     /// Make the contact `element_id` fail to decrypt (or decrypt again).
@@ -2117,6 +2150,10 @@ impl FakeCalendarSource {
 
 #[async_trait::async_trait]
 impl tuta_bridge::ports::contact_source::ContactSource for FakeContactSource {
+    async fn contact_list_id(&self) -> Result<Option<String>> {
+        Ok(self.list_id.lock().unwrap().clone())
+    }
+
     async fn contacts(&self) -> Result<tuta_bridge::ports::contact_source::ContactListing> {
         self.full_loads.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {

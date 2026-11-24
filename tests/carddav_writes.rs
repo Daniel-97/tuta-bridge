@@ -636,6 +636,29 @@ async fn a_create_without_a_known_list_answers_409() {
     assert!(hrefs_with_etags(&listing.body).is_empty());
 }
 
+// Decision 10: the list id is resolved structurally on every load,
+// so a book with no cards at all still knows where a create must
+// land; the first contact does not have to exist first.
+#[tokio::test]
+async fn an_empty_book_with_a_resolved_list_id_creates() {
+    let (book, source) = book_with(Vec::new()).await;
+    source.set_list_id(LIST);
+    let writer = Arc::new(FakeContactWriter::new().answering_create(LIST, "srv-40"));
+    let mut wire = spawn(Arc::clone(&book), Arc::clone(&writer));
+
+    let body = render_vcard(&card("fresh", "New", "Person", "new@example.invalid"));
+    let response = wire
+        .request("PUT", "/addressbooks/contacts/fresh.vcf", &[], &body)
+        .await;
+    assert_eq!(response.status, 201);
+    assert_eq!(
+        response.header("Location"),
+        Some("/addressbooks/contacts/srv-40.vcf")
+    );
+    // The create addressed the structurally resolved list, not a card.
+    assert!(writer.put_calls() == [(LIST.to_string(), None)]);
+}
+
 #[tokio::test]
 async fn write_methods_are_advertised_and_collections_refuse_writes() {
     let (book, _) = book_with(three_cards()).await;

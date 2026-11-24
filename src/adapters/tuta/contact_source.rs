@@ -1,17 +1,22 @@
 //! Load the user's contacts through the SDK's decryption path.
 //!
 //! The whole book comes from `ContactFacade::load_all_user_contacts`,
-//! one contact from the crypto entity client (for event refreshes).
-//! Contacts whose fields failed to decrypt are skipped, and reported
-//! as undecryptable (not gone) so the cache keeps them. Every SDK
+//! one contact from the crypto entity client (for event refreshes),
+//! and the account's contact list id from the same chain the facade's
+//! private `fetch_contact_lists` walks (see [`TutaContactSource`]),
+//! so a write never has to learn it from a rendered card. Contacts
+//! whose fields failed to decrypt are skipped, and reported as
+//! undecryptable (not gone) so the cache keeps them. Every SDK
 //! failure maps to one fixed [`Error::Network`] message: names,
 //! addresses and ids never appear in errors or logs.
 
 use std::sync::Arc;
 
-use tutasdk::entities::generated::tutanota::Contact;
+use tutasdk::entities::generated::sys::RootInstance;
+use tutasdk::entities::generated::tutanota::{Contact, ContactList};
+use tutasdk::entities::Entity;
 use tutasdk::rest_error::HttpError;
-use tutasdk::{ApiCallError, GeneratedId, IdTupleGenerated, LoggedInSdk};
+use tutasdk::{ApiCallError, GeneratedId, IdTupleCustom, IdTupleGenerated, LoggedInSdk};
 
 use crate::domain::{
     ContactCard, ContactField, ContactFieldKind, ContactRelation, ContactRelationKind, Error,
@@ -36,6 +41,36 @@ fn contacts_unavailable() -> Error {
 
 #[async_trait::async_trait]
 impl ContactSource for TutaContactSource {
+    /// The account's contact list id, resolved the way the facade's
+    /// private `fetch_contact_lists` resolves it: load the
+    /// `RootInstance` at `(user group id, ContactList root id)` —
+    /// the root id from the resolved type model — then the
+    /// `ContactList` it references, whose `contacts` field is the
+    /// list id. Structural, so it works for an empty address book
+    /// too; a card is never consulted.
+    async fn contact_list_id(&self) -> Result<Option<String>> {
+        let user_group_id = self.logged.get_user_group_id();
+        let type_root = self
+            .logged
+            .type_model_provider
+            .resolve_client_type_ref(&ContactList::type_ref())
+            .ok_or_else(contacts_unavailable)?;
+        let root_instance_id = IdTupleCustom {
+            list_id: user_group_id,
+            element_id: type_root.root_id.clone(),
+        };
+        let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+        let root_instance = crypto_client
+            .load::<RootInstance, IdTupleCustom>(&root_instance_id)
+            .await
+            .map_err(|_| contacts_unavailable())?;
+        let contact_list = crypto_client
+            .load::<ContactList, GeneratedId>(&root_instance.reference)
+            .await
+            .map_err(|_| contacts_unavailable())?;
+        Ok(Some(contact_list.contacts.as_str().to_string()))
+    }
+
     async fn contacts(&self) -> Result<ContactListing> {
         let contacts = self
             .logged

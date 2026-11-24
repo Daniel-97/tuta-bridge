@@ -9,6 +9,12 @@
 //! stored. Every write runs under one lock, so a slow full load and an
 //! event refresh never interleave.
 //!
+//! Every load also records the address book's contact list id,
+//! resolved structurally through the source (never learned from a
+//! rendered card), so an empty book can create its first contact too;
+//! the write path's "list not known" refusal only ever fires before
+//! the first load.
+//!
 //! A contact that exists but does not decrypt is never turned into a
 //! tombstone: a full load keeps its cached row (and counts it as
 //! skipped), an event refresh leaves the row alone. It is not served
@@ -169,7 +175,14 @@ impl ContactBook {
                 });
             }
         }
-        let list_id = rendered.first().map(|card| card.card.list_id.as_str());
+        // The list id is resolved structurally on every load, empty
+        // book included. A failed resolution never fails the load: the
+        // legacy inference from the first rendered card stays, and
+        // the write path's 409 remains the belt under both.
+        let resolved = self.source.contact_list_id().await.ok().flatten();
+        let list_id = resolved
+            .as_deref()
+            .or_else(|| rendered.first().map(|card| card.card.list_id.as_str()));
         let counts = self
             .store()
             .replace_contacts(self.account_id, list_id, &entries)
