@@ -106,6 +106,21 @@ pub enum ImportError {
 }
 
 impl ImportError {
+    /// Whether this refusal is a policy refusal — a well-formed body
+    /// the bridge chooses not to write — rather than a malformed one.
+    /// The handlers answer a policy refusal with the fixed `403` of
+    /// the plan's decision 3 and a malformed body with `400`.
+    pub fn is_policy(&self) -> bool {
+        matches!(
+            self,
+            ImportError::TooManyVevents
+                | ImportError::BadRule
+                | ImportError::OtherAttendees
+                | ImportError::PerOccurrence
+                | ImportError::RecurrenceMarker
+        )
+    }
+
     /// The fixed message of the failure.
     pub fn message(&self) -> &'static str {
         match self {

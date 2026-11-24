@@ -22,7 +22,7 @@ pub use clock::Clock;
 pub use credentials::CredentialStore;
 pub use dav_writer::{
     CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DavWriters,
-    DeleteOutcome, EventFields, EventRef,
+    DeleteOutcome, EventFields, EventRef, WriteRefusal,
 };
 pub use event_lookup::EventLookup;
 pub use event_stream::{EventHandles, EventStream};

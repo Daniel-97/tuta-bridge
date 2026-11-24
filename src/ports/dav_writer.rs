@@ -7,6 +7,17 @@
 //! idempotently. Errors carry fixed messages only: never ids, names,
 //! addresses or titles.
 //!
+//! An update takes the request's precondition in `if_match`, already
+//! verified by the handler against its cached row (the fast fail). The
+//! writer re-checks it against the freshly loaded entity and answers
+//! [`WriteRefusal::StoredVersionChanged`] when they disagree — the
+//! authority is the loaded entity, never the cache — so a write cannot
+//! overwrite a remote edit the event bus has not delivered yet. The
+//! handlers answer that refusal with the same fixed `412` every
+//! precondition failure answers, every other [`WriteRefusal`] with a
+//! `403` carrying its fixed message, and let everything else (a session
+//! error, a transport failure) reach the session layer.
+//!
 //! Like every data-carrying port type, these types do not implement
 //! `Debug`: they hold personal data.
 
@@ -96,6 +107,85 @@ pub struct EventFields {
     pub organizer: Option<EventPerson>,
 }
 
+/// The precondition token of one update: the version the client read,
+/// as the handler already verified it against its cached row with the
+/// request's `If-Match`. A contact writer re-checks the raw header
+/// against the strong ETag it derives from the freshly loaded card —
+/// the same ETag the reader serves, so the check needs nothing the
+/// handler knows. An event writer cannot recompute the served
+/// resource ETag (it embeds the row's first-seen stamp, which no
+/// freshly loaded entity carries), so the handler passes the stored
+/// master row's content fingerprint instead: the version of the very
+/// event the write updates. `None` (no header, or `If-Match: *`) lets
+/// the write through without a check.
+pub type IfMatch<'a> = Option<&'a str>;
+
+/// A fixed refusal of a write, carried as an
+/// [`Error::Unsupported`](crate::domain::Error::Unsupported) with a
+/// fixed message. The messages are a closed set the handlers
+/// recognize and answer: [`WriteRefusal::StoredVersionChanged`] with
+/// the fixed `412` every precondition failure answers, every other
+/// refusal with `403` and its own message — a permanent refusal a
+/// client must not retry. Everything else a writer answers (a session
+/// error, a transport failure) propagates untouched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WriteRefusal {
+    /// The freshly loaded entity no longer matches the version the
+    /// client's `If-Match` named; the write did not happen. The
+    /// handler answers `412`, so the client reloads and retries.
+    StoredVersionChanged,
+    /// The remote server refused the write for good (403/400: a
+    /// read-only share, a rejected payload). The handler answers
+    /// `403`, never the retry `503`.
+    RemoteRefused,
+    /// The stored event carries attendees the bridge cannot keep in
+    /// step, so it never edits such an event.
+    AttendeesRefused,
+    /// Creating events is upstream-blocked: the pinned SDK cannot
+    /// create Tuta's custom-id events.
+    CreateRefused,
+    /// The account has no contact group to create a contact in.
+    NoContactGroup,
+}
+
+impl WriteRefusal {
+    /// The fixed message of this refusal.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::StoredVersionChanged => "the stored version changed since the client read it",
+            Self::RemoteRefused => "the remote server refused the write",
+            Self::AttendeesRefused => "events with attendees cannot be edited through the bridge",
+            Self::CreateRefused => {
+                "creating events is not supported: create them in the Tuta client, then edit them here"
+            }
+            Self::NoContactGroup => "this account has no contact group",
+        }
+    }
+
+    /// This refusal as a writer error.
+    pub fn error(self) -> crate::domain::Error {
+        crate::domain::Error::Unsupported(self.message().into())
+    }
+
+    /// The refusal this writer error carries, when it carries one.
+    /// Recognition is by the fixed message, so a foreign `Unsupported`
+    /// text is never mistaken for one of these.
+    pub fn of(error: &crate::domain::Error) -> Option<Self> {
+        let crate::domain::Error::Unsupported(message) = error else {
+            return None;
+        };
+        const ALL: [WriteRefusal; 5] = [
+            WriteRefusal::StoredVersionChanged,
+            WriteRefusal::RemoteRefused,
+            WriteRefusal::AttendeesRefused,
+            WriteRefusal::CreateRefused,
+            WriteRefusal::NoContactGroup,
+        ];
+        ALL.into_iter()
+            .find(|refusal| refusal.message() == message.as_str())
+    }
+}
+
 /// The outcome of a delete: the caller answers a vanished entity with
 /// its own "not found" instead of a tombstone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,7 +200,11 @@ pub enum DeleteOutcome {
 ///
 /// `put_contact` creates a contact when `existing` is `None` and
 /// updates the referenced one in place otherwise, answering with the
-/// id the change landed on. Errors carry fixed text only.
+/// id the change landed on. On an update, `if_match` (the request's
+/// `If-Match` header) is re-checked against the freshly loaded card's
+/// strong ETag — the reader's own derivation — and a mismatch refuses
+/// with [`WriteRefusal::StoredVersionChanged`] before anything is
+/// written. Errors carry fixed text only.
 #[async_trait::async_trait]
 pub trait ContactWriter: Send + Sync {
     async fn put_contact(
@@ -118,6 +212,7 @@ pub trait ContactWriter: Send + Sync {
         list_id: &str,
         fields: &ContactFields,
         existing: Option<&ContactRef>,
+        if_match: IfMatch<'_>,
     ) -> Result<ContactRef>;
 
     /// Delete one contact; [`DeleteOutcome::Gone`] when it had already
@@ -130,7 +225,12 @@ pub trait ContactWriter: Send + Sync {
 /// `put_event` creates an event when `existing` is `None` — filed
 /// into the calendar's short or long event list by its repeat rule —
 /// and updates the referenced one otherwise, answering with the id
-/// the change landed on. Errors carry fixed text only.
+/// the change landed on. On an update, `if_match` (the content
+/// fingerprint of the stored master row the handler verified against
+/// the request's `If-Match`) is re-checked against the freshly loaded
+/// event's fingerprint — the reader's own derivation — and a mismatch
+/// refuses with [`WriteRefusal::StoredVersionChanged`] before anything
+/// is written. Errors carry fixed text only.
 #[async_trait::async_trait]
 pub trait CalendarWriter: Send + Sync {
     async fn put_event(
@@ -138,6 +238,7 @@ pub trait CalendarWriter: Send + Sync {
         calendar: &CalendarRef,
         fields: &EventFields,
         existing: Option<&EventRef>,
+        if_match: IfMatch<'_>,
     ) -> Result<EventRef>;
 
     /// Delete one event; [`DeleteOutcome::Gone`] when it had already
@@ -153,4 +254,34 @@ pub trait CalendarWriter: Send + Sync {
 pub struct DavWriters {
     pub contacts: Arc<dyn ContactWriter>,
     pub calendar: Arc<dyn CalendarWriter>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Error;
+
+    #[test]
+    fn every_refusal_round_trips_through_its_error() {
+        for refusal in [
+            WriteRefusal::StoredVersionChanged,
+            WriteRefusal::RemoteRefused,
+            WriteRefusal::AttendeesRefused,
+            WriteRefusal::CreateRefused,
+            WriteRefusal::NoContactGroup,
+        ] {
+            assert_eq!(WriteRefusal::of(&refusal.error()), Some(refusal));
+            assert_eq!(
+                refusal.error().to_string(),
+                format!("unsupported: {}", refusal.message())
+            );
+        }
+        // Recognition is exact: a foreign unsupported message is not
+        // one of these, and neither is any other error.
+        assert_eq!(WriteRefusal::of(&Error::Unsupported("other".into())), None);
+        assert_eq!(
+            WriteRefusal::of(&Error::Login("session is no longer valid".into())),
+            None
+        );
+    }
 }

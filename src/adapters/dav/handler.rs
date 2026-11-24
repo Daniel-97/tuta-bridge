@@ -183,6 +183,21 @@ pub fn strong_etag_matches(condition: &str, etag: &str) -> bool {
     })
 }
 
+/// One writer error as the DAV answer: the precondition refusal
+/// answers the fixed `412` the header-level preconditions answer,
+/// every other fixed refusal answers `403` carrying its own message,
+/// and anything else — a session error, a transport failure —
+/// propagates for the session layer to answer (`500`/`503`).
+pub fn writer_refusal(error: crate::domain::Error) -> crate::domain::Result<DavResponse> {
+    match crate::ports::dav_writer::WriteRefusal::of(&error) {
+        Some(crate::ports::dav_writer::WriteRefusal::StoredVersionChanged) => {
+            Ok(DavResponse::text(412, "precondition failed"))
+        }
+        Some(refusal) => Ok(DavResponse::text(403, refusal.message())),
+        None => Err(error),
+    }
+}
+
 /// A DAV feature: what is served under its root.
 #[async_trait]
 pub trait DavHandler: Send + Sync {

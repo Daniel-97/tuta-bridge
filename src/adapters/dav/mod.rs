@@ -15,8 +15,8 @@ pub mod session;
 pub mod xml;
 
 pub use handler::{
-    etag_matches, strong_etag_matches, DavHandler, DavMethod, DavRequest, DavResponse, Depth,
-    WellKnown, TEXT_PLAIN, XML_CONTENT_TYPE,
+    etag_matches, strong_etag_matches, writer_refusal, DavHandler, DavMethod, DavRequest,
+    DavResponse, Depth, WellKnown, TEXT_PLAIN, XML_CONTENT_TYPE,
 };
 pub use server::{serve_dav, DavServeLimits};
 pub use session::{run_dav_session, DavLimits};

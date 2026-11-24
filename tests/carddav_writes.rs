@@ -9,21 +9,21 @@ use std::time::Duration;
 use base64::Engine as _;
 use tokio::io::{split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tuta_bridge::adapters::carddav::import::ImportError;
-use tuta_bridge::adapters::carddav::vcard::render_vcard;
+use tuta_bridge::adapters::carddav::vcard::{render_vcard, vcard_etag};
 use tuta_bridge::adapters::carddav::CardDavHandler;
 use tuta_bridge::adapters::dav::{run_dav_session, DavHandler, DavLimits};
 use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
 use tuta_bridge::app::contacts::ContactBook;
 use tuta_bridge::domain::{
-    ContactCard, ContactField, ContactFieldKind, EntityEvent, EntityOperation, EventBatch,
+    ContactCard, ContactField, ContactFieldKind, EntityEvent, EntityOperation, Error, EventBatch,
     CONTACT_TYPE_ID, TUTANOTA_APP,
 };
 use tuta_bridge::ports::contact_source::ContactSource;
 use tuta_bridge::ports::imap_backend::ImapBackend;
 use tuta_bridge::ports::state_store::StateStore;
-use tuta_bridge::ports::{ContactRef, ContactWriter, DeleteOutcome};
+use tuta_bridge::ports::{ContactRef, ContactWriter, DeleteOutcome, WriteRefusal};
 
-use support::{FakeContactSource, FakeContactWriter, FakeImapBackend};
+use support::{FailingContactStore, FakeContactSource, FakeContactWriter, FakeImapBackend};
 
 const USER: &str = "user@example.invalid";
 const PASSWORD: &str = "hunter2";
@@ -52,17 +52,32 @@ fn three_cards() -> Vec<ContactCard> {
 }
 
 async fn book_with(cards: Vec<ContactCard>) -> (Arc<ContactBook>, Arc<FakeContactSource>) {
-    let state = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    book_over(
+        cards,
+        Arc::new(SqliteStateStore::open_in_memory().await.unwrap()),
+    )
+    .await
+}
+
+/// The book over `cards` served through `state`, for the tests that
+/// script the store itself.
+async fn book_over(
+    cards: Vec<ContactCard>,
+    state: Arc<dyn StateStore>,
+) -> (Arc<ContactBook>, Arc<FakeContactSource>) {
     let account = state.upsert_account(USER).await.unwrap();
     let source = Arc::new(FakeContactSource::new(cards));
     let book = ContactBook::new(
         account,
-        state as Arc<dyn StateStore>,
+        state,
         Arc::clone(&source) as Arc<dyn ContactSource>,
     )
     .unwrap();
     (Arc::new(book), source)
 }
+
+/// The c1 row's href, the one every update test addresses.
+const C1: &str = "/addressbooks/contacts/c1.vcf";
 
 fn contact_batch(events: &[(&str, EntityOperation)]) -> EventBatch {
     EventBatch {
@@ -169,17 +184,27 @@ impl Wire {
     }
 }
 
-fn spawn(book: Arc<ContactBook>, writer: Arc<FakeContactWriter>) -> Wire {
-    let backend = Arc::new(FakeImapBackend::new(USER, PASSWORD));
-    let handler = Arc::new(CardDavHandler::with_writer(
+/// The writable handler over `book` and `writer`.
+fn handler_of(book: Arc<ContactBook>, writer: Arc<FakeContactWriter>) -> Arc<dyn DavHandler> {
+    Arc::new(CardDavHandler::with_writer(
         book,
         Arc::clone(&writer) as Arc<dyn ContactWriter>,
-    ));
+    ))
+}
+
+fn spawn(book: Arc<ContactBook>, writer: Arc<FakeContactWriter>) -> Wire {
+    spawn_handler(handler_of(book, writer))
+}
+
+/// One more connection onto the same handler: two wires share one
+/// book, one write lock and one writer.
+fn spawn_handler(handler: Arc<dyn DavHandler>) -> Wire {
+    let backend = Arc::new(FakeImapBackend::new(USER, PASSWORD));
     let (client, server) = tokio::io::duplex(1024 * 1024);
     tokio::spawn(run_dav_session(
         server,
         backend as Arc<dyn ImapBackend>,
-        handler as Arc<dyn DavHandler>,
+        handler,
         DavLimits {
             login_failure_delay: Duration::from_millis(1),
             ..DavLimits::default()
@@ -190,6 +215,20 @@ fn spawn(book: Arc<ContactBook>, writer: Arc<FakeContactWriter>) -> Wire {
         reader: BufReader::new(reader),
         writer,
     }
+}
+
+/// The c1 row's listed ETag.
+async fn c1_etag(wire: &mut Wire) -> String {
+    let listing = wire
+        .request(
+            "PROPFIND",
+            "/addressbooks/contacts/",
+            &["Depth: 1"],
+            THUNDERBIRD_LISTING,
+        )
+        .await;
+    let cards = hrefs_with_etags(&listing.body);
+    cards.iter().find(|(href, _)| href == C1).unwrap().1.clone()
 }
 
 /// The text of the first `<name>…</name>` (any prefix) after `from`.
@@ -683,4 +722,251 @@ async fn write_methods_are_advertised_and_collections_refuse_writes() {
     assert_eq!(delete.status, 403);
     assert!(writer.put_calls().is_empty());
     assert!(writer.delete_calls().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The review's lost-update cases: the freshly loaded entity is the
+// precondition's authority
+// ---------------------------------------------------------------------------
+
+/// The review's stale-cache case: the row still carries the ETag the
+/// client read, but the remote card has moved on (a web edit the event
+/// bus has not delivered). The `If-Match` matches the cache, and the
+/// write must still not happen: the writer re-checks the precondition
+/// against the freshly loaded entity and answers `412`.
+#[tokio::test]
+async fn a_stale_cache_matching_put_answers_412_without_writing() {
+    let (book, source) = book_with(three_cards()).await;
+    let writer = Arc::new(FakeContactWriter::new());
+    let mut wire = spawn(Arc::clone(&book), Arc::clone(&writer));
+
+    // The client reads the current version: the listing loads the
+    // book and pins the row's ETag.
+    let etag = c1_etag(&mut wire).await;
+    let stored = book.lookup("c1").await.unwrap().unwrap();
+
+    // The web client edits the contact; the echo has not been
+    // delivered, so the cache still serves the version the client
+    // read. The writer's load answers the web-edited card.
+    let mut web_edited = card("c1", "Ada", "Lovelace", "web-edited@example.invalid");
+    web_edited.comment = "Edited on the web".into();
+    source.put(web_edited.clone());
+    *writer.loaded_etags.lock().unwrap() = vec![vcard_etag(&render_vcard(&web_edited))];
+
+    // The client edits what it read and pins the version it read.
+    let body = render_vcard(&card(
+        "c1",
+        "Ada",
+        "Lovelace",
+        "client-edit@example.invalid",
+    ));
+    let condition = format!("If-Match: {etag}");
+    let response = wire.request("PUT", C1, &[&condition], &body).await;
+    assert_eq!(response.status, 412);
+    assert_eq!(response.body, "precondition failed\n");
+    assert!(writer.put_calls().is_empty(), "no remote update happened");
+    // The cache row is untouched: neither the refused write nor a
+    // partial apply moved it.
+    let after = book.lookup("c1").await.unwrap().unwrap();
+    assert_eq!(after.etag, stored.etag);
+
+    // The version that names the current remote content passes: a
+    // GET heals the row (the reader's own per-row heal), so the client
+    // reads the fresh ETag and its `If-Match` matches the loaded card
+    // again.
+    let fetched = wire.request("GET", C1, &[], "").await;
+    assert_eq!(fetched.status, 200);
+    let fresh = fetched.header("ETag").unwrap().to_string();
+    assert_ne!(fresh, etag, "the GET adopted the web edit");
+    *writer.loaded_etags.lock().unwrap() = vec![fresh.clone()];
+    let condition = format!("If-Match: {fresh}");
+    let response = wire.request("PUT", C1, &[&condition], &body).await;
+    assert_eq!(response.status, 204);
+    assert_eq!(writer.put_calls().len(), 1);
+}
+
+/// Two concurrent `PUT`s with the same `If-Match`: the per-book write
+/// section lets exactly one through; the other's re-check sees the
+/// first write's version and answers `412`. Whichever connection wins
+/// is arbitrary, so the aggregate is pinned, never the order.
+#[tokio::test]
+async fn concurrent_puts_with_the_same_if_match_write_once_and_refuse_the_second() {
+    let (book, _) = book_with(three_cards()).await;
+    let writer = Arc::new(FakeContactWriter::new());
+    let handler = handler_of(Arc::clone(&book), Arc::clone(&writer));
+    let mut first = spawn_handler(Arc::clone(&handler));
+    let mut second = spawn_handler(Arc::clone(&handler));
+
+    // Both clients hold the same listed version.
+    let etag = c1_etag(&mut first).await;
+    // The loads answer: the first write sees the version both read,
+    // the second sees the first's write (a different etag).
+    *writer.loaded_etags.lock().unwrap() = vec![etag.clone(), "\"changed\"".to_string()];
+
+    let body = render_vcard(&card("c1", "Ada", "Lovelace", "edit@example.invalid"));
+    let condition_first = format!("If-Match: {etag}");
+    let condition_second = condition_first.clone();
+    let headers_first = [condition_first.as_str()];
+    let headers_second = [condition_second.as_str()];
+    let (a, b) = tokio::join!(
+        first.request("PUT", C1, &headers_first, &body),
+        second.request("PUT", C1, &headers_second, &body),
+    );
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(statuses, [204, 412]);
+    assert_eq!(writer.put_calls().len(), 1, "exactly one remote write");
+}
+
+// ---------------------------------------------------------------------------
+// A failed cache apply after a held remote write
+// ---------------------------------------------------------------------------
+
+/// The remote write held; the cache apply failed. The answer is still
+/// the success the remote write earned — a client that retried a
+/// write that already happened would create a duplicate — and the
+/// stale mark heals the row on the next read.
+#[tokio::test]
+async fn a_failed_cache_apply_still_answers_the_update() {
+    let state = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    let failing = Arc::new(FailingContactStore::new(Arc::clone(&state)));
+    let (book, source) =
+        book_over(three_cards(), Arc::clone(&failing) as Arc<dyn StateStore>).await;
+    let writer = Arc::new(FakeContactWriter::new());
+    let mut wire = spawn(Arc::clone(&book), Arc::clone(&writer));
+
+    // A first listing loads the book, so the row can be read directly.
+    let stored_etag = c1_etag(&mut wire).await;
+    let stored = book.lookup("c1").await.unwrap().unwrap();
+    assert_eq!(stored.etag, stored_etag);
+
+    // The write's new state, staged the way a held write leaves it.
+    let edited = card("c1", "Ada", "Lovelace", "edited@example.invalid");
+    source.put(edited.clone());
+    failing.set_fail_updates(true);
+
+    let response = wire.request("PUT", C1, &[], &render_vcard(&edited)).await;
+    assert_eq!(response.status, 204, "the answer is the remote write's");
+    assert!(response.header("ETag").is_some());
+    assert!(book.is_stale(), "the failed apply is the stale mark");
+    // The row never landed: the cache still serves the old ETag.
+    assert_eq!(book.lookup("c1").await.unwrap().unwrap().etag, stored.etag);
+
+    // The reload heals: the row adopts the staged remote state and
+    // serves the very ETag the PUT answered.
+    failing.set_fail_updates(false);
+    let fetched = wire.request("GET", C1, &[], "").await;
+    assert_eq!(fetched.status, 200);
+    assert_eq!(
+        fetched.header("ETag"),
+        response.header("ETag"),
+        "the healed row serves the answered ETag"
+    );
+    assert_eq!(
+        book.lookup("c1").await.unwrap().unwrap().etag,
+        fetched.header("ETag").unwrap()
+    );
+    assert!(!book.is_stale());
+}
+
+/// The same contract for a create and a delete: a `201` with the
+/// canonical `Location` and a `204` although the tombstone apply
+/// failed, both healed by the reload.
+#[tokio::test]
+async fn a_failed_cache_apply_still_answers_the_create_and_the_delete() {
+    let state = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    let failing = Arc::new(FailingContactStore::new(Arc::clone(&state)));
+    let (book, source) =
+        book_over(three_cards(), Arc::clone(&failing) as Arc<dyn StateStore>).await;
+    let writer = Arc::new(FakeContactWriter::new().answering_create(LIST, "srv-91"));
+    let mut wire = spawn(Arc::clone(&book), Arc::clone(&writer));
+
+    failing.set_fail_updates(true);
+    let created = card("made-up", "New", "Person", "new@example.invalid");
+    let response = wire
+        .request(
+            "PUT",
+            "/addressbooks/contacts/made-up.vcf",
+            &[],
+            &render_vcard(&created),
+        )
+        .await;
+    assert_eq!(response.status, 201, "the create is answered, not retried");
+    assert_eq!(
+        response.header("Location"),
+        Some("/addressbooks/contacts/srv-91.vcf")
+    );
+    assert!(book.is_stale());
+    assert!(
+        book.lookup("srv-91").await.unwrap().is_none(),
+        "the row never landed"
+    );
+
+    // The delete: the remote delete holds (the fake writer's delete),
+    // the tombstone apply fails, the answer is still the `204` the
+    // delete earned.
+    let response = wire
+        .request("DELETE", "/addressbooks/contacts/c2.vcf", &[], "")
+        .await;
+    assert_eq!(response.status, 204);
+    assert!(book.is_stale());
+    assert!(
+        book.lookup("c2").await.unwrap().is_some(),
+        "the tombstone never landed"
+    );
+
+    // The remote state the delete left, staged the way the echo will
+    // deliver it, then the reload heals both rows: the create stays
+    // unknown to the source, the delete is gone for good.
+    source.remove("c2");
+    failing.set_fail_updates(false);
+    let mut healed = spawn(Arc::clone(&book), Arc::clone(&writer));
+    let response = healed
+        .request("GET", "/addressbooks/contacts/c2.vcf", &[], "")
+        .await;
+    assert_eq!(response.status, 404);
+    let response = healed
+        .request("GET", "/addressbooks/contacts/srv-91.vcf", &[], "")
+        .await;
+    assert_eq!(response.status, 404);
+    assert!(!book.is_stale());
+}
+
+// ---------------------------------------------------------------------------
+// Honest error mapping
+// ---------------------------------------------------------------------------
+
+/// A permanent remote refusal answers `403` with its fixed message,
+/// and an expired session reaches the session layer: the fixed `500`
+/// of today, with the connection closing after it.
+#[tokio::test]
+async fn writer_errors_map_to_fixed_statuses() {
+    let (book, _) = book_with(three_cards()).await;
+    let writer = Arc::new(FakeContactWriter::new());
+    let mut wire = spawn(Arc::clone(&book), Arc::clone(&writer));
+
+    // The raw delete's 403 (a read-only share) as the handler serves it.
+    *writer.delete_error.lock().unwrap() = Some(WriteRefusal::RemoteRefused.error());
+    let response = wire
+        .request("DELETE", "/addressbooks/contacts/c3.vcf", &[], "")
+        .await;
+    assert_eq!(response.status, 403);
+    assert_eq!(response.body, "the remote server refused the write\n");
+    assert!(book.lookup("c3").await.unwrap().is_some());
+
+    // An expired session is not a refusal and not a retry: the session
+    // layer's answer, and the connection ends.
+    let body = render_vcard(&card("c1", "Ada", "Lovelace", "edit@example.invalid"));
+    *writer.put_error.lock().unwrap() = Some(Error::Login(
+        "session is no longer valid; run login again".into(),
+    ));
+    let response = wire.request("PUT", C1, &[], &body).await;
+    assert_eq!(response.status, 500);
+    assert_eq!(response.body, "internal error\n");
+    drop(wire);
+
+    // The refused delete left the row; the session error left it too.
+    let mut fresh = spawn(Arc::clone(&book), Arc::clone(&writer));
+    assert_eq!(c1_etag(&mut fresh).await, c1_etag(&mut fresh).await);
+    assert!(book.lookup("c3").await.unwrap().is_some());
 }

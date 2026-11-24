@@ -19,16 +19,16 @@ use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
 use tuta_bridge::app::calendar_sync::CalendarSync;
 use tuta_bridge::domain::calendar::{split_resource_name, DAY_MS};
 use tuta_bridge::domain::{
-    CalendarEvent, CalendarInfo, CalendarRow, EntityEvent, EntityOperation, EventBatch,
+    CalendarEvent, CalendarInfo, CalendarRow, EntityEvent, EntityOperation, Error, EventBatch,
     EventPerson, RepeatRule, CALENDAR_EVENT_TYPE_ID, TUTANOTA_APP,
 };
 use tuta_bridge::ports::calendar::CalendarStore;
 use tuta_bridge::ports::clock::Clock;
 use tuta_bridge::ports::imap_backend::ImapBackend;
 use tuta_bridge::ports::state_store::StateStore;
-use tuta_bridge::ports::{CalendarRef, CalendarWriter, DeleteOutcome, EventRef};
+use tuta_bridge::ports::{CalendarRef, CalendarWriter, DeleteOutcome, EventRef, WriteRefusal};
 
-use support::{FakeCalendarSource, FakeCalendarWriter, FakeImapBackend};
+use support::{FailingCalendarStore, FakeCalendarSource, FakeCalendarWriter, FakeImapBackend};
 
 const USER: &str = "user@example.invalid";
 const PASSWORD: &str = "hunter2";
@@ -162,6 +162,38 @@ async fn fixture() -> Fixture {
     source.add_calendar(calendar("work"));
     source.put_event(plain_event("e1", "uid-1", NOW_MS + DAY_MS));
     over(source).await
+}
+
+/// The fixture over a store whose write applies fail on demand, for
+/// the cache-apply failure contract. The `Fixture`'s own `store` is
+/// the raw SQLite store the failing wrapper delegates to, so rows can
+/// be read directly.
+async fn failing_fixture() -> (Fixture, Arc<FailingCalendarStore>) {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    source.put_event(plain_event("e1", "uid-1", NOW_MS + DAY_MS));
+    let store = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    let account_id = store.upsert_account(USER).await.unwrap();
+    let failing = Arc::new(FailingCalendarStore::new(
+        Arc::clone(&store) as Arc<dyn CalendarStore>
+    ));
+    let clock = Arc::new(TestClock(AtomicI64::new(NOW_MS)));
+    let sync = Arc::new(CalendarSync::new(
+        account_id,
+        Arc::clone(&failing) as Arc<dyn CalendarStore>,
+        Arc::clone(&source) as _,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    ));
+    sync.reload().await.unwrap();
+    (
+        Fixture {
+            source,
+            store,
+            sync,
+            account_id,
+        },
+        failing,
+    )
 }
 
 /// The cached row of one element of the "work" calendar.
@@ -1328,4 +1360,298 @@ async fn write_methods_are_advertised_and_collections_refuse_writes() {
     let delete = readonly.request("DELETE", &href, &[], "").await;
     assert_eq!(delete.status, 403);
     assert_eq!(delete.body, "forbidden: this server is read-only\n");
+}
+
+// ---------------------------------------------------------------------------
+// The review's lost-update cases: the freshly loaded event is the
+// precondition's authority
+// ---------------------------------------------------------------------------
+
+/// The review's stale-cache case: the cached rows still carry the
+/// ETag the client read, but the remote event has moved on (a web
+/// edit the event bus has not delivered). The `If-Match` matches the
+/// cache, and the write must still not happen: the writer re-checks
+/// the row's content fingerprint against the freshly loaded event and
+/// answers `412`.
+#[tokio::test]
+async fn a_stale_cache_matching_put_answers_412_without_updating() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    // The client reads the current version.
+    let listed = listing(&mut wire, "work").await;
+    let (href, etag) = listed[0].clone();
+
+    // The web client edits the event; the echo has not been
+    // delivered, so the cache still serves the version the client
+    // read. The writer's load answers the web-edited event.
+    let mut web_edited = plain_event("e1", "uid-1", NOW_MS + DAY_MS);
+    web_edited.summary = "Web edited".into();
+    fixture.source.put_event(web_edited.clone());
+    *writer.loaded_fingerprints.lock().unwrap() = vec![web_edited.fingerprint()];
+
+    // The client PUTs its own edit, pinned to the version it read.
+    let mut mine = plain_event("e1", "uid-1", NOW_MS + DAY_MS);
+    mine.summary = "Client edited".into();
+    let condition = format!("If-Match: {etag}");
+    let response = wire
+        .request("PUT", &href, &[&condition], &body_of(&mine))
+        .await;
+    assert_eq!(response.status, 412);
+    assert_eq!(response.body, "precondition failed\n");
+    assert!(writer.put_calls().is_empty(), "no remote update happened");
+    let row = row_of(&fixture, "e1").await.unwrap();
+    assert_eq!(
+        row.fingerprint,
+        plain_event("e1", "uid-1", NOW_MS + DAY_MS).fingerprint(),
+        "the row is untouched"
+    );
+
+    // The version that names the current remote content passes: a
+    // GET heals the row, so the client reads the fresh ETag and its
+    // `If-Match` matches the loaded event again.
+    let fetched = wire.request("GET", &href, &[], "").await;
+    assert_eq!(fetched.status, 200);
+    let fresh = fetched.header("ETag").unwrap().to_string();
+    assert_ne!(fresh, etag, "the GET adopted the web edit");
+    *writer.loaded_fingerprints.lock().unwrap() = vec![web_edited.fingerprint()];
+    let condition = format!("If-Match: {fresh}");
+    let response = wire
+        .request("PUT", &href, &[&condition], &body_of(&mine))
+        .await;
+    assert_eq!(response.status, 204);
+    assert_eq!(writer.put_calls().len(), 1);
+}
+
+/// Two concurrent `PUT`s with the same `If-Match`: the per-calendar
+/// write section lets exactly one through; the other's re-check sees
+/// the first write's content and answers `412`. Whichever connection
+/// wins is arbitrary, so the aggregate is pinned, never the order.
+#[tokio::test]
+async fn concurrent_puts_with_the_same_if_match_write_once_and_refuse_the_second() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let handler: Arc<dyn DavHandler> = Arc::new(CalDavHandler::with_writer(
+        Arc::clone(&fixture.sync),
+        USER.to_string(),
+        Arc::clone(&writer) as Arc<dyn CalendarWriter>,
+        vec![USER.to_string()],
+    ));
+    let mut first = spawn_handler(Arc::clone(&handler));
+    let mut second = spawn_handler(Arc::clone(&handler));
+
+    // Both clients hold the same listed version.
+    let listed = listing(&mut first, "work").await;
+    let (href, etag) = listed[0].clone();
+
+    // The write's new state, staged the way a held write leaves it.
+    let mut edited = plain_event("e1", "uid-1", NOW_MS + DAY_MS);
+    edited.summary = "Edited summary".into();
+    fixture.source.put_event(edited.clone());
+
+    // The loads answer: the first write sees the version both read,
+    // the second sees the first's write (a different fingerprint).
+    let read = plain_event("e1", "uid-1", NOW_MS + DAY_MS);
+    *writer.loaded_fingerprints.lock().unwrap() = vec![read.fingerprint(), edited.fingerprint()];
+
+    let body = body_of(&edited);
+    let condition_first = format!("If-Match: {etag}");
+    let condition_second = condition_first.clone();
+    let headers_first = [condition_first.as_str()];
+    let headers_second = [condition_second.as_str()];
+    let (a, b) = tokio::join!(
+        first.request("PUT", &href, &headers_first, &body),
+        second.request("PUT", &href, &headers_second, &body),
+    );
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(statuses, [204, 412]);
+    assert_eq!(writer.put_calls().len(), 1, "exactly one remote write");
+}
+
+// ---------------------------------------------------------------------------
+// A failed cache apply after a held remote write
+// ---------------------------------------------------------------------------
+
+/// The remote write held; the cache apply failed. The answer is still
+/// the success the remote write earned — a client that retried a
+/// write that already happened would edit the event twice — and the
+/// stale mark heals the row on the next read.
+#[tokio::test]
+async fn a_failed_cache_apply_still_answers_the_write() {
+    let (fixture, failing) = failing_fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+    let baseline = row_of(&fixture, "e1").await.unwrap();
+
+    // The write's new state, staged the way a held write leaves it.
+    let mut edited = plain_event("e1", "uid-1", NOW_MS + DAY_MS);
+    edited.summary = "Edited summary".into();
+    fixture.source.put_event(edited.clone());
+    failing.set_fail_writes(true);
+
+    let response = wire.request("PUT", &href, &[], &body_of(&edited)).await;
+    assert_eq!(response.status, 204, "the answer is the remote write's");
+    assert!(response.header("ETag").is_some());
+    assert!(
+        fixture.sync.is_stale(),
+        "the failed apply is the stale mark"
+    );
+    let after = row_of(&fixture, "e1").await.unwrap();
+    assert_eq!(
+        after.fingerprint, baseline.fingerprint,
+        "the row never landed"
+    );
+
+    // The reader's own per-row heal serves the very ETag the PUT
+    // answered.
+    failing.set_fail_writes(false);
+    let fetched = wire.request("GET", &href, &[], "").await;
+    assert_eq!(fetched.status, 200);
+    assert_eq!(
+        fetched.header("ETag"),
+        response.header("ETag"),
+        "the healed row serves the answered ETag"
+    );
+    assert_eq!(
+        row_of(&fixture, "e1").await.unwrap().fingerprint,
+        edited.fingerprint()
+    );
+}
+
+/// The same contract for a delete: the remote delete held, the row
+/// apply failed, the answer is still the `204` the delete earned, and
+/// the reader's heal removes the row once the store accepts again.
+#[tokio::test]
+async fn a_failed_cache_apply_still_answers_the_delete() {
+    let (fixture, failing) = failing_fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    failing.set_fail_writes(true);
+    let response = wire.request("DELETE", &href, &[], "").await;
+    assert_eq!(response.status, 204, "the answer is the remote delete's");
+    assert!(fixture.sync.is_stale());
+    assert!(
+        row_of(&fixture, "e1").await.is_some(),
+        "the row removal never landed"
+    );
+
+    // The remote state the delete left, then the reader's heal.
+    fixture.source.remove_event("work-short", "e1");
+    failing.set_fail_writes(false);
+    let gone = wire.request("GET", &href, &[], "").await;
+    assert_eq!(gone.status, 404);
+    assert!(row_of(&fixture, "e1").await.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Honest error mapping
+// ---------------------------------------------------------------------------
+
+/// The writer's fixed refusals as the client sees them: the attendee
+/// refusal answers `403` (the interim `500` the review declared is
+/// gone), the permanent remote refusal answers `403`, and an expired
+/// session reaches the session layer — the fixed `500` of today, with
+/// the connection closing after it.
+#[tokio::test]
+async fn writer_errors_map_to_fixed_statuses() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+    let body = body_of(&plain_event("e1", "uid-1", NOW_MS + DAY_MS));
+
+    // A stored event with attendees, as the writer sees it: the whole
+    // edit is refused whole, with the writer's fixed sentence.
+    *writer.put_error.lock().unwrap() = Some(WriteRefusal::AttendeesRefused.error());
+    let response = wire.request("PUT", &href, &[], &body).await;
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.body,
+        "events with attendees cannot be edited through the bridge\n"
+    );
+
+    // The raw delete's 403 (a read-only share) as the handler serves it.
+    *writer.delete_error.lock().unwrap() = Some(WriteRefusal::RemoteRefused.error());
+    let response = wire.request("DELETE", &href, &[], "").await;
+    assert_eq!(response.status, 403);
+    assert_eq!(response.body, "the remote server refused the write\n");
+
+    // An expired session is not a refusal and not a retry: the session
+    // layer's answer, and the connection ends.
+    *writer.put_error.lock().unwrap() = Some(Error::Login(
+        "session is no longer valid; run login again".into(),
+    ));
+    let response = wire.request("PUT", &href, &[], &body).await;
+    assert_eq!(response.status, 500);
+    assert_eq!(response.body, "internal error\n");
+    drop(wire);
+
+    // Nothing was written through any of them.
+    let mut fresh = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+    let relisted = listing(&mut fresh, "work").await;
+    assert_eq!(relisted.len(), 1);
+    let row = row_of(&fixture, "e1").await.unwrap();
+    assert_eq!(
+        row.fingerprint,
+        plain_event("e1", "uid-1", NOW_MS + DAY_MS).fingerprint()
+    );
+}
+
+/// A policy refusal — a well-formed body the bridge chooses not to
+/// write — answers the `403` of the plan's decision 3; only a
+/// malformed body answers `400` (pinned elsewhere).
+#[tokio::test]
+async fn policy_refusals_answer_403() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+
+    let head = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-1\r\n\
+DTSTART:20250107T080000Z\r\nDTEND:20250107T090000Z\r\nSUMMARY:Policy\r\n";
+    for (body, message) in [
+        (
+            // Two events: one PUT is one event.
+            format!(
+                "{head}END:VEVENT\r\nBEGIN:VEVENT\r\nUID:uid-2\r\n\
+DTSTART:20250107T080000Z\r\nDTEND:20250107T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            ImportError::TooManyVevents.message(),
+        ),
+        (
+            // Occurrence-level editing is out of scope.
+            format!("{head}EXDATE:20250114T080000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"),
+            ImportError::PerOccurrence.message(),
+        ),
+        (
+            // A rule the exporter never emits.
+            format!("{head}RRULE:FREQ=WEEKLY;BYMONTH=1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"),
+            ImportError::BadRule.message(),
+        ),
+        (
+            // An attendee other than the organizer: invitations are out
+            // of scope and never dropped silently.
+            format!(
+                "{head}ATTENDEE:mailto:guest@example.invalid\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            ImportError::OtherAttendees.message(),
+        ),
+    ] {
+        let response = wire.request("PUT", &href, &[], &body).await;
+        assert_eq!(response.status, 403, "{message}");
+        assert_eq!(response.body, format!("{message}\n"), "{body:?}");
+    }
+    assert!(writer.put_calls().is_empty());
+    assert_eq!(listing(&mut wire, "work").await.len(), 1);
 }

@@ -29,17 +29,24 @@
 //! events is refused with a fixed precondition (the SDK's generic
 //! create cannot serve Tuta's custom-id events: a client creates its
 //! events in the Tuta client and edits them here). The RFC
-//! preconditions are honoured against the stored ETag, the parsed
-//! event's organizer must be one of the account's addresses, and the
-//! write goes to Tuta first; the row is then refreshed from the
-//! reloaded event — the same refresh a `GET` applies — so the ETag
-//! answered is the one the reader serves and the event echo is a
-//! no-op against it. Two degenerate outcomes answer honestly: a state
-//! that cannot be read back after a held write answers the fixed
-//! `503` (the row stays as it was, the client retries), and a legacy
-//! event whose uid a write repaired moves to another href, answered
-//! `204` without an ETag for a row this href no longer serves. A
-//! `DELETE` removes the whole resource: every
+//! preconditions are honoured against the stored ETag, and the stored
+//! master row's content fingerprint is handed on: the writer re-checks
+//! it against the freshly loaded event, so a cache-matching but stale
+//! write still answers `412` instead of overwriting a remote edit the
+//! event bus has not delivered yet. One whole write per calendar runs
+//! at a time — the put and the cache apply of its outcome never
+//! interleave. The parsed event's organizer must be one of the
+//! account's addresses, and the write goes to Tuta first; the row is
+//! then refreshed from the reloaded event — the same refresh a `GET`
+//! applies — so the ETag answered is the one the reader serves and
+//! the event echo is a no-op against it. A cache apply that fails
+//! after the remote write held still answers the success (the stale
+//! mark heals the row on the next read). Two degenerate outcomes
+//! answer honestly: a state that cannot be read back after a held
+//! write answers the fixed `503` (the row stays as it was, the client
+//! retries), and a legacy event whose uid a write repaired moves to
+//! another href, answered `204` without an ETag for a row this href no
+//! longer serves. A `DELETE` removes the whole resource: every
 //! event of the series is deleted remotely first, then the rows are
 //! removed the way a delete event removes them (the calendar cache
 //! keeps no tombstones, so a href that never existed answers `404` and
@@ -51,10 +58,12 @@
 //! its filter is honoured, `expand` is not) and `calendar-multiget`;
 //! any other report is `403`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
+use tokio::sync::Mutex;
 
 use super::ical::{render_calendar, EventToRender};
 use super::import::{parse_event, ImportError};
@@ -62,8 +71,8 @@ use crate::adapters::dav::xml::{
     props, MultiStatusEntry, PropName, PropRequest, Report, XmlNode, APPLE_ICAL_NS, CALDAV_NS,
 };
 use crate::adapters::dav::{
-    etag_matches, strong_etag_matches, DavHandler, DavMethod, DavRequest, DavResponse, Depth,
-    WellKnown,
+    etag_matches, strong_etag_matches, writer_refusal, DavHandler, DavMethod, DavRequest,
+    DavResponse, Depth, WellKnown,
 };
 use crate::adapters::tuta::dav_writer::choose_event_list;
 use crate::app::calendar_sync::CalendarSync;
@@ -162,6 +171,11 @@ pub struct CalDavHandler {
     /// The account's addresses: the only organizers an imported event
     /// may carry. Empty (the read-only handler's value) accepts none.
     allowed_organizers: Vec<String>,
+    /// One whole write per calendar at a time: the remote put — which
+    /// re-checks the precondition against the freshly loaded event —
+    /// and the cache apply of its outcome never interleave with
+    /// another connection's write.
+    writes: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// A rendered resource.
@@ -183,6 +197,7 @@ impl CalDavHandler {
             sync,
             writer: None,
             allowed_organizers: Vec::new(),
+            writes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -203,8 +218,15 @@ impl CalDavHandler {
             clock: Arc::clone(&sync.clock),
             writer: Some(writer),
             allowed_organizers,
+            writes: Mutex::new(HashMap::new()),
             sync,
         }
+    }
+
+    /// The per-calendar write lock of `calendar_id`.
+    async fn write_guard(&self, calendar_id: &str) -> Arc<Mutex<()>> {
+        let mut guards = self.writes.lock().await;
+        guards.entry(calendar_id.to_string()).or_default().clone()
     }
 
     async fn calendar(&self, calendar_id: &str) -> Result<Option<CalendarInfo>> {
@@ -602,16 +624,11 @@ impl CalDavHandler {
         };
         let fields = match parse_event(body) {
             Ok(fields) => fields,
-            // The bridge's own recurrence marker names a series shape
-            // the importer cannot write back: a degraded form must
-            // never clear a stored series, so it answers `403` like a
-            // creation rather than the ordinary `400` rule refusal.
-            Err(ImportError::RecurrenceMarker) => {
-                return Ok(DavResponse::text(
-                    403,
-                    ImportError::RecurrenceMarker.message(),
-                ))
-            }
+            // A policy refusal — a well-formed body the bridge
+            // chooses not to write, the degraded recurrence form among
+            // them — answers the `403` of the plan's decision 3; only
+            // a malformed body answers `400`.
+            Err(error) if error.is_policy() => return Ok(DavResponse::text(403, error.message())),
             Err(error) => return Ok(DavResponse::text(400, error.message())),
         };
         let calendar_ref = CalendarRef {
@@ -682,17 +699,38 @@ impl CalDavHandler {
         if chosen != master.list_id.as_str() && !bounded_in_long_list {
             return Ok(creation_refused());
         }
-        // Remote first: an error propagates untouched, the cache is not
-        // touched. The writer keeps the event's identity — uid,
+        // The precondition token: the stored master row's content
+        // fingerprint — the version of the very event this write
+        // updates — which the check above already verified against the
+        // request's `If-Match`. The writer re-checks it against the
+        // freshly loaded event, the authority behind that fast fail.
+        // `If-Match: *` pins existence only, so it carries no token.
+        let if_match = request
+            .header("if-match")
+            .filter(|condition| condition.trim() != "*")
+            .map(|_| master.fingerprint.as_str());
+        // Remote first: a refusal answers its fixed status, a session
+        // error and a transport failure reach the session layer
+        // untouched, and the cache is touched only after the remote
+        // write held. The writer keeps the event's identity — uid,
         // sequence, recurrence, alarms, attendees — to itself; the
         // handler hands it the parsed fields and the existing ref only.
         let existing = EventRef {
             list_id: master.list_id.clone(),
             element_id: master.element_id.clone(),
         };
-        let reference = writer
-            .put_event(&calendar_ref, &fields, Some(&existing))
-            .await?;
+        // One whole write per calendar at a time: the put and the
+        // cache apply of its outcome never interleave with another
+        // connection's write.
+        let guard = self.write_guard(&calendar_id).await;
+        let _guard = guard.lock().await;
+        let reference = match writer
+            .put_event(&calendar_ref, &fields, Some(&existing), if_match)
+            .await
+        {
+            Ok(reference) => reference,
+            Err(error) => return writer_refusal(error),
+        };
         // The optimistic row: the same refresh the reader's `GET`
         // applies, so the row (and the ETag with it) is the one the
         // next read serves and the event echo is a no-op against it.
@@ -706,7 +744,16 @@ impl CalDavHandler {
             return Err(Error::Network("calendar data unavailable".into()));
         };
         let row = event.row(&calendar_id, self.clock.now_ms());
-        let stored = self.sync.apply_written(&row).await?;
+        // The remote write held: a cache apply that fails now only
+        // marks the calendar stale (the reload heals the row), and the
+        // answer stays the success the remote write earned — a client
+        // that retried a write that already happened would edit the
+        // event twice.
+        let stored = self
+            .sync
+            .apply_written(&row)
+            .await
+            .unwrap_or_else(|_| row.clone());
         // A legacy event whose uid the write repaired moves to another
         // href: this resource keeps its other rows, and the answer
         // carries no ETag for a row this href no longer serves.
@@ -758,7 +805,9 @@ impl CalDavHandler {
             long_list_id: calendar.long_list_id.clone(),
         };
         // Remote first. Both outcomes proceed: `Gone` has already
-        // reached the end state the client asked for. A failure part
+        // reached the end state the client asked for. A refusal
+        // answers its fixed status; a session error and a transport
+        // failure reach the session layer untouched. A failure part
         // way leaves the cache as it was; the client retries and the
         // events already gone answer `Gone`.
         for row in &resource.rows {
@@ -766,12 +815,16 @@ impl CalDavHandler {
                 list_id: row.list_id.clone(),
                 element_id: row.element_id.clone(),
             };
-            writer.delete_event(&calendar_ref, &reference).await?;
+            match writer.delete_event(&calendar_ref, &reference).await {
+                Ok(_) => {}
+                Err(error) => return writer_refusal(error),
+            }
         }
+        // The remote delete held: a cache apply that fails only marks
+        // the calendar stale (the reload heals the rows), and the
+        // answer stays the success the remote delete earned.
         for row in &resource.rows {
-            self.sync
-                .apply_deleted(&row.list_id, &row.element_id)
-                .await?;
+            let _ = self.sync.apply_deleted(&row.list_id, &row.element_id).await;
         }
         Ok(DavResponse::new(204))
     }

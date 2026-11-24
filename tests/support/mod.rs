@@ -5,15 +5,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::{ExposeSecret, SecretString};
+use tuta_bridge::adapters::dav::strong_etag_matches;
 use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem, ImapArg};
 use tuta_bridge::adapters::imap::search::{parse_search, SearchKey};
+use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
 use tuta_bridge::domain::{
     AccountId, AccountInfo, BatchCounts, BatchOutcome, Error, EventFrame, Folder, MailPlacement,
     MailboxId, MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
     StoredCredentials, StoredMailbox, StoredMessage,
 };
-use tuta_bridge::domain::{CalendarEvent, CalendarInfo};
+use tuta_bridge::domain::{CalendarEvent, CalendarInfo, CalendarRow};
 use tuta_bridge::ports::calendar::{CalendarSource, CalendarStore};
+use tuta_bridge::ports::contact_store::{
+    ContactBookState, ContactCounts, ContactEntry, ContactStore, StoredContact,
+};
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::event_lookup::EventLookup;
 use tuta_bridge::ports::event_stream::{EventHandles, EventStream};
@@ -26,7 +31,7 @@ use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRe
 use tuta_bridge::ports::state_store::StateStore;
 use tuta_bridge::ports::{
     CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DavWriters,
-    DeleteOutcome, EventFields, EventRef,
+    DeleteOutcome, EventFields, EventRef, WriteRefusal,
 };
 
 // ---------------------------------------------------------------------------
@@ -1960,18 +1965,21 @@ impl FakeContactSource {
 // ---------------------------------------------------------------------------
 
 /// One recorded `put_contact`: the list it addressed, the fields it
-/// carried, and the contact it updated (`None` on a create). Holds
-/// personal data: no `Debug`.
+/// carried, the contact it updated (`None` on a create) and the
+/// precondition the handler passed. Holds personal data: no `Debug`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordedPut {
     pub list_id: String,
     pub fields: ContactFields,
     pub existing: Option<ContactRef>,
+    pub if_match: Option<String>,
 }
 
-/// A [`ContactWriter`] that records every call, scriptable to fail with
-/// the fixed error, to answer creates with a scripted ref, and to
-/// answer deletes with a scripted outcome.
+/// A [`ContactWriter`] that records every call, scriptable to fail
+/// with the fixed error, to answer creates with a scripted ref, to
+/// answer deletes with a scripted outcome, to model the entity the
+/// next update's load answers (the writer's own precondition
+/// re-check), and to answer one call with a scripted error.
 pub struct FakeContactWriter {
     /// Every put in call order.
     pub puts: Mutex<Vec<RecordedPut>>,
@@ -1979,6 +1987,14 @@ pub struct FakeContactWriter {
     pub deletes: Mutex<Vec<ContactRef>>,
     /// While set, every call fails with the fixed network error.
     pub failing: Mutex<bool>,
+    /// The strong ETag the next update's load answers, in call order;
+    /// an empty list (the default) answers the caller's own
+    /// precondition, so a matching `If-Match` passes.
+    pub loaded_etags: Mutex<Vec<String>>,
+    /// The error the next put answers, once.
+    pub put_error: Mutex<Option<Error>>,
+    /// The error the next delete answers, once.
+    pub delete_error: Mutex<Option<Error>>,
     /// The ref every create answers with; when `None` a fresh
     /// `generated-<n>` id is minted per create.
     pub create_ref: Mutex<Option<ContactRef>>,
@@ -1993,6 +2009,9 @@ impl Default for FakeContactWriter {
             puts: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
             failing: Mutex::new(false),
+            loaded_etags: Mutex::new(Vec::new()),
+            put_error: Mutex::new(None),
+            delete_error: Mutex::new(None),
             create_ref: Mutex::new(None),
             delete_outcome: Mutex::new(DeleteOutcome::Deleted),
             created: AtomicUsize::new(0),
@@ -2050,12 +2069,33 @@ impl ContactWriter for FakeContactWriter {
         list_id: &str,
         fields: &ContactFields,
         existing: Option<&ContactRef>,
+        if_match: Option<&str>,
     ) -> Result<ContactRef> {
+        // The writer's own precondition re-check, modelled: the load
+        // answers the next scripted ETag, or the caller's own
+        // precondition when none is scripted. A mismatch refuses
+        // before anything is written, so the put is not recorded.
+        if let (Some(_), Some(condition)) = (existing, if_match) {
+            let mut scripted = self.loaded_etags.lock().unwrap();
+            let loaded = if scripted.is_empty() {
+                condition.to_string()
+            } else {
+                scripted.remove(0)
+            };
+            drop(scripted);
+            if !strong_etag_matches(condition, &loaded) {
+                return Err(WriteRefusal::StoredVersionChanged.error());
+            }
+        }
         self.puts.lock().unwrap().push(RecordedPut {
             list_id: list_id.into(),
             fields: fields.clone(),
             existing: existing.cloned(),
+            if_match: if_match.map(str::to_string),
         });
+        if let Some(error) = self.put_error.lock().unwrap().take() {
+            return Err(error);
+        }
         if *self.failing.lock().unwrap() {
             return Err(Error::Network("dav write failed".into()));
         }
@@ -2075,6 +2115,9 @@ impl ContactWriter for FakeContactWriter {
 
     async fn delete_contact(&self, id: &ContactRef) -> Result<DeleteOutcome> {
         self.deletes.lock().unwrap().push(id.clone());
+        if let Some(error) = self.delete_error.lock().unwrap().take() {
+            return Err(error);
+        }
         if *self.failing.lock().unwrap() {
             return Err(Error::Network("dav write failed".into()));
         }
@@ -2261,18 +2304,21 @@ impl CalendarSource for FakeCalendarSource {
 // ---------------------------------------------------------------------------
 
 /// One recorded `put_event`: the calendar it addressed, the fields it
-/// carried, and the event it updated (`None` on a create). Holds
-/// personal data: no `Debug`.
+/// carried, the event it updated (`None` on a create) and the
+/// precondition the handler passed. Holds personal data: no `Debug`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordedEventPut {
     pub calendar: CalendarRef,
     pub fields: EventFields,
     pub existing: Option<EventRef>,
+    pub if_match: Option<String>,
 }
 
 /// A [`CalendarWriter`] that records every call, scriptable to fail
-/// with the fixed error, to answer creates with a scripted ref, and to
-/// answer deletes with a scripted outcome.
+/// with the fixed error, to answer creates with a scripted ref, to
+/// answer deletes with a scripted outcome, to model the entity the
+/// next update's load answers (the writer's own precondition
+/// re-check), and to answer one call with a scripted error.
 pub struct FakeCalendarWriter {
     /// Every put in call order.
     pub puts: Mutex<Vec<RecordedEventPut>>,
@@ -2280,6 +2326,14 @@ pub struct FakeCalendarWriter {
     pub deletes: Mutex<Vec<(CalendarRef, EventRef)>>,
     /// While set, every call fails with the fixed network error.
     pub failing: Mutex<bool>,
+    /// The content fingerprint the next update's load answers, in
+    /// call order; an empty list (the default) answers the caller's
+    /// own precondition, so a matching token passes.
+    pub loaded_fingerprints: Mutex<Vec<String>>,
+    /// The error the next put answers, once.
+    pub put_error: Mutex<Option<Error>>,
+    /// The error the next delete answers, once.
+    pub delete_error: Mutex<Option<Error>>,
     /// The ref every create answers with; when `None` a fresh
     /// `generated-<n>` id is minted per create, in the event list the
     /// fields' repeat rule files them into.
@@ -2295,6 +2349,9 @@ impl Default for FakeCalendarWriter {
             puts: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
             failing: Mutex::new(false),
+            loaded_fingerprints: Mutex::new(Vec::new()),
+            put_error: Mutex::new(None),
+            delete_error: Mutex::new(None),
             create_ref: Mutex::new(None),
             delete_outcome: Mutex::new(DeleteOutcome::Deleted),
             created: AtomicUsize::new(0),
@@ -2352,12 +2409,33 @@ impl CalendarWriter for FakeCalendarWriter {
         calendar: &CalendarRef,
         fields: &EventFields,
         existing: Option<&EventRef>,
+        if_match: Option<&str>,
     ) -> Result<EventRef> {
+        // The writer's own precondition re-check, modelled: the load
+        // answers the next scripted fingerprint, or the caller's own
+        // precondition when none is scripted. A mismatch refuses
+        // before anything is written, so the put is not recorded.
+        if let (Some(_), Some(condition)) = (existing, if_match) {
+            let mut scripted = self.loaded_fingerprints.lock().unwrap();
+            let loaded = if scripted.is_empty() {
+                condition.to_string()
+            } else {
+                scripted.remove(0)
+            };
+            drop(scripted);
+            if loaded != condition {
+                return Err(WriteRefusal::StoredVersionChanged.error());
+            }
+        }
         self.puts.lock().unwrap().push(RecordedEventPut {
             calendar: calendar.clone(),
             fields: fields.clone(),
             existing: existing.cloned(),
+            if_match: if_match.map(str::to_string),
         });
+        if let Some(error) = self.put_error.lock().unwrap().take() {
+            return Err(error);
+        }
         if *self.failing.lock().unwrap() {
             return Err(Error::Network("dav write failed".into()));
         }
@@ -2386,9 +2464,266 @@ impl CalendarWriter for FakeCalendarWriter {
             .lock()
             .unwrap()
             .push((calendar.clone(), id.clone()));
+        if let Some(error) = self.delete_error.lock().unwrap().take() {
+            return Err(error);
+        }
         if *self.failing.lock().unwrap() {
             return Err(Error::Network("dav write failed".into()));
         }
         Ok(*self.delete_outcome.lock().unwrap())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FailingContactStore / FailingCalendarStore
+// ---------------------------------------------------------------------------
+
+/// A [`StateStore`] whose contact cache fails its applies on demand: a
+/// thin wrapper over the real in-memory SQLite store that delegates
+/// everything, except `update_contacts` (the write path's cache apply)
+/// answers the fixed storage error while [`Self::fail_updates`] is set.
+/// The reloads still succeed, so a failed apply heals exactly the way
+/// the production stale mark heals it.
+pub struct FailingContactStore {
+    inner: Arc<SqliteStateStore>,
+    fail_updates: Mutex<bool>,
+}
+
+impl FailingContactStore {
+    pub fn new(inner: Arc<SqliteStateStore>) -> Self {
+        Self {
+            inner,
+            fail_updates: Mutex::new(false),
+        }
+    }
+
+    /// Make every `update_contacts` (the cache apply of a write) fail
+    /// with the fixed storage error, or succeed again.
+    pub fn set_fail_updates(&self, failing: bool) {
+        *self.fail_updates.lock().unwrap() = failing;
+    }
+
+    fn contact_cache(&self) -> &dyn ContactStore {
+        self.inner
+            .contact_store()
+            .expect("the sqlite store has one")
+    }
+}
+
+#[async_trait::async_trait]
+impl ContactStore for FailingContactStore {
+    async fn contact_book(&self, account_id: i64) -> Result<ContactBookState> {
+        self.contact_cache().contact_book(account_id).await
+    }
+
+    async fn replace_contacts(
+        &self,
+        account_id: i64,
+        list_id: Option<&str>,
+        entries: &[ContactEntry],
+    ) -> Result<ContactCounts> {
+        self.contact_cache()
+            .replace_contacts(account_id, list_id, entries)
+            .await
+    }
+
+    async fn update_contacts(
+        &self,
+        account_id: i64,
+        upserts: &[ContactEntry],
+        removals: &[String],
+    ) -> Result<ContactCounts> {
+        if *self.fail_updates.lock().unwrap() {
+            return Err(Error::Storage("the state store is busy".into()));
+        }
+        self.contact_cache()
+            .update_contacts(account_id, upserts, removals)
+            .await
+    }
+
+    async fn contacts(&self, account_id: i64) -> Result<Vec<StoredContact>> {
+        self.contact_cache().contacts(account_id).await
+    }
+
+    async fn contact(&self, account_id: i64, element_id: &str) -> Result<Option<StoredContact>> {
+        self.contact_cache().contact(account_id, element_id).await
+    }
+
+    async fn contact_changes_since(
+        &self,
+        account_id: i64,
+        revision: i64,
+    ) -> Result<(i64, Vec<StoredContact>)> {
+        self.contact_cache()
+            .contact_changes_since(account_id, revision)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl StateStore for FailingContactStore {
+    fn contact_store(&self) -> Option<&dyn ContactStore> {
+        Some(self)
+    }
+
+    async fn upsert_account(&self, mail_address: &str) -> Result<i64> {
+        self.inner.upsert_account(mail_address).await
+    }
+
+    async fn upsert_mailbox(
+        &self,
+        account_id: i64,
+        folder: &Folder,
+        uidvalidity: u32,
+    ) -> Result<MailboxId> {
+        self.inner
+            .upsert_mailbox(account_id, folder, uidvalidity)
+            .await
+    }
+
+    async fn mailboxes(&self, account_id: i64) -> Result<Vec<StoredMailbox>> {
+        self.inner.mailboxes(account_id).await
+    }
+
+    async fn assign_uid(&self, mailbox: MailboxId, header: &MessageHeader) -> Result<u32> {
+        self.inner.assign_uid(mailbox, header).await
+    }
+
+    async fn apply_batch(
+        &self,
+        account_id: i64,
+        group_id: &str,
+        batch_id: &str,
+        changes: &[StateChange],
+    ) -> Result<BatchOutcome> {
+        self.inner
+            .apply_batch(account_id, group_id, batch_id, changes)
+            .await
+    }
+
+    async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {
+        self.inner.remove_mailbox(account_id, mailbox).await
+    }
+
+    async fn update_metadata(
+        &self,
+        mailbox: MailboxId,
+        uid: u32,
+        header: &MessageHeader,
+        rfc822_size: Option<u64>,
+    ) -> Result<()> {
+        self.inner
+            .update_metadata(mailbox, uid, header, rfc822_size)
+            .await
+    }
+
+    async fn set_mime_structure(
+        &self,
+        mailbox: MailboxId,
+        uid: u32,
+        structure: &str,
+    ) -> Result<()> {
+        self.inner.set_mime_structure(mailbox, uid, structure).await
+    }
+
+    async fn remove_message(&self, mailbox: MailboxId, uid: u32) -> Result<()> {
+        self.inner.remove_message(mailbox, uid).await
+    }
+
+    async fn messages(&self, mailbox: MailboxId) -> Result<Vec<StoredMessage>> {
+        self.inner.messages(mailbox).await
+    }
+
+    async fn message_by_uid(&self, mailbox: MailboxId, uid: u32) -> Result<Option<StoredMessage>> {
+        self.inner.message_by_uid(mailbox, uid).await
+    }
+
+    async fn last_batch(&self, account_id: i64, group_id: &str) -> Result<Option<String>> {
+        self.inner.last_batch(account_id, group_id).await
+    }
+
+    async fn set_last_batch(&self, account_id: i64, group_id: &str, batch_id: &str) -> Result<()> {
+        self.inner
+            .set_last_batch(account_id, group_id, batch_id)
+            .await
+    }
+
+    async fn reset_account(&self, account_id: i64) -> Result<()> {
+        self.inner.reset_account(account_id).await
+    }
+}
+
+/// A [`CalendarStore`] that delegates everything except the write
+/// applies: while [`Self::set_fail_writes`] is set,
+/// `upsert_calendar_row` and `remove_calendar_row` answer the fixed
+/// storage error, so a held remote write's cache apply fails the way a
+/// locked database would.
+pub struct FailingCalendarStore {
+    inner: Arc<dyn CalendarStore>,
+    fail_writes: Mutex<bool>,
+}
+
+impl FailingCalendarStore {
+    pub fn new(inner: Arc<dyn CalendarStore>) -> Self {
+        Self {
+            inner,
+            fail_writes: Mutex::new(false),
+        }
+    }
+
+    /// Make the two cache applies of a write fail with the fixed
+    /// storage error, or succeed again.
+    pub fn set_fail_writes(&self, failing: bool) {
+        *self.fail_writes.lock().unwrap() = failing;
+    }
+
+    fn blocked(&self) -> Result<()> {
+        if *self.fail_writes.lock().unwrap() {
+            return Err(Error::Storage("the state store is busy".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl CalendarStore for FailingCalendarStore {
+    async fn replace_calendars(&self, account_id: i64, calendars: &[CalendarInfo]) -> Result<()> {
+        self.inner.replace_calendars(account_id, calendars).await
+    }
+
+    async fn calendars(&self, account_id: i64) -> Result<Vec<CalendarInfo>> {
+        self.inner.calendars(account_id).await
+    }
+
+    async fn replace_calendar_rows(
+        &self,
+        account_id: i64,
+        calendar_id: &str,
+        rows: &[CalendarRow],
+    ) -> Result<()> {
+        self.inner
+            .replace_calendar_rows(account_id, calendar_id, rows)
+            .await
+    }
+
+    async fn upsert_calendar_row(&self, account_id: i64, row: &CalendarRow) -> Result<CalendarRow> {
+        self.blocked()?;
+        self.inner.upsert_calendar_row(account_id, row).await
+    }
+
+    async fn remove_calendar_row(
+        &self,
+        account_id: i64,
+        list_id: &str,
+        element_id: &str,
+    ) -> Result<bool> {
+        self.blocked()?;
+        self.inner
+            .remove_calendar_row(account_id, list_id, element_id)
+            .await
+    }
+
+    async fn calendar_rows(&self, account_id: i64, calendar_id: &str) -> Result<Vec<CalendarRow>> {
+        self.inner.calendar_rows(account_id, calendar_id).await
     }
 }

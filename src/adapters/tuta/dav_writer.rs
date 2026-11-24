@@ -36,6 +36,19 @@
 //! field can name them), and the legacy birthday aggregate is cleared
 //! so a removed birthday cannot return through the reader's fallback.
 //!
+//! An update honours the request's `If-Match` against the freshly
+//! loaded entity, after the load and before anything is written: the
+//! reader's own ETag derivation for a contact, the reader's own
+//! fingerprint for an event. A mismatch answers the fixed
+//! precondition refusal, so a write can never overwrite a remote edit
+//! the event bus has not delivered yet; a contact that cannot be
+//! rendered at all fails closed with the same refusal.
+//!
+//! Error mapping is honest about what the server said: an expired
+//! session is the session error (the handlers let the session layer
+//! answer it), a permanent rejection - 403, or a 400 the server will
+//! answer again - is the fixed remote refusal the handlers answer
+//! with `403`, and everything else is the retryable write failure.
 //! Errors are fixed strings: no id, name, address or title ever
 //! appears in one.
 
@@ -56,17 +69,22 @@ use tutasdk::entities::generated::tutanota::{
     ContactCustomDate, ContactMailAddress, ContactPhoneNumber, ContactRelationship, ContactWebsite,
     EncryptedMailAddress,
 };
+use tutasdk::rest_error::HttpError;
 use tutasdk::{
-    CustomId, GeneratedId, IdTupleCustom, IdTupleGenerated, LoggedInSdk, CLIENT_VERSION,
+    ApiCallError, CustomId, GeneratedId, IdTupleCustom, IdTupleGenerated, LoggedInSdk,
+    CLIENT_VERSION,
 };
 
-use super::contact_source::{address_kind, phone_kind, relation_kind};
+use super::calendar_source::event_from_tuta;
+use super::contact_source::{address_kind, contact_card, phone_kind, relation_kind};
 use crate::adapters::caldav::ical::html_to_text;
+use crate::adapters::carddav::vcard::{render_vcard, vcard_etag};
+use crate::adapters::dav::strong_etag_matches;
 use crate::adapters::smtp::outgoing::text_to_html;
 use crate::domain::{ContactFieldKind, ContactRelationKind, Error, RepeatRule, Result};
 use crate::ports::dav_writer::{
     CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DeleteOutcome,
-    EventFields, EventRef,
+    EventFields, EventRef, IfMatch, WriteRefusal,
 };
 
 /// REST path segment of the `Contact` type.
@@ -91,6 +109,81 @@ fn write_failed() -> Error {
 /// fixed text the session resume uses.
 fn session_invalid() -> Error {
     Error::Login("session is no longer valid; run login again".into())
+}
+
+/// Map one SDK failure of the write path: an expired session is the
+/// session error, a permanent rejection (403, or a 400 the server
+/// will answer again) is the fixed remote refusal, and everything
+/// else is the retryable write failure.
+fn sdk_failure(error: ApiCallError) -> Error {
+    match error {
+        ApiCallError::ServerResponseError { source } => match source {
+            HttpError::NotAuthenticatedError
+            | HttpError::SessionExpiredError
+            | HttpError::AccessDeactivatedError
+            | HttpError::AccessExpiredError
+            | HttpError::AccessBlockedError => session_invalid(),
+            HttpError::NotAuthorizedError
+            | HttpError::BadRequestError
+            | HttpError::InvalidDataError => WriteRefusal::RemoteRefused.error(),
+            _ => write_failed(),
+        },
+        _ => write_failed(),
+    }
+}
+
+/// The strong ETag the reader derives from a loaded contact, or `None`
+/// when the card does not map (the reader would not serve it).
+fn loaded_contact_etag(
+    contact: &tutasdk::entities::generated::tutanota::Contact,
+) -> Option<String> {
+    contact_card(contact).map(|card| vcard_etag(&render_vcard(&card)))
+}
+
+/// The content fingerprint the reader derives from a loaded event, or
+/// `None` when the event does not map.
+fn loaded_event_fingerprint(
+    event: &tutasdk::entities::generated::tutanota::CalendarEvent,
+) -> Option<String> {
+    event_from_tuta(event).map(|mapped| mapped.fingerprint())
+}
+
+/// Refuse an update whose precondition does not name the freshly
+/// loaded contact's current version. The handler has already verified
+/// the header against its cached row; this is the authority. A
+/// contact that cannot be rendered cannot be verified either: fail
+/// closed with the same refusal, never with a silent overwrite.
+fn check_contact_precondition(
+    contact: &tutasdk::entities::generated::tutanota::Contact,
+    if_match: IfMatch<'_>,
+) -> Result<()> {
+    let Some(condition) = if_match else {
+        return Ok(());
+    };
+    if loaded_contact_etag(contact).is_some_and(|etag| strong_etag_matches(condition, &etag)) {
+        return Ok(());
+    }
+    Err(WriteRefusal::StoredVersionChanged.error())
+}
+
+/// Refuse an update whose precondition does not name the freshly
+/// loaded event's current content. The handler passes the stored
+/// master row's fingerprint (the served resource ETag embeds the
+/// row's first-seen stamp, which no freshly loaded event can
+/// reproduce); the loaded event's fingerprint is the reader's own
+/// derivation, so agreement means the event is still the version the
+/// client read. An event that does not map fails closed the same way.
+fn check_event_precondition(
+    event: &tutasdk::entities::generated::tutanota::CalendarEvent,
+    if_match: IfMatch<'_>,
+) -> Result<()> {
+    let Some(condition) = if_match else {
+        return Ok(());
+    };
+    if loaded_event_fingerprint(event).is_some_and(|fingerprint| fingerprint == condition) {
+        return Ok(());
+    }
+    Err(WriteRefusal::StoredVersionChanged.error())
 }
 
 /// The owner-encrypted session key of a new entity: what the server
@@ -590,12 +683,7 @@ pub fn choose_event_list<'a>(calendar: &'a CalendarRef, fields: &EventFields) ->
 /// events is upstream-blocked, since the pinned SDK cannot create
 /// Tuta's custom-id events.
 fn update_target(existing: Option<&EventRef>) -> Result<&EventRef> {
-    existing.ok_or_else(|| {
-        Error::Unsupported(
-            "creating events is not supported: create them in the Tuta client, then edit them here"
-                .into(),
-        )
-    })
+    existing.ok_or_else(|| WriteRefusal::CreateRefused.error())
 }
 
 /// The URL of the raw entity DELETE the web client's
@@ -610,13 +698,16 @@ pub fn entity_delete_url(
 }
 
 /// Map a raw delete response: a 404 means the entity had already
-/// vanished remotely, a rejected session is the session error, and
-/// every other status is the fixed write failure.
+/// vanished remotely, a rejected session is the session error, a 403
+/// or 400 is a permanent refusal the server will answer again (a
+/// read-only share, a rejected id), and every other status is the
+/// fixed write failure.
 fn delete_outcome(status: u32) -> Result<DeleteOutcome> {
     match status {
         200..=299 => Ok(DeleteOutcome::Deleted),
         404 => Ok(DeleteOutcome::Gone),
-        401 | 403 => Err(session_invalid()),
+        401 => Err(session_invalid()),
+        403 | 400 => Err(WriteRefusal::RemoteRefused.error()),
         _ => Err(write_failed()),
     }
 }
@@ -710,6 +801,7 @@ impl ContactWriter for TutaDavWriter {
         list_id: &str,
         fields: &ContactFields,
         existing: Option<&ContactRef>,
+        if_match: IfMatch<'_>,
     ) -> Result<ContactRef> {
         let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
         if let Some(existing) = existing {
@@ -717,25 +809,29 @@ impl ContactWriter for TutaDavWriter {
                 GeneratedId(existing.list_id.clone()),
                 GeneratedId(existing.element_id.clone()),
             );
-            let mut contact: Contact = crypto_client.load(&id).await.map_err(|_| write_failed())?;
+            let mut contact: Contact = crypto_client.load(&id).await.map_err(sdk_failure)?;
+            // The precondition runs against the freshly loaded entity,
+            // after the load and before anything is written: the
+            // authority behind the handler's cached fast fail.
+            check_contact_precondition(&contact, if_match)?;
             apply_contact_fields(&mut contact, fields);
             crypto_client
                 .update_instance(contact)
                 .await
-                .map_err(|_| write_failed())?;
+                .map_err(sdk_failure)?;
             Ok(ContactRef {
                 list_id: existing.list_id.clone(),
                 element_id: existing.element_id.clone(),
             })
         } else {
             let owner_group = contact_owner_group(self.logged.get_user().memberships.iter())
-                .ok_or_else(|| Error::Unsupported("this account has no contact group".into()))?;
+                .ok_or_else(|| WriteRefusal::NoContactGroup.error())?;
             let (key, session_key) = self.owner_key_material(&owner_group).await?;
             let contact = contact_entity(fields, list_id, &owner_group, &key);
             let created = crypto_client
                 .create_instance(contact, Some(session_key))
                 .await
-                .map_err(|_| write_failed())?;
+                .map_err(sdk_failure)?;
             let element_id = created.generatedId.ok_or_else(write_failed)?.0;
             Ok(ContactRef {
                 list_id: list_id.to_string(),
@@ -757,6 +853,7 @@ impl CalendarWriter for TutaDavWriter {
         _calendar: &CalendarRef,
         fields: &EventFields,
         existing: Option<&EventRef>,
+        if_match: IfMatch<'_>,
     ) -> Result<EventRef> {
         let existing = update_target(existing)?;
         let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
@@ -764,13 +861,19 @@ impl CalendarWriter for TutaDavWriter {
             GeneratedId(existing.list_id.clone()),
             CustomId(existing.element_id.clone()),
         );
-        let mut event: CalendarEvent = crypto_client.load(&id).await.map_err(|_| write_failed())?;
+        let mut event: CalendarEvent = crypto_client.load(&id).await.map_err(sdk_failure)?;
+        // The attendee gate outranks the precondition: an event with
+        // guests is never editable, so telling the client to reload and
+        // retry would only lead it into the same refusal.
         attendee_gate(&event)?;
+        // The precondition runs against the freshly loaded entity,
+        // after the load and before anything is written.
+        check_event_precondition(&event, if_match)?;
         apply_event_fields(&mut event, fields);
         crypto_client
             .update_instance(event)
             .await
-            .map_err(|_| write_failed())?;
+            .map_err(sdk_failure)?;
         Ok(EventRef {
             list_id: existing.list_id.clone(),
             element_id: existing.element_id.clone(),
@@ -1720,17 +1823,93 @@ then edit them here"
             delete_outcome(401).unwrap_err().to_string(),
             "login failed: session is no longer valid; run login again"
         );
+        // A 403 (NotAuthorized, for example a read-only share) and a
+        // 400 are permanent: the fixed refusal the handler answers
+        // with `403`, never a session error and never the retry.
         assert_eq!(
             delete_outcome(403).unwrap_err().to_string(),
-            "login failed: session is no longer valid; run login again"
+            "unsupported: the remote server refused the write"
         );
         assert_eq!(
             delete_outcome(400).unwrap_err().to_string(),
-            "network error: dav write failed"
+            "unsupported: the remote server refused the write"
         );
         assert_eq!(
             delete_outcome(500).unwrap_err().to_string(),
             "network error: dav write failed"
         );
+    }
+
+    /// The reader's own chain names the loaded contact's version, so a
+    /// matching `If-Match` passes, a stale one refuses before anything
+    /// is written, and a card that cannot be rendered fails closed.
+    #[test]
+    fn a_contact_precondition_matches_the_readers_own_etag() {
+        let contact = contact_entity(&fields(), "list", "group", &key());
+        let etag = loaded_contact_etag(&contact).unwrap();
+        assert_eq!(
+            etag,
+            vcard_etag(&render_vcard(&contact_card(&contact).unwrap()))
+        );
+        assert!(check_contact_precondition(&contact, Some(&etag)).is_ok());
+        // A list of candidates, `*`, quoting: the strong comparison
+        // of the DAV layer, not plain equality.
+        assert!(check_contact_precondition(&contact, Some(&format!("\"other\", {etag}"))).is_ok());
+        assert!(check_contact_precondition(&contact, Some("*")).is_ok());
+        assert!(check_contact_precondition(&contact, None).is_ok());
+        let error = check_contact_precondition(&contact, Some("\"stale\""))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "unsupported: the stored version changed since the client read it"
+        );
+        // A different content answers a different etag, so the stale
+        // check catches the web client's edit.
+        let mut edited = contact_entity(&fields(), "list", "group", &key());
+        edited.comment = "Edited comment".into();
+        assert_ne!(loaded_contact_etag(&edited).unwrap(), etag);
+        // A contact the reader cannot serve cannot be verified: fail
+        // closed, never with a silent overwrite.
+        let mut broken = contact_entity(&fields(), "list", "group", &key());
+        broken._id = None;
+        assert_eq!(loaded_contact_etag(&broken), None);
+        let error = check_contact_precondition(&broken, Some(&etag))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "unsupported: the stored version changed since the client read it"
+        );
+    }
+
+    /// The reader's own fingerprint names the loaded event's content,
+    /// which is the token the handler passes for the stored row.
+    #[test]
+    fn an_event_precondition_matches_the_readers_own_fingerprint() {
+        let event = stored_event("uid-1");
+        let fingerprint = loaded_event_fingerprint(&event).unwrap();
+        assert!(check_event_precondition(&event, Some(&fingerprint)).is_ok());
+        assert!(check_event_precondition(&event, None).is_ok());
+        let error = check_event_precondition(&event, Some("stale"))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "unsupported: the stored version changed since the client read it"
+        );
+        // An edit made in the web client changes the fingerprint, so
+        // the client's stale token no longer names the content.
+        let mut edited = stored_event("uid-1");
+        edited.summary = "Edited summary".into();
+        assert_ne!(loaded_event_fingerprint(&edited).unwrap(), fingerprint);
+        // An event the reader cannot serve fails closed.
+        let mut broken = stored_event("uid-1");
+        broken._id = None;
+        assert_eq!(loaded_event_fingerprint(&broken), None);
+        assert!(matches!(
+            check_event_precondition(&broken, Some(&fingerprint)),
+            Err(Error::Unsupported(_))
+        ));
     }
 }

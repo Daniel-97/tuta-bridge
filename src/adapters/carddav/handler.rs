@@ -34,16 +34,27 @@
 //!
 //! `PUT` and `DELETE` are served when a writer is wired. `PUT` enforces
 //! the RFC preconditions against the stored ETag (`If-Match`; an
-//! `If-None-Match: *` refuses an overwrite), writes remotely first, lands
-//! a create on the server-generated id (the client's href id is never
-//! stored), and updates the cache only after the remote write held.
-//! `DELETE` tombstones a row only after the remote delete held. Without
-//! a writer both answer the fixed `403` the session answered before.
+//! `If-None-Match: *` refuses an overwrite) and hands the `If-Match`
+//! on: the writer re-checks it against the freshly loaded entity, so
+//! a cache-matching but stale write still answers `412` instead of
+//! overwriting a remote edit the event bus has not delivered yet. One
+//! whole write per book runs at a time — the put and the cache apply
+//! of its outcome never interleave. The remote write comes first, a
+//! create lands on the server-generated id (the client's href id is
+//! never stored), and the cache is updated after the remote write
+//! held — a cache apply that fails anyway still answers the success
+//! the remote write earned (the stale mark heals the row on the next
+//! read; a client that retried a write that already happened would
+//! create a duplicate). `DELETE` tombstones a row only after the
+//! remote delete held, and a failed cache apply stays the success the
+//! same way. Without a writer both answer the fixed `403` the session
+//! answered before.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use super::import::{parse_vcard, ImportError};
 use super::vcard::{formatted_name, VCARD_CONTENT_TYPE};
@@ -51,8 +62,8 @@ use crate::adapters::dav::xml::{
     props, MultiStatusEntry, PropName, PropRequest, Report, XmlElement, XmlNode, CARDDAV_NS, DAV_NS,
 };
 use crate::adapters::dav::{
-    etag_matches, strong_etag_matches, DavHandler, DavMethod, DavRequest, DavResponse, Depth,
-    WellKnown, XML_CONTENT_TYPE,
+    etag_matches, strong_etag_matches, writer_refusal, DavHandler, DavMethod, DavRequest,
+    DavResponse, Depth, WellKnown, XML_CONTENT_TYPE,
 };
 use crate::app::contacts::{ContactBook, RenderedCard};
 use crate::domain::{ContactCard, Result};
@@ -272,17 +283,27 @@ pub struct CardDavHandler {
     /// The Tuta write seam; `None` keeps the handler read-only (the
     /// state `serve` serves until the writer is wired in).
     writer: Option<Arc<dyn ContactWriter>>,
+    /// Serializes one whole write per book across connections: the
+    /// remote put — which re-checks the precondition against the
+    /// freshly loaded entity — and the cache apply of its outcome
+    /// never interleave with another connection's.
+    write: Mutex<()>,
 }
 
 impl CardDavHandler {
     pub fn new(book: Arc<ContactBook>) -> Self {
-        Self { book, writer: None }
+        Self {
+            book,
+            writer: None,
+            write: Mutex::new(()),
+        }
     }
 
     pub fn with_writer(book: Arc<ContactBook>, writer: Arc<dyn ContactWriter>) -> Self {
         Self {
             book,
             writer: Some(writer),
+            write: Mutex::new(()),
         }
     }
 
@@ -532,11 +553,21 @@ impl CardDavHandler {
                 }
             },
         };
-        // Remote first: an error propagates untouched, the cache is not
-        // touched.
-        let reference = writer
-            .put_contact(&list_id, &fields, existing.as_ref())
-            .await?;
+        // The request's `If-Match`, already verified above: the writer
+        // re-checks it against the freshly loaded entity, which is
+        // the authority behind that fast fail.
+        let if_match = request.header("if-match");
+        // One whole write per book at a time: the put and the cache
+        // apply of its outcome never interleave with another
+        // connection's write.
+        let _guard = self.write.lock().await;
+        let reference = match writer
+            .put_contact(&list_id, &fields, existing.as_ref(), if_match)
+            .await
+        {
+            Ok(reference) => reference,
+            Err(error) => return writer_refusal(error),
+        };
         let rendered = RenderedCard::new(written_card(&reference, &fields));
         let entry = ContactEntry {
             list_id: reference.list_id.clone(),
@@ -544,8 +575,12 @@ impl CardDavHandler {
             etag: rendered.etag.clone(),
         };
         // The store skips an unchanged ETag, so the echo of this change
-        // does not advance the revision again.
-        self.book.apply_written(&entry).await?;
+        // does not advance the revision again. The remote write held:
+        // a cache apply that fails now only marks the book stale (the
+        // reload heals the row), and the answer stays the success the
+        // remote write earned — a client that retried a write that
+        // already happened would create a duplicate.
+        let _ = self.book.apply_written(&entry).await;
         Ok(if existing.is_some() {
             DavResponse::new(204).with_etag(&rendered.etag)
         } else {
@@ -581,9 +616,17 @@ impl CardDavHandler {
             element_id: stored.element_id.clone(),
         };
         // Remote first. Both outcomes proceed: `Gone` has already
-        // reached the end state the client asked for.
-        writer.delete_contact(&reference).await?;
-        self.book.apply_deleted(&stored.element_id).await?;
+        // reached the end state the client asked for. A refusal
+        // answers its fixed status; a session error and a transport
+        // failure reach the session layer untouched.
+        match writer.delete_contact(&reference).await {
+            Ok(_) => {}
+            Err(error) => return writer_refusal(error),
+        }
+        // The remote delete held: a cache apply that fails only marks
+        // the book stale (the reload heals the row), and the answer
+        // stays the success the remote delete earned.
+        let _ = self.book.apply_deleted(&stored.element_id).await;
         Ok(DavResponse::new(204))
     }
 

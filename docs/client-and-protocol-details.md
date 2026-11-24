@@ -415,7 +415,15 @@ served at most (see the residuals under "Writes").
 - Preconditions run against the stored row, never the rendered body:
   `If-Match` must match the stored ETag strongly, `If-None-Match: *` on
   an existing card answers `412`, and so does a stale `If-Match`; an
-  unchanged reload can never answer `412`.
+  unchanged reload can never answer `412`. The stored row is only the
+  fast fail: the write itself re-loads the contact and re-checks the
+  request's `If-Match` against the freshly loaded card's ETag — the
+  reader's own derivation — so a write that matches the cache but not
+  the entity (an edit made in the web client whose event has not
+  reached the bridge yet) answers `412` instead of overwriting it. One
+  whole write runs per book at a time, so two concurrent `PUT`s with
+  the same `If-Match` cannot both write: one succeeds, the other's
+  re-check sees the first write's version and answers `412`.
 - Create: a `PUT` to any unused `.vcf` href writes to Tuta first and
   answers `201` with `Location: /addressbooks/contacts/<id>.vcf` naming
   the server-generated id, plus the new `ETag`. The id in the client's
@@ -437,10 +445,17 @@ served at most (see the residuals under "Writes").
   at most, so a second stored anniversary cannot survive an echoed
   `PUT`, and a scheme-less stored website is rewritten because its
   served value carries the added `https://`.
-- The remote write holds before the cache is touched: a remote failure
-  answers the fixed `503` (with `Retry-After`) and leaves the cache and
-  its ETag untouched, so the client retries. Bodies are parsed in
-  memory only; the cache stays metadata-only.
+- The remote write holds before the cache is touched: a transport
+  failure answers the fixed `503` (with `Retry-After`) and leaves the
+  cache and its ETag untouched, so the client retries; a session that
+  has expired answers the session layer's fixed `500`; a permanent
+  remote rejection (403/400: a read-only share) answers the fixed `403`
+  `the remote server refused the write`, which no retry can fix. A
+  cache apply that fails after the remote write held still answers the
+  success the write earned — the failed apply marks the book stale and
+  the next read reloads and heals the row, and a client that retried a
+  write that already happened would create a duplicate. Bodies are
+  parsed in memory only; the cache stays metadata-only.
 - The contact-list id is resolved structurally, not from the first
   loaded card: the `RootInstance` at (user group id, `ContactList` root
   id) → the `ContactList` entity → its `contacts` field, the same chain
@@ -469,7 +484,9 @@ served at most (see the residuals under "Writes").
 - `DELETE`: a card that never existed answers `404` (no tombstone for a
   nonexistent row) and `If-Match` is enforced. The remote delete runs
   first (already-gone counts as success), then the row is tombstoned so
-  `sync-collection` reports it as a `404`; the answer is `204`.
+  `sync-collection` reports it as a `404`; the answer is `204`, and a
+  tombstone apply that fails anyway still answers `204` (the stale mark
+  heals the row, exactly as on the update path).
 - Echo idempotence: the write upserts the new ETag and the store skips
   a row whose ETag is unchanged, so the event-bus echo of the same
   change does not count twice (`src/app/contacts.rs::apply_written`).
@@ -601,7 +618,18 @@ client from your contacts, it is not a calendar on the server.
   why).
 - Preconditions run against the stored resource ETag: a matching
   `If-None-Match` answers `412`, `If-Match` must match strongly, and an
-  unchanged reload never answers `412`.
+  unchanged reload never answers `412`. The stored rows are only the
+  fast fail: the write itself re-loads the event and re-checks the
+  version the client read — the stored master row's content fingerprint,
+  which the writer compares against the freshly loaded event's
+  fingerprint (the reader's own derivation; the served resource ETag
+  embeds the row's first-seen stamp, which no freshly loaded event can
+  reproduce) — so a write that matches the cache but not the entity
+  (an edit made in the web client whose event has not reached the
+  bridge yet) answers `412` instead of overwriting it. One whole write
+  runs per calendar at a time, so two concurrent `PUT`s with the same
+  `If-Match` cannot both write: one succeeds, the other's re-check sees
+  the first write's content and answers `412`.
 - The body must be exactly one `VEVENT` in a `VCALENDAR` (a
   `VTIMEZONE` is accepted and ignored). Times come in the three forms
   the renderer writes: UTC (`…Z`), a `TZID`-qualified local time naming
@@ -616,36 +644,58 @@ client from your contacts, it is not a calendar on the server.
   `BYMONTHDAY=28…31;BYSETPOS=-1` pattern of a start on the 29th–31st,
   which maps back onto Tuta's clamp to each month's last day. Anything
   else — `BYMONTH`, an ordinal `BYDAY`, a second `RRULE` — refuses the
-  whole event with `400`: a rule that cannot be mapped is never
-  accepted and then mangled. The renderer itself emits two rule shapes
-  the importer refuses with the same `400`: advanced rule parts and the
-  yearly Feb-29 clamp (it carries a `BYMONTH`). The degraded
+  whole event with `403` (a well-formed body the bridge chooses not to
+  write; only a malformed one answers `400`): a rule that cannot be
+  mapped is never accepted and then mangled. The renderer itself emits
+  two rule shapes the importer refuses with the same `403`: advanced
+  rule parts and the yearly Feb-29 clamp (it carries a `BYMONTH`). The
+  degraded
   single-occurrence form is refused with `403` instead: it carries
   `X-TUTA-BRIDGE-RECURRENCE` (whatever its value), which the importer
   refuses, and a handler backstop refuses a stored repeating master
   whose body carries no `RRULE` at all, so a degraded form can never
   clear the repetition in Tuta. Edit such events in the Tuta client.
-- `EXDATE`, `RDATE` or `RECURRENCE-ID` refuses the event
+- `EXDATE`, `RDATE` or `RECURRENCE-ID` refuses the event with `403`
   (occurrence-level editing is out of scope); the refusal outranks the
   one-event rule, so the body a client writes back after editing one
   occurrence fails with the occurrence message. An `ATTENDEE` other
-  than the organizer (case-insensitive) refuses the event — invitations
-  are out of scope and are never dropped silently. A `VALARM` is
-  accepted and ignored: reminders set by clients are not carried to
-  Tuta.
-- `ORGANIZER` maps to its address only (the `CN` parameter is accepted
-  and dropped; an unusable value is treated as no organizer, a personal
-  event). The address must be one of the account's, and only the
-  primary address is known without a network call, so aliases answer
+  than the organizer (case-insensitive) refuses the whole event with
+  `403` — invitations are out of scope and are never dropped silently.
+  A stored event that carries attendees is refused just as firmly:
+  such an event cannot be edited through the bridge at all (see
+  below). A `VALARM` is accepted and ignored: reminders set by clients
+  are not carried to Tuta.
+- `ORGANIZER` maps to its address only; the `CN` parameter is
+  preserved when the same address stays the organizer (a body that
+  echoes the served one keeps the stored display name, so a title-only
+  edit cannot blank it), and an unusable value is treated as no
+  organizer, a personal event. The address must be one of the
+  account's, and only the primary address is known without a network
+  call, so aliases answer
   the fixed `403` `the organizer is not an address of this account`.
+- An in-place update cannot move the event's start or flip it between
+  the short and long event lists: a short event's id derives from its
+  start, both the Tuta web client and this bridge's reader load short
+  events by id range, and the web client deletes and re-creates on a
+  start change anyway (creating is blocked here). Both answer the fixed
+  creation `403` body.
 - The update goes remote first: the writer reloads the stored event,
   applies the parsed fields and `update_instance`s it back (uid,
-  sequence, recurrence, alarms and attendees stay as the Tuta client
-  keeps them). The row is then rebuilt from the reloaded event — the
+  sequence, recurrence and alarms stay as the Tuta client keeps them).
+  A stored event that carries attendees other than the organizer is
+  refused whole with the fixed `403` `events with attendees cannot be
+  edited through the bridge` — the bridge cannot keep invitation state
+  in step, so it never edits such an event (the served body carries the
+  attendees, so a client's edit of one always reaches the refusal). The
+  row is then rebuilt from the reloaded event — the
   same row, fingerprint and all, that the reader derives — and
   upserted, so the `204`'s `ETag` is the one the next read serves and
   the event-bus echo of the same change counts once
-  (`src/app/calendar_sync.rs::apply_written`). The two-year loading
+  (`src/app/calendar_sync.rs::apply_written`). A cache apply that
+  fails after the remote write held still answers the `204` the write
+  earned (the stale mark heals the row on the next read; a client that
+  retried a write that already happened would edit the event twice).
+  The two-year loading
   window is deliberately not applied to a written row: an event moved
   beyond the window keeps its row until the echo removes it, exactly as
   an edit made in the Tuta client does, so the client sees the write it
@@ -653,13 +703,18 @@ client from your contacts, it is not a calendar on the server.
 - Two honest degenerates: a legacy event whose missing uid a write
   repaired moves to another href — `204` without an `ETag`; a state
   that cannot be read back after a held write answers the fixed `503`
-  (`Retry-After`) and keeps the row as it was.
+  (`Retry-After`) and keeps the row as it was. Remote failures map
+  honestly: a session that has expired answers the session layer's
+  fixed `500`, a permanent remote rejection (403/400: a read-only
+  shared calendar) answers the fixed `403` `the remote server refused
+  the write`, and only a transport failure keeps the `503` retry.
 - `DELETE` removes the whole resource: every event of the series is
   deleted remotely first (already-gone counts as done), then the rows
   are removed the way a delete event removes them. The calendar cache
   keeps no tombstones and there is no `sync-collection`, so a href that
   never existed answers `404`; `If-Match` is enforced; the answer is
-  `204`.
+  `204`, and a row removal that fails anyway still answers `204` (the
+  stale mark heals the rows, exactly as on the update path).
 
 ### Freshness
 
