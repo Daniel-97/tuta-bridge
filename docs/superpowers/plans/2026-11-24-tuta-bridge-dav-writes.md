@@ -78,6 +78,24 @@ calendar rows already carry everything the write path needs).
    types) and `accessToken`; a 404 maps to "already gone", auth failures
    to the session error, everything else to the fixed network error.
 
+9. **Creation is split by id type, and event creation is refused.**
+   Verified against the pinned SDK and the web client: the web client
+   pre-assigns element ids, registers a kdf nonce per new encrypted
+   instance through `UpdateKdfNonceService`, and POSTs with the id in the
+   body; the Rust SDK's generic create does none of this - it POSTs with
+   `_id: null` (entity_client.rs nulls the id field on every POST) and
+   never registers a nonce. For custom-id types (`CalendarEvent`) the
+   create cannot work: the POST return carries no id for custom types,
+   so a null-id event would be created unreachable. Event creation is
+   therefore refused with a fixed 403 precondition (upstream-blocked, the
+   same family as the SMTP E2E caveat: the SDK does not expose the web
+   client's machinery); events support update and delete. For
+   generated-id types (`Contact`) the SDK create is the only create API
+   the SDK has - the same API the mobile clients use - so contact
+   creation stays, but it is the first manual-acceptance checkpoint:
+   if the live server rejects the null-id create, contact creation
+   flips to the same 403 and the README notes it as upstream-blocked.
+
 ## Global Constraints
 
 - All code, identifiers, comments, and commit messages in English.
