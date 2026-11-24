@@ -96,6 +96,18 @@ calendar rows already carry everything the write path needs).
    if the live server rejects the null-id create, contact creation
    flips to the same 403 and the README notes it as upstream-blocked.
 
+10. **The contact list id is resolved structurally, never learned
+   from cards.** The write path needs the account's contacts list id,
+   and learning it from the first rendered card leaves an empty
+   address book unable to create its first contact. The SDK resolves
+   it structurally: load the `RootInstance` at
+   `(user group id, ContactList root id)` - the same chain
+   `ContactFacade::fetch_contact_lists` walks - then the
+   `ContactList` entity, whose `contacts` field is the list id,
+   regardless of how many contacts exist. The book load/refresh (Task 6
+   wiring) always records it in `contact_books.list_id`, so the 409 of
+   decision "book not loaded" only ever fires before the first load.
+
 ## Global Constraints
 
 - All code, identifiers, comments, and commit messages in English.
