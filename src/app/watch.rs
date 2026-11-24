@@ -1008,12 +1008,19 @@ impl ServeUseCase {
             }
             None => None,
         };
+        // The DAV startup lines drop the read-only suffix when the
+        // session hands out writers.
+        let dav_suffix = if dav_writers.is_some() {
+            ""
+        } else {
+            " (read-only)"
+        };
         // CardDAV listens on its own port; the baseline load of the
         // address book runs in the background so IMAP is not delayed.
         let carddav_listener = match &carddav {
             Some((carddav_port, book)) => {
                 let carddav_listener = bind_loopback("carddav", *carddav_port).await?;
-                println!("serving CardDAV on 127.0.0.1:{carddav_port} (read-only)");
+                println!("serving CardDAV on 127.0.0.1:{carddav_port}{dav_suffix}");
                 Some((carddav_listener, Arc::clone(book)))
             }
             None => None,
@@ -1039,12 +1046,12 @@ impl ServeUseCase {
                 }
             })
         });
-        // CalDAV: read-only calendars over HTTPS with the same
+        // CalDAV: calendars over HTTPS with the same
         // certificate and bridge password.
         let caldav_listener = match &caldav {
             Some((caldav_port, _, handler)) => {
                 let caldav_listener = bind_loopback("caldav", *caldav_port).await?;
-                println!("serving CalDAV on https://127.0.0.1:{caldav_port}/ (read-only)");
+                println!("serving CalDAV on https://127.0.0.1:{caldav_port}/{dav_suffix}");
                 Some((caldav_listener, Arc::clone(handler)))
             }
             None => None,
