@@ -533,6 +533,12 @@ impl DavHandler for CalDavHandler {
             DavMethod::Get => self.get(request).await,
             DavMethod::Propfind(wanted) => self.propfind(request, wanted).await,
             DavMethod::Report(report) => self.report(request, report).await,
+            // Calendars are read-only until the CalDAV write path lands:
+            // the same refusal the session used to answer.
+            DavMethod::Put | DavMethod::Delete => Ok(DavResponse::text(
+                403,
+                "forbidden: this server is read-only",
+            )),
         }
     }
 }

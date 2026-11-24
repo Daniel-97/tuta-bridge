@@ -1,10 +1,11 @@
 //! The seam a DAV feature (CardDAV, CalDAV) implements.
 //!
 //! The generic session authenticates the request, answers everything
-//! protocol-agnostic itself (`OPTIONS`, `/.well-known/*`, writes,
-//! unknown methods, `HEAD`, `If-None-Match` on `GET`), parses
-//! `PROPFIND`/`REPORT` bodies, and hands the handler only an
-//! authenticated read: `GET`, `PROPFIND` or `REPORT`.
+//! protocol-agnostic itself (`OPTIONS`, `/.well-known/*`, the write
+//! methods no feature serves, unknown methods, `HEAD`, `If-None-Match`
+//! on `GET`), parses `PROPFIND`/`REPORT` bodies, and hands the handler
+//! the authenticated request: `GET`, `PROPFIND`, `REPORT` and, when the
+//! feature serves writes, `PUT` and `DELETE`.
 
 use async_trait::async_trait;
 
@@ -35,6 +36,11 @@ pub enum DavMethod {
     Propfind(PropRequest),
     /// `REPORT`, any report name.
     Report(Box<Report>),
+    /// `PUT`; the raw body arrives in [`DavRequest::body`], preconditions
+    /// (`If-None-Match`, `If-Match`) are the handler's to enforce.
+    Put,
+    /// `DELETE`.
+    Delete,
 }
 
 /// One authenticated request.
@@ -154,6 +160,29 @@ impl DavResponse {
     }
 }
 
+/// Whether a condition (an `If-None-Match` value) matches `etag`: weak
+/// comparison (RFC 9110 §13.1.2), used by the session's `304` path and
+/// the handler's PUT `If-None-Match` check. `*` matches any current
+/// representation, a comma list matches when any member does.
+pub fn etag_matches(condition: &str, etag: &str) -> bool {
+    let opaque = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    let etag = opaque(etag);
+    condition
+        .split(',')
+        .any(|candidate| candidate.trim() == "*" || opaque(candidate) == etag)
+}
+
+/// Whether `condition` — an `If-Match` value — matches `etag`: strong
+/// comparison (RFC 9110 §13.1.1). `*` matches any current
+/// representation; a list matches when a member equals the stored
+/// strong ETag exactly — a weak `W/…` candidate never matches.
+pub fn strong_etag_matches(condition: &str, etag: &str) -> bool {
+    condition.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate == etag.trim()
+    })
+}
+
 /// A DAV feature: what is served under its root.
 #[async_trait]
 pub trait DavHandler: Send + Sync {
@@ -179,8 +208,22 @@ pub trait DavHandler: Send + Sync {
     /// answers `404`.
     fn well_known(&self, service: WellKnown) -> Option<String>;
 
-    /// Serve one authenticated read. Errors become a fixed-text `503`
+    /// Serve one authenticated request. Errors become a fixed-text `503`
     /// (`Error::Network`) or `500` (anything else); the error text is
     /// never sent or logged.
     async fn handle(&self, request: &DavRequest) -> Result<DavResponse>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strong_etag_matches;
+
+    #[test]
+    fn strong_matching_is_exact_and_rejects_weak_candidates() {
+        assert!(strong_etag_matches("*", "\"a\""));
+        assert!(strong_etag_matches("\"a\"", "\"a\""));
+        assert!(strong_etag_matches("\"x\", \"a\"", "\"a\""));
+        assert!(!strong_etag_matches("W/\"a\"", "\"a\""));
+        assert!(!strong_etag_matches("\"b\"", "\"a\""));
+    }
 }

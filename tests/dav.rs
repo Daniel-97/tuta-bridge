@@ -1,9 +1,10 @@
 //! Integration contract for the shared DAV layer: HTTP/1.1 framing and
 //! keep-alive, Basic auth against the bridge password (failure delay,
 //! the shared login gate, lockout), the generic answers (OPTIONS,
-//! well-known redirects, read-only writes, unknown methods, 304), and
-//! PROPFIND/REPORT routed to a scripted handler — over an in-memory
-//! duplex, plus one round through the TLS accept loop.
+//! well-known redirects, the write refusal, unknown methods, 304),
+//! PROPFIND/REPORT routed to a scripted handler, and PUT/DELETE handed
+//! to it — over an in-memory duplex, plus one round through the TLS
+//! accept loop.
 
 mod support;
 
@@ -131,6 +132,10 @@ impl DavHandler for FakeHandler {
                     .collect();
                 Ok(DavResponse::multistatus(&entries, None))
             }
+            DavMethod::Put | DavMethod::Delete => Ok(DavResponse::text(
+                403,
+                "forbidden: this server is read-only",
+            )),
         }
     }
 }
@@ -439,8 +444,6 @@ async fn every_write_method_is_forbidden_with_a_fixed_body() {
     let (handler, mut wire, session) = spawn();
     let auth = auth_header();
     for method in [
-        "PUT",
-        "DELETE",
         "PROPPATCH",
         "MKCOL",
         "MKCALENDAR",
@@ -461,6 +464,35 @@ async fn every_write_method_is_forbidden_with_a_fixed_body() {
         );
     }
     assert!(handler.seen().is_empty());
+    drop(wire);
+    session.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn put_and_delete_are_handed_to_the_handler() {
+    let (handler, mut wire, session) = spawn();
+    let auth = auth_header();
+    let response = wire
+        .request(
+            "PUT",
+            ITEM,
+            &[&auth, "Content-Type: text/vcard", "If-Match: \"x\""],
+            VCARD,
+        )
+        .await;
+    assert_eq!(response.status, 403);
+    assert_eq!(response.body, "forbidden: this server is read-only\n");
+    let response = wire.request("DELETE", ITEM, &[&auth], "").await;
+    assert_eq!(response.status, 403);
+    assert_eq!(response.body, "forbidden: this server is read-only\n");
+
+    let seen = handler.seen();
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(seen[0].method, DavMethod::Put));
+    assert!(matches!(seen[1].method, DavMethod::Delete));
+    assert_eq!(seen[0].path, ITEM);
+    assert_eq!(seen[0].body, VCARD.as_bytes());
+    assert_eq!(seen[0].header("if-match"), Some("\"x\""));
     drop(wire);
     session.await.unwrap().unwrap();
 }

@@ -24,6 +24,7 @@ use tuta_bridge::ports::prompt::LoginPrompt;
 use tuta_bridge::ports::renderer::MessageRenderer;
 use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
 use tuta_bridge::ports::state_store::StateStore;
+use tuta_bridge::ports::{ContactFields, ContactRef, ContactWriter, DeleteOutcome};
 
 // ---------------------------------------------------------------------------
 // FakePrompt
@@ -1915,6 +1916,133 @@ impl FakeContactSource {
 
     pub fn single_loads(&self) -> usize {
         self.single_loads.load(Ordering::SeqCst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeContactWriter (CardDAV)
+// ---------------------------------------------------------------------------
+
+/// One recorded `put_contact`: the list it addressed, the fields it
+/// carried, and the contact it updated (`None` on a create). Holds
+/// personal data: no `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecordedPut {
+    pub list_id: String,
+    pub fields: ContactFields,
+    pub existing: Option<ContactRef>,
+}
+
+/// A [`ContactWriter`] that records every call, scriptable to fail with
+/// the fixed error, to answer creates with a scripted ref, and to
+/// answer deletes with a scripted outcome.
+pub struct FakeContactWriter {
+    /// Every put in call order.
+    pub puts: Mutex<Vec<RecordedPut>>,
+    /// Every delete in call order.
+    pub deletes: Mutex<Vec<ContactRef>>,
+    /// While set, every call fails with the fixed network error.
+    pub failing: Mutex<bool>,
+    /// The ref every create answers with; when `None` a fresh
+    /// `generated-<n>` id is minted per create.
+    pub create_ref: Mutex<Option<ContactRef>>,
+    /// The outcome every delete answers with (default `Deleted`).
+    pub delete_outcome: Mutex<DeleteOutcome>,
+    created: AtomicUsize,
+}
+
+impl Default for FakeContactWriter {
+    fn default() -> Self {
+        Self {
+            puts: Mutex::new(Vec::new()),
+            deletes: Mutex::new(Vec::new()),
+            failing: Mutex::new(false),
+            create_ref: Mutex::new(None),
+            delete_outcome: Mutex::new(DeleteOutcome::Deleted),
+            created: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl FakeContactWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Answer every create with this ref.
+    pub fn answering_create(self, list_id: &str, element_id: &str) -> Self {
+        *self.create_ref.lock().unwrap() = Some(ContactRef {
+            list_id: list_id.into(),
+            element_id: element_id.into(),
+        });
+        self
+    }
+
+    pub fn set_failing(&self, failing: bool) {
+        *self.failing.lock().unwrap() = failing;
+    }
+
+    /// The `(list id, existing ref)` pairs of every put, in order.
+    pub fn put_calls(&self) -> Vec<(String, Option<ContactRef>)> {
+        self.puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|put| (put.list_id.clone(), put.existing.clone()))
+            .collect()
+    }
+
+    /// A clone of the nth put's fields.
+    pub fn fields_of_put(&self, index: usize) -> Option<ContactFields> {
+        self.puts
+            .lock()
+            .unwrap()
+            .get(index)
+            .map(|put| put.fields.clone())
+    }
+
+    /// Every delete, in order.
+    pub fn delete_calls(&self) -> Vec<ContactRef> {
+        self.deletes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ContactWriter for FakeContactWriter {
+    async fn put_contact(
+        &self,
+        list_id: &str,
+        fields: &ContactFields,
+        existing: Option<&ContactRef>,
+    ) -> Result<ContactRef> {
+        self.puts.lock().unwrap().push(RecordedPut {
+            list_id: list_id.into(),
+            fields: fields.clone(),
+            existing: existing.cloned(),
+        });
+        if *self.failing.lock().unwrap() {
+            return Err(Error::Network("dav write failed".into()));
+        }
+        if let Some(existing) = existing {
+            return Ok(existing.clone());
+        }
+        Ok(self
+            .create_ref
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| ContactRef {
+                list_id: list_id.into(),
+                element_id: format!("generated-{}", self.created.fetch_add(1, Ordering::SeqCst)),
+            }))
+    }
+
+    async fn delete_contact(&self, id: &ContactRef) -> Result<DeleteOutcome> {
+        self.deletes.lock().unwrap().push(id.clone());
+        if *self.failing.lock().unwrap() {
+            return Err(Error::Network("dav write failed".into()));
+        }
+        Ok(*self.delete_outcome.lock().unwrap())
     }
 }
 

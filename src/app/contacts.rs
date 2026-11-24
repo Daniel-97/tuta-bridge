@@ -14,6 +14,9 @@
 //! skipped), an event refresh leaves the row alone. It is not served
 //! until it decrypts again (a fetch answers `404`).
 //!
+//! The DAV write path applies an accepted remote write the same way an
+//! event refresh does.
+//!
 //! Output and errors carry fixed text and counters only.
 
 use std::collections::HashMap;
@@ -221,6 +224,36 @@ impl ContactBook {
         self.store()
             .contact_changes_since(self.account_id, revision)
             .await
+    }
+
+    /// Apply one contact write the remote side has already accepted: the
+    /// same upsert a refresh applies, which keeps an unchanged ETag (and
+    /// the revision with it) as it is — the echo of the same change
+    /// counts once. A store failure marks the book stale so the next
+    /// request reloads and heals the row.
+    pub async fn apply_written(&self, entry: &ContactEntry) -> Result<()> {
+        let _guard = self.write.lock().await;
+        self.store()
+            .update_contacts(self.account_id, std::slice::from_ref(entry), &[])
+            .await
+            .inspect_err(|_| self.mark_stale())
+            .map(|_| ())
+    }
+
+    /// Apply one contact deletion the remote side has already confirmed:
+    /// the row becomes a tombstone the sync reports. A store failure
+    /// marks the book stale so the next request reloads and heals it.
+    pub async fn apply_deleted(&self, element_id: &str) -> Result<()> {
+        let _guard = self.write.lock().await;
+        self.store()
+            .update_contacts(
+                self.account_id,
+                &[],
+                std::slice::from_ref(&element_id.to_string()),
+            )
+            .await
+            .inspect_err(|_| self.mark_stale())
+            .map(|_| ())
     }
 
     /// Render one cached contact from the SDK. `None` when it is gone
