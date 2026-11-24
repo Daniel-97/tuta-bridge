@@ -1,0 +1,1153 @@
+//! Write contacts and calendar events through the SDK's generic
+//! encrypted-entity path, and delete them the way the web client does.
+//!
+//! Creates go through `CryptoEntityClient::create_instance`: the
+//! session key is generated here, owner-encrypted with the owner
+//! group's current key the same way [`super::mail_sender`] encrypts a
+//! draft's session key, and handed to the SDK alongside the entity.
+//! The SDK encrypts the payload and posts it; the server fills in the
+//! element id. Updates load the stored instance (the SDK resolves the
+//! session key from its `_ownerEncSessionKey`), apply the fields in
+//! place and `update_instance` it back.
+//!
+//! Deletions cannot use the SDK's `erase_list_element`: at the pinned
+//! rev it is a `todo!()`. The web client's `entityClient.erase` is a
+//! plain authenticated `DELETE` on the entity REST endpoint, so the
+//! writer issues the same request through the session's `RestClient`
+//! with `cv`, `v` (type model version 118 for both types) and the
+//! access token; a 404 answers `Gone`, auth rejections map to the
+//! session error, everything else to the fixed write failure.
+//!
+//! One deliberate simplification of the web client's edit: rewritten
+//! aggregate rows (mail addresses, phones, ...) get fresh ids instead
+//! of keeping the ids of value-identical rows. Nothing observable
+//! keys on aggregate ids - the domain card is flat, and the server
+//! stores whatever ids the client sends, as it must for the rows the
+//! web client itself adds.
+//!
+//! Errors are fixed strings: no id, name, address or title ever
+//! appears in one.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crypto_primitives::aes::{Aes256Key, InitializationVector};
+use crypto_primitives::key::GenericAesKey;
+use crypto_primitives::randomizer_facade::RandomizerFacade;
+use rand_core::OsRng;
+use tutasdk::bindings::rest_client::{HttpMethod, RestClient, RestClientOptions};
+use tutasdk::bindings::suspendable_rest_client::SuspensionBehavior;
+use tutasdk::date::DateTime;
+use tutasdk::entities::generated::sys::{DateWrapper, GroupMembership};
+use tutasdk::entities::generated::tutanota::{
+    AdvancedRepeatRule, CalendarEvent, CalendarRepeatRule, Contact, ContactAddress,
+    ContactCustomDate, ContactMailAddress, ContactPhoneNumber, ContactRelationship, ContactWebsite,
+    EncryptedMailAddress,
+};
+use tutasdk::{
+    CustomId, GeneratedId, IdTupleCustom, IdTupleGenerated, LoggedInSdk, CLIENT_VERSION,
+};
+
+use super::generated_id::timestamp_to_generated_id;
+use crate::domain::{ContactFieldKind, ContactRelationKind, Error, RepeatRule, Result};
+use crate::ports::dav_writer::{
+    CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DeleteOutcome,
+    EventFields, EventRef,
+};
+
+/// REST path segment of the `Contact` type.
+const CONTACT_PATH: &str = "contact";
+/// REST path segment of the `CalendarEvent` type.
+const EVENT_PATH: &str = "calendarevent";
+/// Type model version of `Contact` and `CalendarEvent`: the `v` header
+/// a raw request must carry.
+const TYPE_MODEL_VERSION: &str = "118";
+/// `GroupType.Contact`: the membership whose group owns the account's
+/// contacts.
+const CONTACT_GROUP_TYPE: Option<i64> = Some(6);
+/// `RepeatRuleEndType.NEVER`: a rule without an end repeats forever,
+/// which is what files an event into the long-events list.
+const REPEAT_END_NEVER: i64 = 0;
+
+fn write_failed() -> Error {
+    Error::Network("dav write failed".into())
+}
+
+/// The session error a rejected raw request answers with: the same
+/// fixed text the session resume uses.
+fn session_invalid() -> Error {
+    Error::Login("session is no longer valid; run login again".into())
+}
+
+/// The owner-encrypted session key of a new entity: what the server
+/// stores so the owner group can read the entity. The raw session key
+/// travels beside it into `create_instance`, not into the entity.
+pub struct SessionKeyMaterial {
+    pub owner_enc_session_key: Vec<u8>,
+    pub owner_key_version: i64,
+}
+
+/// Wall-clock milliseconds, for the ids and uids a write stamps.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A Tuta `DateTime`, clamped to the epoch like the reader clamps on
+/// the way out (times before 1970 cannot be stored).
+fn date_time(ms: i64) -> DateTime {
+    DateTime::from_millis(u64::try_from(ms).unwrap_or(0))
+}
+
+/// The contact owner group: the group of the account's Contact-group
+/// membership, `None` for an account without one.
+pub fn contact_owner_group<'a, I>(memberships: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a GroupMembership>,
+{
+    memberships
+        .into_iter()
+        .find(|membership| membership.groupType == CONTACT_GROUP_TYPE)
+        .map(|membership| membership.group.0.clone())
+}
+
+/// The uid of a new event that carries none, the way the web client
+/// generates one: `{calendar group id}{timestamp}@tuta.com`.
+fn generated_event_uid(group_id: &str, now_ms: i64) -> String {
+    format!("{group_id}{now_ms}@tuta.com")
+}
+
+/// Fresh ids for rewritten aggregate rows, stamped from the wall clock
+/// the way the web client stamps its added rows; every id of one call
+/// is unique because each row advances the tick.
+struct FreshIds {
+    next_ms: i64,
+}
+
+impl FreshIds {
+    fn next(&mut self) -> CustomId {
+        let id = CustomId(timestamp_to_generated_id(self.next_ms));
+        self.next_ms = self.next_ms.saturating_add(1);
+        id
+    }
+}
+
+/// A text field Tuta keeps nullable: `None` when unset, the way the
+/// web client leaves it.
+fn opt_text(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// `ContactAddressType` / `ContactWebsiteType`: PRIVATE 0, WORK 1,
+/// OTHER 2, CUSTOM 3 — the inverse of the reader's mapping.
+fn address_code(kind: ContactFieldKind) -> i64 {
+    match kind {
+        ContactFieldKind::Home => 0,
+        ContactFieldKind::Work => 1,
+        ContactFieldKind::Custom => 3,
+        ContactFieldKind::Mobile | ContactFieldKind::Fax | ContactFieldKind::Other => 2,
+    }
+}
+
+/// `ContactPhoneNumberType`: PRIVATE 0, WORK 1, MOBILE 2, FAX 3,
+/// OTHER 4, CUSTOM 5.
+fn phone_code(kind: ContactFieldKind) -> i64 {
+    match kind {
+        ContactFieldKind::Home => 0,
+        ContactFieldKind::Work => 1,
+        ContactFieldKind::Mobile => 2,
+        ContactFieldKind::Fax => 3,
+        ContactFieldKind::Custom => 5,
+        ContactFieldKind::Other => 4,
+    }
+}
+
+/// `ContactRelationshipType`: PARENT 0, BROTHER 1, SISTER 2, CHILD 3,
+/// FRIEND 4, RELATIVE 5, SPOUSE 6, PARTNER 7, ASSISTANT 8, MANAGER 9,
+/// OTHER 10, CUSTOM 11. The reader folds BROTHER and SISTER into one
+/// kind; the writer picks the first of the pair.
+fn relation_code(kind: ContactRelationKind) -> i64 {
+    match kind {
+        ContactRelationKind::Parent => 0,
+        ContactRelationKind::Sibling => 1,
+        ContactRelationKind::Child => 3,
+        ContactRelationKind::Friend => 4,
+        ContactRelationKind::Relative => 5,
+        ContactRelationKind::Spouse => 6,
+        ContactRelationKind::Partner => 7,
+        ContactRelationKind::Assistant => 8,
+        ContactRelationKind::Manager => 9,
+        ContactRelationKind::Other => 10,
+    }
+}
+
+/// The `anniversary` kind of Tuta's custom dates (the reader's filter).
+const ANNIVERSARY_TYPE: i64 = 0;
+
+fn mail_address(field: &crate::domain::ContactField, id: Option<CustomId>) -> ContactMailAddress {
+    ContactMailAddress {
+        _id: id,
+        r#type: address_code(field.kind),
+        address: field.value.clone(),
+        customTypeName: String::new(),
+        _errors: Default::default(),
+    }
+}
+
+fn phone_number(field: &crate::domain::ContactField, id: Option<CustomId>) -> ContactPhoneNumber {
+    ContactPhoneNumber {
+        _id: id,
+        r#type: phone_code(field.kind),
+        number: field.value.clone(),
+        customTypeName: String::new(),
+        _errors: Default::default(),
+    }
+}
+
+fn postal_address(field: &crate::domain::ContactField, id: Option<CustomId>) -> ContactAddress {
+    ContactAddress {
+        _id: id,
+        r#type: address_code(field.kind),
+        address: field.value.clone(),
+        customTypeName: String::new(),
+        _errors: Default::default(),
+    }
+}
+
+fn website(field: &crate::domain::ContactField, id: Option<CustomId>) -> ContactWebsite {
+    ContactWebsite {
+        _id: id,
+        r#type: address_code(field.kind),
+        customTypeName: String::new(),
+        url: field.value.clone(),
+        _errors: Default::default(),
+    }
+}
+
+fn relationship(
+    relation: &crate::domain::ContactRelation,
+    id: Option<CustomId>,
+) -> ContactRelationship {
+    ContactRelationship {
+        _id: id,
+        r#type: relation_code(relation.kind),
+        customTypeName: String::new(),
+        person: relation.person.clone(),
+        _errors: Default::default(),
+    }
+}
+
+fn anniversary(date_iso: &str, id: Option<CustomId>) -> ContactCustomDate {
+    ContactCustomDate {
+        _id: id,
+        r#type: ANNIVERSARY_TYPE,
+        customTypeName: String::new(),
+        dateIso: date_iso.to_string(),
+        _errors: Default::default(),
+    }
+}
+
+/// A new `Contact` in the web client's `createNewContact` shape: the
+/// writable fields applied, the rest at their documented defaults
+/// (empty strings, nulls, empty lists), the owner-encrypted session
+/// key and owner group set, and the id prepared for the server to
+/// fill. The aggregate rows carry no ids: the server assigns them on
+/// create, exactly as it does for the web client's null-id rows.
+pub fn contact_entity(
+    fields: &ContactFields,
+    list_id: &str,
+    owner_group: &str,
+    key: &SessionKeyMaterial,
+) -> Contact {
+    Contact {
+        _id: Some(IdTupleGenerated {
+            list_id: GeneratedId(list_id.to_string()),
+            element_id: Default::default(),
+        }),
+        _permissions: Default::default(),
+        _format: 0,
+        _ownerEncSessionKey: Some(key.owner_enc_session_key.clone()),
+        _ownerGroup: Some(GeneratedId(owner_group.to_string())),
+        _ownerKeyVersion: Some(key.owner_key_version),
+        _kdfNonce: None,
+        firstName: fields.first_name.clone(),
+        lastName: fields.last_name.clone(),
+        company: fields.company.clone(),
+        role: fields.role.clone(),
+        oldBirthdayDate: None,
+        comment: fields.comment.clone(),
+        presharedPassword: None,
+        nickname: opt_text(&fields.nickname),
+        title: opt_text(&fields.title),
+        birthdayIso: fields.birthday.clone(),
+        middleName: opt_text(&fields.middle_name),
+        nameSuffix: opt_text(&fields.name_suffix),
+        phoneticFirst: None,
+        phoneticMiddle: None,
+        phoneticLast: None,
+        department: opt_text(&fields.department),
+        mailAddresses: fields
+            .emails
+            .iter()
+            .map(|field| mail_address(field, None))
+            .collect(),
+        phoneNumbers: fields
+            .phones
+            .iter()
+            .map(|field| phone_number(field, None))
+            .collect(),
+        addresses: fields
+            .addresses
+            .iter()
+            .map(|field| postal_address(field, None))
+            .collect(),
+        socialIds: Vec::new(),
+        oldBirthdayAggregate: None,
+        photo: None,
+        customDate: fields
+            .anniversaries
+            .iter()
+            .map(|iso| anniversary(iso, None))
+            .collect(),
+        websites: fields
+            .websites
+            .iter()
+            .map(|field| website(field, None))
+            .collect(),
+        relationships: fields
+            .relations
+            .iter()
+            .map(|relation| relationship(relation, None))
+            .collect(),
+        messengerHandles: Vec::new(),
+        pronouns: Vec::new(),
+        _errors: Default::default(),
+    }
+}
+
+/// Apply the writable fields onto a loaded contact (the update path).
+/// The ids, owner encryption, permissions and the legacy birthday
+/// aggregate stay as loaded - the latter is never rewritten: the
+/// reader prefers the ISO date and the legacy form cannot be written
+/// back. Rewritten aggregate rows get fresh ids (see the module doc).
+pub fn apply_contact_fields(contact: &mut Contact, fields: &ContactFields, now_ms: i64) {
+    contact.firstName = fields.first_name.clone();
+    contact.lastName = fields.last_name.clone();
+    contact.company = fields.company.clone();
+    contact.role = fields.role.clone();
+    contact.comment = fields.comment.clone();
+    contact.title = opt_text(&fields.title);
+    contact.nickname = opt_text(&fields.nickname);
+    contact.middleName = opt_text(&fields.middle_name);
+    contact.nameSuffix = opt_text(&fields.name_suffix);
+    contact.department = opt_text(&fields.department);
+    contact.birthdayIso = fields.birthday.clone();
+    let mut ids = FreshIds { next_ms: now_ms };
+    contact.mailAddresses = fields
+        .emails
+        .iter()
+        .map(|field| mail_address(field, Some(ids.next())))
+        .collect();
+    contact.phoneNumbers = fields
+        .phones
+        .iter()
+        .map(|field| phone_number(field, Some(ids.next())))
+        .collect();
+    contact.addresses = fields
+        .addresses
+        .iter()
+        .map(|field| postal_address(field, Some(ids.next())))
+        .collect();
+    contact.customDate = fields
+        .anniversaries
+        .iter()
+        .map(|iso| anniversary(iso, Some(ids.next())))
+        .collect();
+    contact.websites = fields
+        .websites
+        .iter()
+        .map(|field| website(field, Some(ids.next())))
+        .collect();
+    contact.relationships = fields
+        .relations
+        .iter()
+        .map(|relation| relationship(relation, Some(ids.next())))
+        .collect();
+}
+
+/// The time zones stored on an event: none for an all-day one (its
+/// bounds sit on UTC midnight), the fields' zone for a timed one —
+/// the web client importer's rule.
+fn event_zones(fields: &EventFields) -> (Option<String>, Option<String>) {
+    if fields.all_day {
+        (None, None)
+    } else {
+        (fields.time_zone.clone(), fields.time_zone.clone())
+    }
+}
+
+/// A Tuta repeat rule from the domain one. The id is kept on updates
+/// (the web client updates the progenitor's rule instead of replacing
+/// it) and left to the server on creates.
+fn repeat_rule(rule: &RepeatRule, id: Option<CustomId>) -> CalendarRepeatRule {
+    CalendarRepeatRule {
+        _id: id,
+        frequency: rule.frequency,
+        endType: rule.end_type,
+        endValue: rule.end_value,
+        interval: rule.interval,
+        timeZone: rule.time_zone.clone(),
+        excludedDates: rule
+            .excluded_ms
+            .iter()
+            .map(|ms| DateWrapper {
+                _id: None,
+                date: date_time(*ms),
+                _errors: Default::default(),
+            })
+            .collect(),
+        advancedRules: rule
+            .advanced
+            .iter()
+            .map(|(kind, value)| AdvancedRepeatRule {
+                _id: None,
+                ruleType: *kind,
+                interval: value.clone(),
+                _errors: Default::default(),
+            })
+            .collect(),
+        _errors: Default::default(),
+    }
+}
+
+fn event_organizer(person: &crate::domain::EventPerson) -> EncryptedMailAddress {
+    EncryptedMailAddress {
+        _id: None,
+        name: person.name.clone(),
+        address: person.address.clone(),
+        _errors: Default::default(),
+    }
+}
+
+/// A new `CalendarEvent` in the web client editor's create shape: the
+/// writable fields applied, the sequence at zero, no attendees, alarms
+/// or recurrence (the importer refuses those events before a write),
+/// the owner-encrypted session key and owner group set, and the id
+/// prepared for the server to fill.
+pub fn event_entity(
+    fields: &EventFields,
+    list_id: &str,
+    owner_group: &str,
+    uid: &str,
+    key: &SessionKeyMaterial,
+) -> CalendarEvent {
+    let (start_zone, end_zone) = event_zones(fields);
+    CalendarEvent {
+        _id: Some(IdTupleCustom {
+            list_id: GeneratedId(list_id.to_string()),
+            element_id: Default::default(),
+        }),
+        _permissions: Default::default(),
+        _format: 0,
+        _ownerGroup: Some(GeneratedId(owner_group.to_string())),
+        _ownerEncSessionKey: Some(key.owner_enc_session_key.clone()),
+        _ownerKeyVersion: Some(key.owner_key_version),
+        _kdfNonce: None,
+        summary: fields.summary.clone(),
+        description: fields.description.clone(),
+        startTime: date_time(fields.start_ms),
+        endTime: date_time(fields.end_ms),
+        location: fields.location.clone(),
+        uid: Some(uid.to_string()),
+        hashedUid: None,
+        sequence: 0,
+        invitedConfidentially: Some(false),
+        recurrenceId: None,
+        sender: None,
+        pendingInvitation: Some(false),
+        startTimeZone: start_zone,
+        endTimeZone: end_zone,
+        repeatRule: fields.repeat.as_ref().map(|rule| repeat_rule(rule, None)),
+        alarmInfos: Vec::new(),
+        attendees: Vec::new(),
+        organizer: fields.organizer.as_ref().map(event_organizer),
+        _errors: Default::default(),
+    }
+}
+
+/// Apply the writable fields onto a loaded event (the update path).
+/// The ids, owner encryption, permissions, alarms and attendees stay
+/// as loaded; the stored uid is identity (the web client never edits
+/// it), save that a legacy event without one takes the fields', the
+/// way the web client repairs such events. The sequence bumps on
+/// every edit, like the web client's `incrementSequence`, and the
+/// repeat rule keeps its id when the loaded event had one.
+pub fn apply_event_fields(event: &mut CalendarEvent, fields: &EventFields) {
+    event.summary = fields.summary.clone();
+    event.description = fields.description.clone();
+    event.location = fields.location.clone();
+    event.startTime = date_time(fields.start_ms);
+    event.endTime = date_time(fields.end_ms);
+    let (start_zone, end_zone) = event_zones(fields);
+    event.startTimeZone = start_zone;
+    event.endTimeZone = end_zone;
+    event.organizer = fields.organizer.as_ref().map(event_organizer);
+    if event.uid.is_none() {
+        event.uid = fields.uid.clone();
+    }
+    // The progenitor's rule is updated, not replaced: keep its id.
+    let rule_id = event.repeatRule.as_ref().and_then(|rule| rule._id.clone());
+    event.repeatRule = fields
+        .repeat
+        .as_ref()
+        .map(|rule| repeat_rule(rule, rule_id));
+    event.sequence = event.sequence.saturating_add(1);
+}
+
+/// Which event list a write goes to (the plan's decision): the long
+/// list for a repeating unbounded event, the short list for everything
+/// else (non-recurring or bounded by `UNTIL`/`COUNT`).
+pub fn choose_event_list<'a>(calendar: &'a CalendarRef, fields: &EventFields) -> &'a str {
+    match &fields.repeat {
+        Some(rule) if rule.end_type == REPEAT_END_NEVER => &calendar.long_list_id,
+        _ => &calendar.short_list_id,
+    }
+}
+
+/// The URL of the raw entity DELETE the web client's
+/// `entityClient.erase` issues.
+pub fn entity_delete_url(
+    base_url: &str,
+    type_path: &str,
+    list_id: &str,
+    element_id: &str,
+) -> String {
+    format!("{base_url}/rest/tutanota/{type_path}/{list_id}/{element_id}")
+}
+
+/// Map a raw delete response: a 404 means the entity had already
+/// vanished remotely, a rejected session is the session error, and
+/// every other status is the fixed write failure.
+fn delete_outcome(status: u32) -> Result<DeleteOutcome> {
+    match status {
+        200..=299 => Ok(DeleteOutcome::Deleted),
+        404 => Ok(DeleteOutcome::Gone),
+        401 | 403 => Err(session_invalid()),
+        _ => Err(write_failed()),
+    }
+}
+
+/// [`ContactWriter`] and [`CalendarWriter`] over the logged-in Tuta
+/// SDK. The rest client, base url and access token are constructor
+/// arguments so the tests can substitute them; the SDK carries the
+/// create and update cryptography.
+pub struct TutaDavWriter {
+    logged: Arc<LoggedInSdk>,
+    rest: Arc<dyn RestClient>,
+    base_url: String,
+    access_token: String,
+}
+
+impl TutaDavWriter {
+    pub fn new(
+        logged: Arc<LoggedInSdk>,
+        rest: Arc<dyn RestClient>,
+        base_url: String,
+        access_token: String,
+    ) -> Self {
+        Self {
+            logged,
+            rest,
+            base_url,
+            access_token,
+        }
+    }
+
+    /// A fresh session key and the material that grants the owner
+    /// group access to it: the same owner-encryption the draft path
+    /// applies, keyed with the group's current symmetric key.
+    async fn owner_key_material(
+        &self,
+        group_id: &str,
+    ) -> Result<(SessionKeyMaterial, GenericAesKey)> {
+        let group = GeneratedId(group_id.to_string());
+        let group_key = self
+            .logged
+            .get_current_sym_group_key(&group)
+            .await
+            .map_err(|_| write_failed())?;
+        let random = RandomizerFacade::from_core(OsRng);
+        let session_key: GenericAesKey = Aes256Key::generate(&random).into();
+        let owner_enc_session_key = group_key
+            .object
+            .encrypt_key(&session_key, InitializationVector::generate(&random));
+        let owner_key_version = i64::try_from(group_key.version).map_err(|_| write_failed())?;
+        Ok((
+            SessionKeyMaterial {
+                owner_enc_session_key,
+                owner_key_version,
+            },
+            session_key,
+        ))
+    }
+
+    /// The raw entity DELETE (decision 8): authenticated with the
+    /// access token, `cv` and the type model version, like every
+    /// other entity request the clients send.
+    async fn delete_entity(
+        &self,
+        type_path: &str,
+        list_id: &str,
+        element_id: &str,
+    ) -> Result<DeleteOutcome> {
+        let url = entity_delete_url(&self.base_url, type_path, list_id, element_id);
+        let mut headers = HashMap::new();
+        headers.insert("cv".to_string(), CLIENT_VERSION.to_string());
+        headers.insert("v".to_string(), TYPE_MODEL_VERSION.to_string());
+        headers.insert("accessToken".to_string(), self.access_token.clone());
+        let options = RestClientOptions {
+            headers,
+            body: None,
+            suspension_behavior: Some(SuspensionBehavior::Suspend),
+        };
+        let response = self
+            .rest
+            .request_binary(url, HttpMethod::DELETE, options)
+            .await
+            .map_err(|_| write_failed())?;
+        delete_outcome(response.status)
+    }
+}
+
+#[async_trait::async_trait]
+impl ContactWriter for TutaDavWriter {
+    async fn put_contact(
+        &self,
+        list_id: &str,
+        fields: &ContactFields,
+        existing: Option<&ContactRef>,
+    ) -> Result<ContactRef> {
+        let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+        if let Some(existing) = existing {
+            let id = IdTupleGenerated::new(
+                GeneratedId(existing.list_id.clone()),
+                GeneratedId(existing.element_id.clone()),
+            );
+            let mut contact: Contact = crypto_client.load(&id).await.map_err(|_| write_failed())?;
+            apply_contact_fields(&mut contact, fields, now_ms());
+            crypto_client
+                .update_instance(contact)
+                .await
+                .map_err(|_| write_failed())?;
+            Ok(ContactRef {
+                list_id: existing.list_id.clone(),
+                element_id: existing.element_id.clone(),
+            })
+        } else {
+            let owner_group = contact_owner_group(self.logged.get_user().memberships.iter())
+                .ok_or_else(|| Error::Unsupported("this account has no contact group".into()))?;
+            let (key, session_key) = self.owner_key_material(&owner_group).await?;
+            let contact = contact_entity(fields, list_id, &owner_group, &key);
+            let created = crypto_client
+                .create_instance(contact, Some(session_key))
+                .await
+                .map_err(|_| write_failed())?;
+            let element_id = created.generatedId.ok_or_else(write_failed)?.0;
+            Ok(ContactRef {
+                list_id: list_id.to_string(),
+                element_id,
+            })
+        }
+    }
+
+    async fn delete_contact(&self, id: &ContactRef) -> Result<DeleteOutcome> {
+        self.delete_entity(CONTACT_PATH, &id.list_id, &id.element_id)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl CalendarWriter for TutaDavWriter {
+    async fn put_event(
+        &self,
+        calendar: &CalendarRef,
+        fields: &EventFields,
+        existing: Option<&EventRef>,
+    ) -> Result<EventRef> {
+        let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+        if let Some(existing) = existing {
+            let id = IdTupleCustom::new(
+                GeneratedId(existing.list_id.clone()),
+                CustomId(existing.element_id.clone()),
+            );
+            let mut event: CalendarEvent =
+                crypto_client.load(&id).await.map_err(|_| write_failed())?;
+            apply_event_fields(&mut event, fields);
+            crypto_client
+                .update_instance(event)
+                .await
+                .map_err(|_| write_failed())?;
+            Ok(EventRef {
+                list_id: existing.list_id.clone(),
+                element_id: existing.element_id.clone(),
+            })
+        } else {
+            let list_id = choose_event_list(calendar, fields);
+            let (key, session_key) = self.owner_key_material(&calendar.group_id).await?;
+            let uid = fields
+                .uid
+                .clone()
+                .unwrap_or_else(|| generated_event_uid(&calendar.group_id, now_ms()));
+            let event = event_entity(fields, list_id, &calendar.group_id, &uid, &key);
+            let created = crypto_client
+                .create_instance(event, Some(session_key))
+                .await
+                .map_err(|_| write_failed())?;
+            let element_id = created.generatedId.ok_or_else(write_failed)?.0;
+            Ok(EventRef {
+                list_id: list_id.to_string(),
+                element_id,
+            })
+        }
+    }
+
+    async fn delete_event(&self, _calendar: &CalendarRef, id: &EventRef) -> Result<DeleteOutcome> {
+        self.delete_entity(EVENT_PATH, &id.list_id, &id.element_id)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ContactField, ContactRelation, EventPerson};
+    use tutasdk::entities::generated::tutanota::{Birthday, CalendarEventAttendee};
+
+    fn key() -> SessionKeyMaterial {
+        SessionKeyMaterial {
+            owner_enc_session_key: b"owner-enc".to_vec(),
+            owner_key_version: 7,
+        }
+    }
+
+    fn membership(group_type: Option<i64>, group: &str) -> GroupMembership {
+        GroupMembership {
+            _id: None,
+            symEncGKey: Vec::new(),
+            admin: false,
+            groupType: group_type,
+            capability: None,
+            groupKeyVersion: 0,
+            symKeyVersion: 0,
+            group: GeneratedId(group.into()),
+            groupInfo: IdTupleGenerated::new(GeneratedId("i".into()), GeneratedId("e".into())),
+            groupMember: IdTupleGenerated::new(GeneratedId("i".into()), GeneratedId("e".into())),
+        }
+    }
+
+    fn fields() -> ContactFields {
+        ContactFields {
+            title: "Dr.".into(),
+            first_name: "First".into(),
+            middle_name: "Middle".into(),
+            last_name: "Last".into(),
+            name_suffix: "Jr.".into(),
+            nickname: "Nick".into(),
+            company: "Company".into(),
+            department: "Dept".into(),
+            role: "Role".into(),
+            birthday: Some("2000-01-02".into()),
+            anniversaries: vec!["2001-02-03".into()],
+            comment: "Comment".into(),
+            emails: vec![ContactField {
+                kind: ContactFieldKind::Work,
+                value: "a@b.example".into(),
+            }],
+            phones: vec![ContactField {
+                kind: ContactFieldKind::Mobile,
+                value: "123".into(),
+            }],
+            addresses: vec![ContactField {
+                kind: ContactFieldKind::Home,
+                value: "Street 1".into(),
+            }],
+            websites: vec![ContactField {
+                kind: ContactFieldKind::Other,
+                value: "https://x.example".into(),
+            }],
+            relations: vec![ContactRelation {
+                kind: ContactRelationKind::Spouse,
+                person: "P".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn the_contact_owner_group_is_the_contact_membership_group() {
+        let memberships = [
+            membership(Some(2), "mail-group"),
+            membership(Some(6), "contact-group"),
+        ];
+        assert_eq!(
+            contact_owner_group(memberships.iter()),
+            Some("contact-group".into())
+        );
+        let without = [membership(Some(2), "mail-group")];
+        assert_eq!(contact_owner_group(without.iter()), None);
+    }
+
+    #[test]
+    fn a_new_contact_maps_every_field_one_by_one() {
+        let contact = contact_entity(&fields(), "list", "group", &key());
+        assert_eq!(
+            contact._id,
+            Some(IdTupleGenerated {
+                list_id: GeneratedId("list".into()),
+                element_id: GeneratedId(String::new()),
+            })
+        );
+        assert_eq!(contact._ownerGroup, Some(GeneratedId("group".into())));
+        assert_eq!(
+            contact._ownerEncSessionKey.as_deref(),
+            Some(&b"owner-enc"[..])
+        );
+        assert_eq!(contact._ownerKeyVersion, Some(7));
+        assert_eq!(contact._format, 0);
+        assert_eq!(contact.firstName, "First");
+        assert_eq!(contact.lastName, "Last");
+        assert_eq!(contact.company, "Company");
+        assert_eq!(contact.role, "Role");
+        assert_eq!(contact.comment, "Comment");
+        assert_eq!(contact.title.as_deref(), Some("Dr."));
+        assert_eq!(contact.nickname.as_deref(), Some("Nick"));
+        assert_eq!(contact.middleName.as_deref(), Some("Middle"));
+        assert_eq!(contact.nameSuffix.as_deref(), Some("Jr."));
+        assert_eq!(contact.department.as_deref(), Some("Dept"));
+        assert_eq!(contact.birthdayIso.as_deref(), Some("2000-01-02"));
+        assert_eq!(contact.mailAddresses.len(), 1);
+        assert_eq!(contact.mailAddresses[0].r#type, 1);
+        assert_eq!(contact.mailAddresses[0].address, "a@b.example");
+        assert_eq!(contact.phoneNumbers[0].r#type, 2);
+        assert_eq!(contact.phoneNumbers[0].number, "123");
+        assert_eq!(contact.addresses[0].r#type, 0);
+        assert_eq!(contact.addresses[0].address, "Street 1");
+        assert_eq!(contact.websites[0].r#type, 2);
+        assert_eq!(contact.websites[0].url, "https://x.example");
+        assert_eq!(contact.relationships[0].r#type, 6);
+        assert_eq!(contact.relationships[0].person, "P");
+        assert_eq!(contact.customDate[0].r#type, 0);
+        assert_eq!(contact.customDate[0].dateIso, "2001-02-03");
+    }
+
+    #[test]
+    fn a_new_contact_keeps_the_web_client_defaults() {
+        let contact = contact_entity(&ContactFields::default(), "list", "group", &key());
+        assert_eq!(contact.firstName, "");
+        assert_eq!(contact.lastName, "");
+        assert_eq!(contact.company, "");
+        assert_eq!(contact.role, "");
+        assert_eq!(contact.comment, "");
+        for value in [
+            contact.title.as_deref(),
+            contact.nickname.as_deref(),
+            contact.middleName.as_deref(),
+            contact.nameSuffix.as_deref(),
+            contact.department.as_deref(),
+        ] {
+            assert_eq!(value, None);
+        }
+        assert_eq!(contact.birthdayIso, None);
+        assert_eq!(contact.oldBirthdayDate, None);
+        assert!(contact.oldBirthdayAggregate.is_none());
+        assert_eq!(contact.presharedPassword, None);
+        assert_eq!(contact.phoneticFirst, None);
+        assert_eq!(contact.photo, None);
+        assert!(contact.socialIds.is_empty());
+        assert!(contact.messengerHandles.is_empty());
+        assert!(contact.pronouns.is_empty());
+        assert!(contact.mailAddresses.is_empty());
+        // The aggregate rows carry no ids: the server assigns them.
+        assert!(contact._errors.is_empty());
+    }
+
+    #[test]
+    fn applying_fields_rewrites_the_aggregates_with_fresh_ids() {
+        let mut contact = contact_entity(&fields(), "list", "group", &key());
+        contact.oldBirthdayAggregate = Some(Birthday {
+            _id: None,
+            day: 2,
+            month: 9,
+            year: Some(2000),
+        });
+        let next = ContactFields {
+            title: "New".into(),
+            emails: vec![
+                ContactField {
+                    kind: ContactFieldKind::Home,
+                    value: "one@x.example".into(),
+                },
+                ContactField {
+                    kind: ContactFieldKind::Home,
+                    value: "two@x.example".into(),
+                },
+            ],
+            ..ContactFields::default()
+        };
+        apply_contact_fields(&mut contact, &next, 1_700_000_000_000);
+        assert_eq!(contact.title.as_deref(), Some("New"));
+        assert_eq!(contact.firstName, "");
+        // An unset nullable text clears the stored value.
+        assert_eq!(contact.nickname, None);
+        assert_eq!(contact.mailAddresses.len(), 2);
+        let first = contact.mailAddresses[0]._id.clone();
+        let second = contact.mailAddresses[1]._id.clone();
+        assert!(first.is_some());
+        assert!(
+            first.as_ref().unwrap().0 != second.as_ref().unwrap().0,
+            "every rewritten row gets its own id"
+        );
+        // The legacy birthday aggregate is never rewritten.
+        assert!(contact.oldBirthdayAggregate.is_some());
+        // The ids and owner encryption stay as loaded.
+        assert!(contact._id.is_some());
+        assert_eq!(
+            contact._ownerEncSessionKey.as_deref(),
+            Some(&b"owner-enc"[..])
+        );
+    }
+
+    fn event_fields() -> EventFields {
+        EventFields {
+            summary: "Summary".into(),
+            description: "Description".into(),
+            location: "Location".into(),
+            start_ms: 1_700_000_000_000,
+            end_ms: 1_700_003_600_000,
+            all_day: false,
+            time_zone: Some("Europe/Rome".into()),
+            repeat: Some(RepeatRule {
+                frequency: 1,
+                interval: 2,
+                end_type: 1,
+                end_value: Some(5),
+                time_zone: "Europe/Rome".into(),
+                excluded_ms: vec![1_700_000_000_000],
+                advanced: vec![(2, "MO".into())],
+            }),
+            uid: Some("uid-1".into()),
+            organizer: Some(EventPerson {
+                name: "Me".into(),
+                address: "me@tuta.example".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_new_event_maps_every_field_one_by_one() {
+        let event = event_entity(&event_fields(), "list", "group", "uid-1", &key());
+        assert_eq!(
+            event._id,
+            Some(IdTupleCustom {
+                list_id: GeneratedId("list".into()),
+                element_id: CustomId(String::new()),
+            })
+        );
+        assert_eq!(event._ownerGroup, Some(GeneratedId("group".into())));
+        assert_eq!(
+            event._ownerEncSessionKey.as_deref(),
+            Some(&b"owner-enc"[..])
+        );
+        assert_eq!(event._ownerKeyVersion, Some(7));
+        assert_eq!(event._format, 0);
+        assert_eq!(event.summary, "Summary");
+        assert_eq!(event.description, "Description");
+        assert_eq!(event.location, "Location");
+        assert_eq!(event.startTime.as_millis(), 1_700_000_000_000);
+        assert_eq!(event.endTime.as_millis(), 1_700_003_600_000);
+        assert_eq!(event.startTimeZone.as_deref(), Some("Europe/Rome"));
+        assert_eq!(event.endTimeZone.as_deref(), Some("Europe/Rome"));
+        assert_eq!(event.uid.as_deref(), Some("uid-1"));
+        assert_eq!(event.sequence, 0);
+        assert_eq!(event.hashedUid, None);
+        assert_eq!(event.recurrenceId, None);
+        assert_eq!(event.sender, None);
+        assert_eq!(event.invitedConfidentially, Some(false));
+        assert_eq!(event.pendingInvitation, Some(false));
+        assert!(event.alarmInfos.is_empty());
+        assert!(event.attendees.is_empty());
+        assert_eq!(
+            event
+                .organizer
+                .as_ref()
+                .map(|organizer| organizer.address.clone()),
+            Some("me@tuta.example".into())
+        );
+        let rule = event.repeatRule.unwrap();
+        assert_eq!(rule.frequency, 1);
+        assert_eq!(rule.endType, 1);
+        assert_eq!(rule.endValue, Some(5));
+        assert_eq!(rule.interval, 2);
+        assert_eq!(rule.timeZone, "Europe/Rome");
+        assert_eq!(rule.excludedDates.len(), 1);
+        assert_eq!(rule.excludedDates[0].date.as_millis(), 1_700_000_000_000);
+        assert_eq!(rule.advancedRules.len(), 1);
+        assert_eq!(rule.advancedRules[0].ruleType, 2);
+        assert_eq!(rule.advancedRules[0].interval, "MO");
+    }
+
+    #[test]
+    fn an_all_day_event_stores_no_zone_and_times_clamp_to_the_epoch() {
+        let mut fields = event_fields();
+        fields.all_day = true;
+        fields.time_zone = Some("Europe/Rome".into());
+        fields.start_ms = -1;
+        let event = event_entity(&fields, "list", "group", "uid-1", &key());
+        assert_eq!(event.startTimeZone, None);
+        assert_eq!(event.endTimeZone, None);
+        assert_eq!(event.startTime.as_millis(), 0);
+    }
+
+    #[test]
+    fn applying_event_fields_keeps_identity_and_bumps_the_sequence() {
+        let mut event = event_entity(&event_fields(), "list", "group", "stored-uid", &key());
+        event.sequence = 3;
+        event.alarmInfos = vec![IdTupleGenerated::new(
+            GeneratedId("alarms".into()),
+            GeneratedId("alarm".into()),
+        )];
+        event.attendees = vec![CalendarEventAttendee {
+            _id: None,
+            status: 1,
+            address: EncryptedMailAddress {
+                _id: None,
+                name: "Guest".into(),
+                address: "guest@x.example".into(),
+                _errors: Default::default(),
+            },
+            _errors: Default::default(),
+        }];
+        event.repeatRule.as_mut().unwrap()._id = Some(CustomId("rule-id".into()));
+
+        let mut fields = event_fields();
+        fields.summary = "Edited".into();
+        fields.uid = Some("client-uid".into());
+        fields.repeat = Some(RepeatRule {
+            frequency: 1,
+            interval: 1,
+            end_type: 0,
+            end_value: None,
+            time_zone: "Europe/Rome".into(),
+            excluded_ms: Vec::new(),
+            advanced: Vec::new(),
+        });
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.summary, "Edited");
+        // The stored uid is identity: the client's uid does not replace it.
+        assert_eq!(event.uid.as_deref(), Some("stored-uid"));
+        // Every edit bumps the sequence, like the web client's editor.
+        assert_eq!(event.sequence, 4);
+        // The progenitor's rule keeps its id.
+        assert!(event
+            .repeatRule
+            .as_ref()
+            .unwrap()
+            ._id
+            .as_ref()
+            .is_some_and(|id| id.0 == "rule-id"));
+        assert_eq!(event.repeatRule.as_ref().unwrap().endType, 0);
+        // Alarms and attendees are never touched by a write.
+        assert_eq!(event.alarmInfos.len(), 1);
+        assert_eq!(event.attendees.len(), 1);
+        // No repeat left: the rule is cleared.
+        let mut cleared = event_fields();
+        cleared.repeat = None;
+        apply_event_fields(&mut event, &cleared);
+        assert!(event.repeatRule.is_none());
+        assert_eq!(event.sequence, 5);
+    }
+
+    #[test]
+    fn a_legacy_event_without_a_uid_takes_the_fields_one() {
+        let mut event = event_entity(&event_fields(), "list", "group", "filled-later", &key());
+        event.uid = None;
+        let mut fields = event_fields();
+        fields.uid = Some("client-uid".into());
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.uid.as_deref(), Some("client-uid"));
+    }
+
+    #[test]
+    fn the_event_list_follows_the_repeat_rule() {
+        let calendar = CalendarRef {
+            group_id: "group".into(),
+            short_list_id: "short".into(),
+            long_list_id: "long".into(),
+        };
+        let mut fields = event_fields();
+        fields.repeat = None;
+        assert_eq!(choose_event_list(&calendar, &fields), "short");
+        let unbounded = RepeatRule {
+            frequency: 1,
+            interval: 1,
+            end_type: 0,
+            end_value: None,
+            time_zone: "UTC".into(),
+            excluded_ms: Vec::new(),
+            advanced: Vec::new(),
+        };
+        fields.repeat = Some(unbounded.clone());
+        assert_eq!(choose_event_list(&calendar, &fields), "long");
+        let mut bounded = unbounded.clone();
+        bounded.end_type = 1;
+        bounded.end_value = Some(10);
+        fields.repeat = Some(bounded);
+        assert_eq!(choose_event_list(&calendar, &fields), "short");
+        let mut until = unbounded;
+        until.end_type = 2;
+        until.end_value = Some(1_700_000_000_000);
+        fields.repeat = Some(until);
+        assert_eq!(choose_event_list(&calendar, &fields), "short");
+    }
+
+    #[test]
+    fn the_delete_url_is_the_entity_rest_path() {
+        assert_eq!(
+            entity_delete_url("https://tuta.example", "contact", "list", "element"),
+            "https://tuta.example/rest/tutanota/contact/list/element"
+        );
+        assert_eq!(
+            entity_delete_url("https://tuta.example", "calendarevent", "l", "e"),
+            "https://tuta.example/rest/tutanota/calendarevent/l/e"
+        );
+    }
+
+    #[test]
+    fn delete_responses_map_to_outcomes_and_fixed_errors() {
+        assert!(matches!(delete_outcome(200), Ok(DeleteOutcome::Deleted)));
+        assert!(matches!(delete_outcome(204), Ok(DeleteOutcome::Deleted)));
+        assert!(matches!(delete_outcome(404), Ok(DeleteOutcome::Gone)));
+        assert_eq!(
+            delete_outcome(401).unwrap_err().to_string(),
+            "login failed: session is no longer valid; run login again"
+        );
+        assert_eq!(
+            delete_outcome(403).unwrap_err().to_string(),
+            "login failed: session is no longer valid; run login again"
+        );
+        assert_eq!(
+            delete_outcome(400).unwrap_err().to_string(),
+            "network error: dav write failed"
+        );
+        assert_eq!(
+            delete_outcome(500).unwrap_err().to_string(),
+            "network error: dav write failed"
+        );
+    }
+
+    #[test]
+    fn a_generated_uid_follows_the_web_client_shape() {
+        assert_eq!(generated_event_uid("group-id", 5), "group-id5@tuta.com");
+    }
+}
