@@ -29,9 +29,10 @@
 //! by value and by the kind the reader maps its Tuta type to (the
 //! Other/Custom collapse included), and a match keeps the loaded row
 //! byte for byte - id, Tuta type and custom label. A field without a
-//! match becomes a new row whose id the server assigns, as on create
-//! (the bridge never stamps aggregate ids); a loaded row without a
-//! counterpart is removed. Custom dates that are not anniversaries are
+//! match becomes a new row with no id, which the SDK's encryption
+//! fills with a random aggregate id (the bridge never stamps one);
+//! a loaded row without a counterpart is removed. Custom dates that
+//! are not anniversaries are
 //! kept untouched (the exporter never serves them, so no imported
 //! field can name them), and the legacy birthday aggregate is cleared
 //! so a removed birthday cannot return through the reader's fallback.
@@ -78,7 +79,7 @@ use tutasdk::{
 
 use super::calendar_source::event_from_tuta;
 use super::contact_source::{address_kind, contact_card, phone_kind, relation_kind};
-use crate::adapters::caldav::ical::html_to_text;
+use crate::adapters::caldav::ical::description_parts;
 use crate::adapters::carddav::vcard::{render_vcard, vcard_etag};
 use crate::adapters::dav::strong_etag_matches;
 use crate::adapters::smtp::outgoing::text_to_html;
@@ -374,10 +375,10 @@ fn anniversary(date_iso: &str) -> ContactCustomDate {
 /// A new `Contact` in the web client's `createNewContact` shape: the
 /// writable fields applied, the rest at their documented defaults
 /// (empty strings, nulls, empty lists), the owner-encrypted session
-/// key and owner group set, and the id prepared for the server to
-/// fill. Aggregate rows carry no ids: the server assigns them, on
-/// create and for a new row of an update alike, exactly as it does for
-/// the web client's null-id rows.
+/// key and owner group set, and the element id prepared for the server
+/// to fill. Aggregate rows carry no ids: the SDK's `encrypt_and_map`
+/// fills each null aggregate `_id` with a random id when it encrypts
+/// the payload, exactly as it does for the web client's null-id rows.
 pub fn contact_entity(
     fields: &ContactFields,
     list_id: &str,
@@ -478,9 +479,10 @@ fn merge_rows<Row, Field>(
 /// an incoming field takes the first loaded row with the same trimmed
 /// value and a compatible reader-mapped kind and keeps it byte for
 /// byte (id, Tuta type and custom label survive), an unmatched field
-/// becomes a new row with no id, and a loaded row no field names is
-/// removed. Custom dates of other kinds are kept untouched, and the
-/// legacy birthday aggregate is always cleared (see the module doc).
+/// becomes a new row with no id (the SDK fills a random aggregate id
+/// on encryption), and a loaded row no field names is removed. Custom
+/// dates of other kinds are kept untouched, and the legacy birthday
+/// aggregate is always cleared (see the module doc).
 pub fn apply_contact_fields(contact: &mut Contact, fields: &ContactFields) {
     contact.firstName = fields.first_name.clone();
     contact.lastName = fields.last_name.clone();
@@ -639,6 +641,39 @@ fn attendee_gate(event: &CalendarEvent) -> Result<()> {
     Ok(())
 }
 
+/// Refuse an organizer change while the stored event carries any
+/// attendee. The self-only attendee is updatable, but only while the
+/// body keeps the same organizer address: dropping or replacing it
+/// would silently desync the one attendee row the bridge lets through.
+/// The comparison is by address (case-insensitive), so a `CN`-only
+/// change is not a change; [`apply_event_fields`] preserves the stored
+/// display name. Without attendees the organizer is a plain personal
+/// field and stays freely editable.
+fn organizer_gate(event: &CalendarEvent, fields: &EventFields) -> Result<()> {
+    if event.attendees.is_empty() {
+        return Ok(());
+    }
+    let same = match (
+        event
+            .organizer
+            .as_ref()
+            .map(|person| person.address.as_str()),
+        fields
+            .organizer
+            .as_ref()
+            .map(|person| person.address.as_str()),
+    ) {
+        (None, None) => true,
+        (Some(stored), Some(incoming)) => stored.eq_ignore_ascii_case(incoming),
+        _ => false,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(WriteRefusal::AttendeesRefused.error())
+    }
+}
+
 /// Apply the writable fields onto a loaded event (the update path).
 /// The ids, owner encryption, permissions, alarms and attendees stay
 /// as loaded; the stored uid is identity (the web client never edits
@@ -648,11 +683,12 @@ fn attendee_gate(event: &CalendarEvent) -> Result<()> {
 /// repeat rule keeps its id when the loaded event had one.
 pub fn apply_event_fields(event: &mut CalendarEvent, fields: &EventFields) {
     event.summary = fields.summary.clone();
-    // `DESCRIPTION` is the plain rendering of the stored HTML, so a
-    // description echoed back means the client did not touch it: keep
-    // the stored HTML. A different description is regenerated from
-    // its plain text, the way the web client's editor writes it.
-    if html_to_text(&event.description) != fields.description {
+    // `DESCRIPTION` is what the renderer serves for the stored
+    // description, so a description echoed back means the client did
+    // not touch it: keep the stored value, HTML or plain text alike.
+    // A different description is regenerated from its plain text, the
+    // way the web client's editor writes it.
+    if description_parts(&event.description).0 != fields.description {
         event.description = text_to_html(&fields.description);
     }
     event.location = fields.location.clone();
@@ -938,6 +974,10 @@ impl CalendarWriter for TutaDavWriter {
         // guests is never editable, so telling the client to reload and
         // retry would only lead it into the same refusal.
         attendee_gate(&event)?;
+        // The self-only attendee that gate lets through is still an
+        // attendee: the body may edit the event, but not remove or
+        // replace its organizer.
+        organizer_gate(&event, fields)?;
         // The precondition runs against the freshly loaded entity,
         // after the load and before anything is written.
         check_event_precondition(&event, if_match)?;
@@ -1135,8 +1175,8 @@ mod tests {
         assert!(contact.messengerHandles.is_empty());
         assert!(contact.pronouns.is_empty());
         assert!(contact.mailAddresses.is_empty());
-        // The aggregate rows carry no ids: the server assigns them on
-        // create.
+        // The new contact's aggregate rows carry no ids: the SDK
+        // fills random aggregate ids when it encrypts them.
         assert!(contact._errors.is_empty());
     }
 
@@ -1698,6 +1738,62 @@ then edit them here"
         assert!(attendee_gate(&event).is_ok());
     }
 
+    fn organizer(address: &str) -> EventPerson {
+        EventPerson {
+            name: "Me".into(),
+            address: address.into(),
+        }
+    }
+
+    fn refused_for_attendees(gate: Result<()>) {
+        let error = gate.err().unwrap();
+        assert_eq!(
+            WriteRefusal::of(&error),
+            Some(WriteRefusal::AttendeesRefused)
+        );
+        assert_eq!(
+            error.to_string(),
+            "unsupported: events with attendees cannot be edited through the bridge"
+        );
+    }
+
+    #[test]
+    fn an_organizer_change_is_refused_while_any_attendee_is_stored() {
+        let mut event = stored_event("uid-1");
+        event.organizer = Some(EncryptedMailAddress {
+            _id: None,
+            name: "Me".into(),
+            address: "me@tuta.example".into(),
+            _errors: Default::default(),
+        });
+        // The only attendee is the organizer itself: still an attendee.
+        event.attendees = vec![attendee("me@tuta.example")];
+        let mut fields = event_fields();
+
+        // Echoing the organizer, letter case included, is not a change.
+        assert!(organizer_gate(&event, &fields).is_ok());
+        fields.organizer = Some(organizer("ME@TUTA.EXAMPLE"));
+        assert!(organizer_gate(&event, &fields).is_ok());
+
+        // Removing it is refused, and so is replacing its address.
+        fields.organizer = None;
+        refused_for_attendees(organizer_gate(&event, &fields));
+        fields.organizer = Some(organizer("other@tuta.example"));
+        refused_for_attendees(organizer_gate(&event, &fields));
+
+        // A stored organizer the body does not name is refused too.
+        event.organizer = None;
+        fields.organizer = Some(organizer("me@tuta.example"));
+        refused_for_attendees(organizer_gate(&event, &fields));
+
+        // Without attendees both changes stay ordinary updates.
+        event.attendees.clear();
+        fields.organizer = None;
+        assert!(organizer_gate(&event, &fields).is_ok());
+        fields.organizer = Some(organizer("other@tuta.example"));
+        assert!(organizer_gate(&event, &fields).is_ok());
+    }
+
     #[test]
     fn an_echoed_description_keeps_the_stored_html() {
         let mut event = stored_event("stored-uid");
@@ -1718,6 +1814,25 @@ then edit them here"
         event.description = String::new();
         apply_event_fields(&mut event, &fields);
         assert_eq!(event.description, text_to_html("one\ntwo"));
+    }
+
+    #[test]
+    fn an_echoed_plain_description_keeps_the_stored_text() {
+        let mut event = stored_event("stored-uid");
+        // Plain text the served DESCRIPTION carries verbatim: repeated
+        // blank lines and a literal `<b` that is not markup.
+        let stored = "First line\n\n\nSecond line with a literal <b marker";
+        event.description = stored.into();
+        let mut fields = event_fields();
+        fields.description = description_parts(stored).0;
+        assert_eq!(fields.description, stored);
+        fields.summary = "Edited title".into();
+
+        // A title-only edit echoes the served plain text: the stored
+        // description must survive byte for byte, never be re-encoded
+        // as HTML.
+        apply_event_fields(&mut event, &fields);
+        assert_eq!(event.description, stored);
     }
 
     #[test]

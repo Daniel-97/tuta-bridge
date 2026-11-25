@@ -420,8 +420,11 @@ served at most (see the residuals under "Writes").
   request's `If-Match` against the freshly loaded card's ETag — the
   reader's own derivation — so a write that matches the cache but not
   the entity (an edit made in the web client whose event has not
-  reached the bridge yet) answers `412` instead of overwriting it. One
-  whole write runs per book at a time, so two concurrent `PUT`s with
+  reached the bridge yet) answers `412` instead of overwriting it. If
+  that fresh load finds the card gone (`NotFound`), the write is the
+  same `412` — the version the client read no longer exists — never a
+  `404` and never a create. One whole write
+  runs per book at a time, so two concurrent `PUT`s with
   the same `If-Match` cannot both write: one succeeds, the other's
   re-check sees the first write's version and answers `412`.
 - Create: a `PUT` to any unused `.vcf` href writes to Tuta first and
@@ -437,7 +440,8 @@ served at most (see the residuals under "Writes").
   anniversary matches by trimmed date alone. The Other/Custom
   collapse is tolerated because both render without a `TYPE`; the
   loaded row's type still wins. A field without a match
-  becomes a new row whose id the server assigns, as on create; a
+  becomes a new row with no id, which the SDK's encryption fills with
+  a random aggregate id, as on create; a
   loaded row without a counterpart is removed. Custom dates that are
   not anniversaries (a name day) are kept untouched, and the legacy
   birthday aggregate is cleared so a removed `BDAY` stays removed.
@@ -445,13 +449,20 @@ served at most (see the residuals under "Writes").
   at most, so a second stored anniversary cannot survive an echoed
   `PUT`, and a scheme-less stored website is rewritten because its
   served value carries the added `https://`.
-- The remote write holds before the cache is touched: a transport
-  failure answers the fixed `503` (with `Retry-After`) and leaves the
-  cache and its ETag untouched, so the client retries; a session that
-  has expired answers the session layer's fixed `500`; a permanent
-  remote rejection (403/400: a read-only share) answers the fixed `403`
-  `the remote server refused the write`, which no retry can fix. A
-  cache apply that fails after the remote write held still answers the
+- The remote write holds before the cache is touched: a transport or
+  `5xx` failure answers the fixed `503` (with `Retry-After`) and
+  leaves the cache and its ETag untouched, so the client retries; an
+  invalid or expired session (`401`, `440`, `470`, `471`, `472`)
+  answers the session layer's fixed `500`; a permanent remote
+  rejection (`400`, `403`, `473`: a read-only share, a rejected
+  payload) answers the fixed `403` `the remote server refused the
+  write`, which no retry can fix. A contact whose freshly loaded
+  payload carries decryption errors refuses the whole edit with the
+  fixed `403` `contacts with decryption errors cannot be edited
+  through the bridge`, even without `If-Match`: the bridge cannot
+  render it, so merging would silently drop or overwrite the
+  unreadable fields. A cache apply that fails after the remote write
+  held still answers the
   success the write earned — the failed apply marks the book stale and
   the next read reloads and heals the row, and a client that retried a
   write that already happened would create a duplicate. Bodies are
@@ -482,7 +493,11 @@ served at most (see the residuals under "Writes").
   most; the importer accepts every `ANNIVERSARY`, and a `PUT` keeps
   every other stored custom date.
 - `DELETE`: a card that never existed answers `404` (no tombstone for a
-  nonexistent row) and `If-Match` is enforced. The remote delete runs
+  nonexistent row) and `If-Match` is enforced against the stored ETag.
+  A conditional delete then freshly loads the card and re-checks the
+  same ETag; a card that vanished since the client read it (the fresh
+  load answers `NotFound`) answers the same `412`, never a silent
+  delete. The remote delete runs
   first (already-gone counts as success), then the row is tombstoned so
   `sync-collection` reports it as a `404`; the answer is `204`, and a
   tombstone apply that fails anyway still answers `204` (the stale mark
@@ -580,7 +595,9 @@ client from your contacts, it is not a calendar on the server.
 - `SUMMARY`, `DESCRIPTION`, `LOCATION`, `ORGANIZER`, `ATTENDEE` (with
   `PARTSTAT`: accepted, declined, tentative, needs action) and the UID
   come from the Tuta event. Tuta descriptions are HTML: `DESCRIPTION`
-  carries a plain-text version, `X-ALT-DESC` the original.
+  carries a plain-text version, `X-ALT-DESC` the original. An imported
+  event's plain-text description is served as is (no `X-ALT-DESC`),
+  and a body that echoes it back leaves the stored text untouched.
 - Reminders: your own Tuta alarms become `VALARM`s (display alarms,
   minutes to weeks before the start), so Thunderbird rings them.
   Other attendees' alarms are not visible to you and are not served.
@@ -626,8 +643,15 @@ client from your contacts, it is not a calendar on the server.
   embeds the row's first-seen stamp, which no freshly loaded event can
   reproduce) — so a write that matches the cache but not the entity
   (an edit made in the web client whose event has not reached the
-  bridge yet) answers `412` instead of overwriting it. One whole write
-  runs per calendar at a time, so two concurrent `PUT`s with the same
+  bridge yet) answers `412` instead of overwriting it. That fresh load
+  finding the event gone (`NotFound`) is the same `412`. The start and
+  event-list checks below read the cached master row: without
+  `If-Match` they rest on that cache alone (low risk — the cache is
+  the row the client just read — so only an unconditional write or
+  `If-Match: *` can act on a stale start or list); with a concrete
+  `If-Match` the freshly loaded fingerprint is authoritative, and a
+  remote change answers `412` before anything is written. One whole
+  write runs per calendar at a time, so two concurrent `PUT`s with the same
   `If-Match` cannot both write: one succeeds, the other's re-check sees
   the first write's content and answers `412`.
 - The body must be exactly one `VEVENT` in a `VCALENDAR` (a
@@ -661,15 +685,23 @@ client from your contacts, it is not a calendar on the server.
   occurrence fails with the occurrence message. An `ATTENDEE` other
   than the organizer (case-insensitive) refuses the whole event with
   `403` — invitations are out of scope and are never dropped silently.
-  A stored event that carries attendees is refused just as firmly:
-  such an event cannot be edited through the bridge at all (see
-  below). A `VALARM` is accepted and ignored: reminders set by clients
+  A stored event that carries an attendee other than its organizer is
+  refused just as firmly: such an event cannot be edited through the
+  bridge at all (see below). The organizer's own attendee row is the
+  one exception, and only while the body keeps the same organizer
+  address. A `VALARM` is accepted and ignored: reminders set by clients
   are not carried to Tuta.
 - `ORGANIZER` maps to its address only; the `CN` parameter is
   preserved when the same address stays the organizer (a body that
   echoes the served one keeps the stored display name, so a title-only
   edit cannot blank it), and an unusable value is treated as no
-  organizer, a personal event. The address must be one of the
+  organizer, a personal event. While any attendee is stored — even
+  only the organizer itself — a body that removes `ORGANIZER`, adds
+  one where none was stored, or names a different address is refused
+  whole with the fixed `403` `events with attendees cannot be edited
+  through the bridge`; a case-only address change is not a change.
+  Without stored attendees the organizer stays freely editable. The
+  address must be one of the
   account's, and only the primary address is known without a network
   call, so aliases answer
   the fixed `403` `the organizer is not an address of this account`.
@@ -704,16 +736,22 @@ client from your contacts, it is not a calendar on the server.
   repaired moves to another href — `204` without an `ETag`; a state
   that cannot be read back after a held write answers the fixed `503`
   (`Retry-After`) and keeps the row as it was. Remote failures map
-  honestly: a session that has expired answers the session layer's
-  fixed `500`, a permanent remote rejection (403/400: a read-only
-  shared calendar) answers the fixed `403` `the remote server refused
-  the write`, and only a transport failure keeps the `503` retry.
+  honestly: an invalid or expired session (`401`, `440`, `470`, `471`,
+  `472`) answers the session layer's fixed `500`; a permanent remote
+  rejection (`400`, `403`, `473`: a read-only shared calendar, a
+  rejected body) answers the fixed `403` `the remote server refused
+  the write`; a `5xx` or transport failure keeps the `503` retry.
 - `DELETE` removes the whole resource: every event of the series is
   deleted remotely first (already-gone counts as done), then the rows
   are removed the way a delete event removes them. The calendar cache
   keeps no tombstones and there is no `sync-collection`, so a href that
-  never existed answers `404`; `If-Match` is enforced; the answer is
-  `204`, and a row removal that fails anyway still answers `204` (the
+  never existed answers `404`, and `If-Match` is enforced against the
+  stored resource ETag. A conditional delete then hands each row's own
+  cached fingerprint to the writer, which freshly loads every event of
+  the resource and compares it: a row that changed since the client
+  read it, or vanished (`NotFound`), answers `412` and the whole
+  resource is left alone — an altered occurrence included. The answer
+  is `204`, and a row removal that fails anyway still answers `204` (the
   stale mark heals the rows, exactly as on the update path).
 
 ### Freshness
