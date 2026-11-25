@@ -33,6 +33,7 @@ use tuta_bridge::ports::{
     CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DavWriters,
     DeleteOutcome, EventFields, EventRef, WriteRefusal,
 };
+use tutasdk::date::calendar_facade::DAYS_SHIFTED_MS;
 
 // ---------------------------------------------------------------------------
 // FakePrompt
@@ -2442,11 +2443,15 @@ impl CalendarWriter for FakeCalendarWriter {
         if let Some(existing) = existing {
             return Ok(existing.clone());
         }
-        // The list the fields' repeat rule files the event into: the
-        // unbounded (never-ending) rule goes to the long list.
-        let list_id = match &fields.repeat {
-            Some(rule) if rule.end_type == 0 => calendar.long_list_id.clone(),
-            _ => calendar.short_list_id.clone(),
+        // The list the fields file the event into, the way the web
+        // client's `isLongEvent` decides it: any repeat rule, or a
+        // duration beyond the event-id randomization range, is a long
+        // event.
+        let duration_ms = i128::from(fields.end_ms) - i128::from(fields.start_ms);
+        let list_id = if fields.repeat.is_some() || duration_ms > i128::from(DAYS_SHIFTED_MS) {
+            calendar.long_list_id.clone()
+        } else {
+            calendar.short_list_id.clone()
         };
         Ok(self
             .create_ref

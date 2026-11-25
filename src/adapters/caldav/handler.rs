@@ -673,30 +673,14 @@ impl CalDavHandler {
         if fields.start_ms != stored_start {
             return Ok(creation_refused());
         }
-        // The body's rule decides the event list: moving the event
-        // between the short and long lists is a creation-shaped change,
-        // not an in-place update. Refuse it with the fixed creation
-        // answer too.
-        //
-        // One stored shape is not a state change: `series_end_ms` is
-        // `Some` exactly when the series end is known from the data
-        // (a non-recurring row, or a series bounded by `UNTIL`), so a
-        // stored master in the long list with a known series end is
-        // already bounded (or non-recurring) and merely lives there.
-        // A body whose rule also maps to the short list therefore does
-        // not change its long/short state, and writing it in place is
-        // safe because long-list rows are always fetched in full (no
-        // id-range visibility problem). It also covers a non-recurring
-        // row stored in the long list: neither its list nor its repeat
-        // state changes, and long-list rows are fetched in full.
-        // A `COUNT`-bounded series in the
-        // long list has `series_end_ms == None` and is still refused:
-        // Tuta's own split flow only produces `UNTIL` bounds.
+        // The body's rule and duration decide the event list, the web
+        // client's `isLongEvent`: a repeating event (any rule, bounded
+        // or not) or a one-off longer than the event-id randomization
+        // range is a long event. Moving the event between the short
+        // and long lists is a creation-shaped change, not an in-place
+        // update. Refuse it with the fixed creation answer too.
         let chosen = choose_event_list(&calendar_ref, &fields);
-        let bounded_in_long_list = master.list_id == calendar_ref.long_list_id
-            && master.series_end_ms.is_some()
-            && chosen == calendar_ref.short_list_id.as_str();
-        if chosen != master.list_id.as_str() && !bounded_in_long_list {
+        if chosen != master.list_id.as_str() {
             return Ok(creation_refused());
         }
         // The precondition token: the stored master row's content

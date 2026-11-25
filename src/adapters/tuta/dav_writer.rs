@@ -62,6 +62,7 @@ use crypto_primitives::sha::sha256;
 use rand_core::OsRng;
 use tutasdk::bindings::rest_client::{HttpMethod, RestClient, RestClientOptions};
 use tutasdk::bindings::suspendable_rest_client::SuspensionBehavior;
+use tutasdk::date::calendar_facade::DAYS_SHIFTED_MS;
 use tutasdk::date::DateTime;
 use tutasdk::entities::generated::sys::{DateWrapper, GroupMembership};
 use tutasdk::entities::generated::tutanota::{
@@ -97,9 +98,6 @@ const TYPE_MODEL_VERSION: &str = "118";
 /// `GroupType.Contact`: the membership whose group owns the account's
 /// contacts.
 const CONTACT_GROUP_TYPE: Option<i64> = Some(6);
-/// `RepeatRuleEndType.NEVER`: a rule without an end repeats forever,
-/// which is what files an event into the long-events list.
-const REPEAT_END_NEVER: i64 = 0;
 
 fn write_failed() -> Error {
     Error::Network("dav write failed".into())
@@ -668,13 +666,16 @@ pub fn apply_event_fields(event: &mut CalendarEvent, fields: &EventFields) {
     event.sequence = event.sequence.saturating_add(1);
 }
 
-/// Which event list a write goes to (the plan's decision): the long
-/// list for a repeating unbounded event, the short list for everything
-/// else (non-recurring or bounded by `UNTIL`/`COUNT`).
+/// Which event list a write goes to, the web client's `isLongEvent`:
+/// the long list for any repeating event (a rule bounded by `UNTIL` or
+/// `COUNT` included) and for a one-off longer than the event-id
+/// randomization range, the short list for everything else.
 pub fn choose_event_list<'a>(calendar: &'a CalendarRef, fields: &EventFields) -> &'a str {
-    match &fields.repeat {
-        Some(rule) if rule.end_type == REPEAT_END_NEVER => &calendar.long_list_id,
-        _ => &calendar.short_list_id,
+    let duration_ms = i128::from(fields.end_ms) - i128::from(fields.start_ms);
+    if fields.repeat.is_some() || duration_ms > i128::from(DAYS_SHIFTED_MS) {
+        &calendar.long_list_id
+    } else {
+        &calendar.short_list_id
     }
 }
 
@@ -1778,7 +1779,19 @@ then edit them here"
         };
         let mut fields = event_fields();
         fields.repeat = None;
+        fields.start_ms = 1_700_000_000_000;
+        fields.end_ms = fields.start_ms + 3_600_000;
         assert_eq!(choose_event_list(&calendar, &fields), "short");
+        // The web client's `isLongEvent` boundary is strict: exactly
+        // 15 days still fits the event-id randomization range.
+        let days_shifted = i64::try_from(DAYS_SHIFTED_MS).unwrap();
+        fields.end_ms = fields.start_ms + days_shifted;
+        assert_eq!(choose_event_list(&calendar, &fields), "short");
+        fields.end_ms += 1;
+        assert_eq!(choose_event_list(&calendar, &fields), "long");
+        fields.end_ms = fields.start_ms + 3_600_000;
+        // Any repeat rule files the event into the long list, a
+        // COUNT- or UNTIL-bounded one included.
         let unbounded = RepeatRule {
             frequency: 1,
             interval: 1,
@@ -1794,12 +1807,12 @@ then edit them here"
         bounded.end_type = 1;
         bounded.end_value = Some(10);
         fields.repeat = Some(bounded);
-        assert_eq!(choose_event_list(&calendar, &fields), "short");
+        assert_eq!(choose_event_list(&calendar, &fields), "long");
         let mut until = unbounded;
         until.end_type = 2;
         until.end_value = Some(1_700_000_000_000);
         fields.repeat = Some(until);
-        assert_eq!(choose_event_list(&calendar, &fields), "short");
+        assert_eq!(choose_event_list(&calendar, &fields), "long");
     }
 
     #[test]
