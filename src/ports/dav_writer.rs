@@ -264,18 +264,33 @@ pub trait CalendarWriter: Send + Sync {
     ) -> Result<EventRef>;
 
     /// Delete one event; [`DeleteOutcome::Gone`] when it had already
-    /// vanished remotely. A condition (the handler's per-row token:
-    /// that row's cached content fingerprint, or `*` for existence) is
-    /// re-checked against the freshly loaded event — a vanished or
-    /// mismatching event refuses with
-    /// [`WriteRefusal::StoredVersionChanged`] before anything is
+    /// vanished remotely. A condition (that event's cached content
+    /// fingerprint, or `*` for existence) is re-checked against the
+    /// freshly loaded event — a vanished or mismatching event refuses
+    /// with [`WriteRefusal::StoredVersionChanged`] before anything is
     /// deleted. `None` deletes unconditionally.
+    ///
+    /// A conditional series delete calls
+    /// [`Self::verify_event_precondition`] for every row before its
+    /// first `delete_event`, so no row is deleted when a later row
+    /// fails; the handler then deletes with `None`, since the rows were
+    /// just verified. A network failure part way through those
+    /// unconditional deletes can still leave a partially deleted
+    /// series, which a retry finishes.
     async fn delete_event(
         &self,
         calendar: &CalendarRef,
         id: &EventRef,
         if_match: IfMatch<'_>,
     ) -> Result<DeleteOutcome>;
+
+    /// Verify one row's precondition against a fresh load without
+    /// deleting anything. `*` pins existence only; every other token is
+    /// that row's cached content fingerprint, which must equal the
+    /// freshly loaded content. Used for every row of a conditional
+    /// series delete before the first remote delete, so a failure on
+    /// any row removes nothing.
+    async fn verify_event_precondition(&self, id: &EventRef, if_match: IfMatch<'_>) -> Result<()>;
 }
 
 /// The DAV write seams of one session, handed to `serve` together:

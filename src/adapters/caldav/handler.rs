@@ -51,11 +51,14 @@
 //! removed the way a delete event removes them (the calendar cache
 //! keeps no tombstones, so a href that never existed answers `404` and
 //! writes nothing). It shares the calendar's write section with the
-//! put, and a conditional delete hands each row its own cached
-//! fingerprint (or `*` for existence): the writer freshly loads every
-//! event, so a cache-matching but stale resource — an altered
-//! occurrence included — answers `412` and removes nothing. Without a
-//! writer both answer the fixed `403` the session answered before.
+//! put, and a conditional delete verifies every row against its own
+//! cached fingerprint (or `*` for existence) before the first remote
+//! delete: the writer freshly loads every event, so a cache-matching
+//! but stale resource — an altered occurrence included — answers `412`
+//! and removes nothing. A network failure part way through the deletes
+//! can still leave a partially deleted series; a retry finishes it.
+//! Without a writer both answer the fixed `403` the session answered
+//! before.
 //!
 //! `Depth: infinity` (and a `PROPFIND` without `Depth`) is served as
 //! `Depth: 1`. Reports: `calendar-query` (the first `time-range` of
@@ -802,28 +805,41 @@ impl CalDavHandler {
         // Remote first. Both outcomes proceed: `Gone` has already
         // reached the end state the client asked for. A refusal
         // answers its fixed status; a session error and a transport
-        // failure reach the session layer untouched. A failure part
-        // way leaves the cache as it was; the client retries and the
-        // events already gone answer `Gone`.
+        // failure reach the session layer untouched.
         //
-        // The condition is per row: the request's header was verified
-        // against the whole resource above, but each event is checked
-        // against its own cached fingerprint (or `*` for existence), so
-        // an altered occurrence inside the series is caught too.
+        // A conditional delete verifies every row against its own
+        // cached fingerprint (or `*` for existence) before the first
+        // remote delete: a changed or vanished occurrence answers the
+        // fixed `412` and removes nothing. Only after every row passed
+        // are the deletes issued, unconditionally, since the fresh
+        // loads just verified them. A network failure part way through
+        // those deletes can still leave a partially deleted series; a
+        // retry finishes it.
+        if let Some(condition) = if_match {
+            for row in &resource.rows {
+                let reference = EventRef {
+                    list_id: row.list_id.clone(),
+                    element_id: row.element_id.clone(),
+                };
+                let row_condition = if condition.trim() == "*" {
+                    "*"
+                } else {
+                    row.fingerprint.as_str()
+                };
+                if let Err(error) = writer
+                    .verify_event_precondition(&reference, Some(row_condition))
+                    .await
+                {
+                    return writer_refusal(error);
+                }
+            }
+        }
         for row in &resource.rows {
             let reference = EventRef {
                 list_id: row.list_id.clone(),
                 element_id: row.element_id.clone(),
             };
-            let condition = match if_match {
-                None => None,
-                Some(condition) if condition.trim() == "*" => Some("*"),
-                Some(_) => Some(row.fingerprint.as_str()),
-            };
-            match writer
-                .delete_event(&calendar_ref, &reference, condition)
-                .await
-            {
+            match writer.delete_event(&calendar_ref, &reference, None).await {
                 Ok(_) => {}
                 Err(error) => return writer_refusal(error),
             }

@@ -47,10 +47,13 @@ calendar rows already carry everything the write path needs).
    accepted and ignored - documented in the README, because refusing a
    whole event over a reminder would be hostile and reminders are not
    carried to Tuta either way.
-4. **Which list an event goes to:** a non-recurring or bounded
-   (`UNTIL`/`COUNT`) event is written to the calendar's short-events
-   list, a repeating unbounded event to the long-events list - mirroring
-   how the web client files them and how the reader loads them.
+4. **Which list an event goes to:** the current behavior (second review,
+   2026-11-25) follows the web client's `isLongEvent`: **any** repeating
+   event (bounded `UNTIL`/`COUNT` included) goes to the calendar's
+   long-events list, as does a one-off longer than the 15-day event-id
+   randomization range; only a short one-off goes to the short-events
+   list. An in-place update may not move an event between the lists.
+   (This supersedes the original split that filed bounded rules short.)
 5. **Preconditions are honored:** `If-Match` on update, `If-None-Match: *`
    on create; a stale `If-Match` answers `412`. The privilege sets flip
    from read-only to writable on both collections so clients stop marking
@@ -76,7 +79,15 @@ calendar rows already carry everything the write path needs).
    `pre_session.rs`). The writer issues the same DELETE through the
    session's `RestClient` with `cv`, `v` (type model version 118 for both
    types) and `accessToken`; a 404 maps to "already gone", auth failures
-   to the session error, everything else to the fixed network error.
+   to the session error, `400`/`403`/`473` to the fixed permanent
+   refusal (`403`), and `5xx` or a transport failure to the retryable
+   network error. (Second review, 2026-11-25: the earlier "everything
+   else network" mapping was too coarse.) A conditional DELETE is not a
+   raw delete: a contact re-checks the request ETag against the freshly
+   loaded card, and an event series verifies **every** row (each row's
+   cached fingerprint, or `*` for existence) before its first remote
+   delete, so a mismatch answers `412` and removes nothing; a network
+   failure part way through the deletes may still be partial.
 
 9. **Creation is split by id type, and event creation is refused.**
    Verified against the pinned SDK and the web client: the web client

@@ -22,7 +22,15 @@
 //! writer issues the same request through the session's `RestClient`
 //! with `cv`, `v` (type model version 118 for both types) and the
 //! access token; a 404 answers `Gone`, auth rejections map to the
-//! session error, everything else to the fixed write failure.
+//! session error, 400/403/473 to the fixed remote refusal, and
+//! everything else to the retryable write failure.
+//!
+//! A conditional calendar DELETE verifies every event of the series
+//! against its own cached fingerprint (or `*` for existence) before
+//! the first remote delete, so a changed or vanished occurrence
+//! removes nothing. Without a header the deletes stay unconditional,
+//! and a network failure part way through either run can still leave
+//! some events deleted; a retry finishes the series.
 //!
 //! Updates merge into the loaded contact, like the web client's edit:
 //! every rewritten aggregate row is matched against the loaded rows
@@ -45,6 +53,12 @@
 //! the event bus has not delivered yet; a contact that cannot be
 //! rendered at all fails closed with the same refusal.
 //!
+//! The pinned SDK's `EntityClient::update_instance` asserts a 2xx
+//! status instead of returning `Err` (`"non-ok status code {}"`), so
+//! the update futures are caught and that exact panic is mapped
+//! through the SDK's own HTTP mapping like an error. Any other panic
+//! is resumed: a programming error is never masked as a write failure.
+//!
 //! Error mapping is honest about what the server said: an expired
 //! session is the session error (the handlers let the session layer
 //! answer it), a permanent rejection - 403, or a 400 the server will
@@ -54,12 +68,15 @@
 //! appears in one.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use crypto_primitives::aes::{Aes256Key, InitializationVector};
 use crypto_primitives::key::GenericAesKey;
 use crypto_primitives::randomizer_facade::RandomizerFacade;
 use crypto_primitives::sha::sha256;
+use futures_util::FutureExt;
 use rand_core::OsRng;
 use tutasdk::bindings::rest_client::{HttpMethod, RestClient, RestClientOptions};
 use tutasdk::bindings::suspendable_rest_client::SuspensionBehavior;
@@ -146,6 +163,52 @@ fn update_failure(error: ApiCallError) -> Error {
     }
 }
 
+/// The exact panic message prefix of the pinned SDK's
+/// `EntityClient::update_instance` status assertion
+/// (`assert!(..., "non-ok status code {}", response.status)`).
+const NON_OK_STATUS_PREFIX: &str = "non-ok status code ";
+
+/// The HTTP status the pinned SDK's status assertion carried, or `None`
+/// when the panic is anything else (a foreign panic or a malformed
+/// status).
+fn panic_status(payload: &(dyn std::any::Any + Send)) -> Option<u32> {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())?;
+    message
+        .strip_prefix(NON_OK_STATUS_PREFIX)?
+        .parse::<u32>()
+        .ok()
+}
+
+/// Map the pinned SDK's non-2xx panic of `update_instance` like an SDK
+/// error: the status goes through the SDK's own HTTP mapping and
+/// [`update_failure`]. Any other panic is a programming error and is
+/// resumed, never masked as a write failure. The payload is only read
+/// for its status, so no body or entity data is exposed.
+fn update_panic_failure(payload: Box<dyn std::any::Any + Send>) -> Error {
+    let Some(status) = panic_status(payload.as_ref()) else {
+        std::panic::resume_unwind(payload);
+    };
+    match HttpError::from_http_response(status, &HashMap::new()) {
+        Ok(error) => update_failure(ApiCallError::ServerResponseError { source: error }),
+        Err(_) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Await an update future and map its failure like an update, catching
+/// the pinned SDK's status panic on the way.
+async fn update_instance_caught<T, F>(future: F) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, ApiCallError>>,
+{
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(result) => result.map_err(update_failure),
+        Err(payload) => Err(update_panic_failure(payload)),
+    }
+}
+
 /// The strong ETag the reader derives from a loaded contact, or `None`
 /// when the card does not map (the reader would not serve it).
 fn loaded_contact_etag(
@@ -174,6 +237,11 @@ fn check_contact_precondition(
     let Some(condition) = if_match else {
         return Ok(());
     };
+    // `*` pins existence only: the fresh load already found the card,
+    // so a card the reader cannot render is still an existence pass.
+    if condition.trim() == "*" {
+        return Ok(());
+    }
     if loaded_contact_etag(contact).is_some_and(|etag| strong_etag_matches(condition, &etag)) {
         return Ok(());
     }
@@ -905,10 +973,7 @@ impl ContactWriter for TutaDavWriter {
             // handler's cached fast fail).
             check_contact_editable(&contact, if_match)?;
             apply_contact_fields(&mut contact, fields);
-            crypto_client
-                .update_instance(contact)
-                .await
-                .map_err(update_failure)?;
+            update_instance_caught(crypto_client.update_instance(contact)).await?;
             Ok(ContactRef {
                 list_id: existing.list_id.clone(),
                 element_id: existing.element_id.clone(),
@@ -982,10 +1047,7 @@ impl CalendarWriter for TutaDavWriter {
         // after the load and before anything is written.
         check_event_precondition(&event, if_match)?;
         apply_event_fields(&mut event, fields);
-        crypto_client
-            .update_instance(event)
-            .await
-            .map_err(update_failure)?;
+        update_instance_caught(crypto_client.update_instance(event)).await?;
         Ok(EventRef {
             list_id: existing.list_id.clone(),
             element_id: existing.element_id.clone(),
@@ -1014,6 +1076,22 @@ impl CalendarWriter for TutaDavWriter {
         }
         self.delete_entity(EVENT_PATH, &id.list_id, &id.element_id)
             .await
+    }
+
+    async fn verify_event_precondition(&self, id: &EventRef, if_match: IfMatch<'_>) -> Result<()> {
+        // A series delete calls this for every row before its first
+        // remote delete: the fresh load and the same check
+        // `delete_event` would apply, without the delete.
+        let Some(condition) = if_match else {
+            return Ok(());
+        };
+        let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+        let tuple = IdTupleCustom::new(
+            GeneratedId(id.list_id.clone()),
+            CustomId(id.element_id.clone()),
+        );
+        let event: CalendarEvent = crypto_client.load(&tuple).await.map_err(update_failure)?;
+        check_event_delete_precondition(&event, condition)
     }
 }
 
@@ -2306,5 +2384,94 @@ then edit them here"
         // E only guards edits: no update header and the raw delete
         // path's existing check still pass.
         assert!(check_contact_precondition(&contact, None).is_ok());
+    }
+
+    /// `If-Match: *` on a delete pins existence only, like the event
+    /// path: once the fresh load found the card, a card the reader
+    /// cannot render still passes. The edit gate outranks it.
+    #[test]
+    fn a_conditional_contact_delete_star_is_an_existence_pass() {
+        let mut contact = contact_entity(&fields(), "list", "group", &key());
+        contact._errors = decryption_errors();
+        assert!(check_contact_precondition(&contact, Some("*")).is_ok());
+        assert_eq!(
+            WriteRefusal::of(&check_contact_editable(&contact, Some("*")).unwrap_err()),
+            Some(WriteRefusal::ContactDecryptionFailed)
+        );
+        // An exact token still needs a renderable card.
+        let error = check_contact_precondition(&contact, Some("\"stale\"")).unwrap_err();
+        assert_eq!(
+            WriteRefusal::of(&error),
+            Some(WriteRefusal::StoredVersionChanged)
+        );
+    }
+
+    /// The pinned SDK's `EntityClient::update_instance` asserts a 2xx
+    /// status instead of returning `Err`, so the writer catches exactly
+    /// that panic and maps its status like the SDK's own error.
+    #[tokio::test]
+    async fn an_update_status_panic_maps_like_the_sdk_error() {
+        let not_found = update_instance_caught::<(), _>(async {
+            panic!("non-ok status code 404");
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            WriteRefusal::of(&not_found),
+            Some(WriteRefusal::StoredVersionChanged)
+        );
+
+        for status in [403, 473] {
+            let refused = update_instance_caught::<(), _>(async move {
+                panic!("non-ok status code {status}");
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(
+                WriteRefusal::of(&refused),
+                Some(WriteRefusal::RemoteRefused),
+                "status {status}"
+            );
+        }
+
+        let expired = update_instance_caught::<(), _>(async {
+            panic!("non-ok status code 440");
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(expired, Error::Login(_)));
+
+        let network = update_instance_caught::<(), _>(async {
+            panic!("non-ok status code 500");
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(network, Error::Network(_)));
+    }
+
+    /// A panic that is not the pinned status assertion is a programming
+    /// error: it is resumed, never masked as a write failure.
+    #[tokio::test]
+    async fn a_foreign_or_malformed_update_panic_is_resumed() {
+        let foreign = AssertUnwindSafe(update_instance_caught::<(), _>(async {
+            panic!("a programming error");
+        }))
+        .catch_unwind()
+        .await
+        .unwrap_err();
+        assert_eq!(foreign.downcast_ref::<&str>(), Some(&"a programming error"));
+
+        for malformed in ["non-ok status code nope", "non-ok status code "] {
+            let payload = AssertUnwindSafe(update_instance_caught::<(), _>(async move {
+                panic!("{malformed}");
+            }))
+            .catch_unwind()
+            .await
+            .unwrap_err();
+            assert_eq!(
+                payload.downcast_ref::<String>().map(String::as_str),
+                Some(malformed)
+            );
+        }
     }
 }

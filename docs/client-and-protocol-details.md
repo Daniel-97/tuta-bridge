@@ -746,13 +746,17 @@ client from your contacts, it is not a calendar on the server.
   are removed the way a delete event removes them. The calendar cache
   keeps no tombstones and there is no `sync-collection`, so a href that
   never existed answers `404`, and `If-Match` is enforced against the
-  stored resource ETag. A conditional delete then hands each row's own
-  cached fingerprint to the writer, which freshly loads every event of
-  the resource and compares it: a row that changed since the client
-  read it, or vanished (`NotFound`), answers `412` and the whole
-  resource is left alone — an altered occurrence included. The answer
-  is `204`, and a row removal that fails anyway still answers `204` (the
-  stale mark heals the rows, exactly as on the update path).
+  stored resource ETag. A conditional delete then verifies every row
+  before the first remote delete: each row's own cached fingerprint (or
+  `*` for existence) is handed to the writer, which freshly loads the
+  event and compares it, so a row that changed since the client read
+  it, or vanished (`NotFound`), answers `412` and the whole resource is
+  left alone — an altered occurrence included. Only after every row
+  verified are the deletes issued. A network failure part way through
+  them can still leave a partially deleted series, which a retry
+  finishes; a row removal that fails after the remote deletes still
+  answers `204` (the stale mark heals the rows, exactly as on the
+  update path).
 
 ### Freshness
 

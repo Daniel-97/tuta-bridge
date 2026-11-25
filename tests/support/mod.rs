@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::{ExposeSecret, SecretString};
@@ -9,6 +9,7 @@ use tuta_bridge::adapters::dav::strong_etag_matches;
 use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem, ImapArg};
 use tuta_bridge::adapters::imap::search::{parse_search, SearchKey};
 use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
+use tuta_bridge::adapters::tuta::dav_writer::choose_event_list;
 use tuta_bridge::domain::{
     AccountId, AccountInfo, BatchCounts, BatchOutcome, Error, EventFrame, Folder, MailPlacement,
     MailboxId, MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
@@ -33,7 +34,6 @@ use tuta_bridge::ports::{
     CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DavWriters,
     DeleteOutcome, EventFields, EventRef, WriteRefusal,
 };
-use tutasdk::date::calendar_facade::DAYS_SHIFTED_MS;
 
 /// Counts one in-flight writer call and the high-water mark: a write
 /// section that works keeps the mark at one.
@@ -2431,6 +2431,16 @@ pub struct FakeCalendarWriter {
     /// list (the default) answers the caller's own condition, so a
     /// matching row passes.
     pub loaded_delete_fingerprints: Mutex<Vec<Option<String>>>,
+    /// The content fingerprint each verify's fresh load answers, in
+    /// call order; `None` means the event is gone. An empty list (the
+    /// default) answers the caller's own condition, so a matching row
+    /// passes.
+    pub loaded_verify_fingerprints: Mutex<Vec<Option<String>>>,
+    /// Every verified row in call order.
+    pub verifies: Mutex<Vec<EventRef>>,
+    /// Every verify's condition in call order, aligned with
+    /// `verifies`.
+    pub verify_conditions: Mutex<Vec<Option<String>>>,
     /// The error the next put answers, once.
     pub put_error: Mutex<Option<Error>>,
     /// The error the next delete answers, once.
@@ -2457,6 +2467,9 @@ impl Default for FakeCalendarWriter {
             failing: Mutex::new(false),
             loaded_fingerprints: Mutex::new(Vec::new()),
             loaded_delete_fingerprints: Mutex::new(Vec::new()),
+            loaded_verify_fingerprints: Mutex::new(Vec::new()),
+            verifies: Mutex::new(Vec::new()),
+            verify_conditions: Mutex::new(Vec::new()),
             put_error: Mutex::new(None),
             delete_error: Mutex::new(None),
             create_ref: Mutex::new(None),
@@ -2515,6 +2528,17 @@ impl FakeCalendarWriter {
     /// `delete_calls()`.
     pub fn delete_conditions(&self) -> Vec<Option<String>> {
         self.delete_conditions.lock().unwrap().clone()
+    }
+
+    /// Every verified row, in order.
+    pub fn verify_calls(&self) -> Vec<EventRef> {
+        self.verifies.lock().unwrap().clone()
+    }
+
+    /// Every verify's condition, in order, aligned with
+    /// `verify_calls()`.
+    pub fn verify_conditions(&self) -> Vec<Option<String>> {
+        self.verify_conditions.lock().unwrap().clone()
     }
 
     /// Block the next writer call (a put or a delete) until a permit is
@@ -2580,23 +2604,16 @@ impl CalendarWriter for FakeCalendarWriter {
         if let Some(existing) = existing {
             return Ok(existing.clone());
         }
-        // The list the fields file the event into, the way the web
-        // client's `isLongEvent` decides it: any repeat rule, or a
-        // duration beyond the event-id randomization range, is a long
-        // event.
-        let duration_ms = i128::from(fields.end_ms) - i128::from(fields.start_ms);
-        let list_id = if fields.repeat.is_some() || duration_ms > i128::from(DAYS_SHIFTED_MS) {
-            calendar.long_list_id.clone()
-        } else {
-            calendar.short_list_id.clone()
-        };
+        // The list production's `choose_event_list` files the event
+        // into (a repeating event, or one longer than the id
+        // randomization range, is a long event).
         Ok(self
             .create_ref
             .lock()
             .unwrap()
             .clone()
             .unwrap_or_else(|| EventRef {
-                list_id,
+                list_id: choose_event_list(calendar, fields).to_string(),
                 element_id: format!("generated-{}", self.created.fetch_add(1, Ordering::SeqCst)),
             }))
     }
@@ -2647,21 +2664,56 @@ impl CalendarWriter for FakeCalendarWriter {
         }
         Ok(*self.delete_outcome.lock().unwrap())
     }
+
+    async fn verify_event_precondition(&self, id: &EventRef, if_match: Option<&str>) -> Result<()> {
+        self.verify_conditions
+            .lock()
+            .unwrap()
+            .push(if_match.map(str::to_string));
+        self.verifies.lock().unwrap().push(id.clone());
+        // The writer's own fresh-load check, modelled separately from
+        // the actual delete: the conditional load answers the next
+        // scripted fingerprint, or the caller's own condition when none
+        // is scripted. `*` pins existence only.
+        let Some(condition) = if_match else {
+            return Ok(());
+        };
+        let mut scripted = self.loaded_verify_fingerprints.lock().unwrap();
+        let loaded = if scripted.is_empty() {
+            Some(condition.to_string())
+        } else {
+            scripted.remove(0)
+        };
+        drop(scripted);
+        let matches = match loaded {
+            None => false,
+            Some(_) if condition.trim() == "*" => true,
+            Some(fingerprint) => fingerprint == condition,
+        };
+        if !matches {
+            return Err(WriteRefusal::StoredVersionChanged.error());
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // FailingContactStore / FailingCalendarStore
 // ---------------------------------------------------------------------------
 
-/// A [`StateStore`] whose contact cache fails its applies on demand: a
-/// thin wrapper over the real in-memory SQLite store that delegates
-/// everything, except `update_contacts` (the write path's cache apply)
-/// answers the fixed storage error while [`Self::fail_updates`] is set.
-/// The reloads still succeed, so a failed apply heals exactly the way
-/// the production stale mark heals it.
+/// A [`StateStore`] whose contact cache fails or blocks its applies on
+/// demand: a thin wrapper over the real in-memory SQLite store that
+/// delegates everything, except `update_contacts` (the write path's
+/// cache apply) answers the fixed storage error while
+/// [`Self::fail_updates`] is set, or waits in [`Self::hold_removals`]
+/// while a tombstone apply is held. The reloads still succeed, so a
+/// failed apply heals exactly the way the production stale mark heals
+/// it.
 pub struct FailingContactStore {
     inner: Arc<SqliteStateStore>,
     fail_updates: Mutex<bool>,
+    hold_removals: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    removal_entered: AtomicBool,
 }
 
 impl FailingContactStore {
@@ -2669,6 +2721,8 @@ impl FailingContactStore {
         Self {
             inner,
             fail_updates: Mutex::new(false),
+            hold_removals: Mutex::new(None),
+            removal_entered: AtomicBool::new(false),
         }
     }
 
@@ -2676,6 +2730,21 @@ impl FailingContactStore {
     /// with the fixed storage error, or succeed again.
     pub fn set_fail_updates(&self, failing: bool) {
         *self.fail_updates.lock().unwrap() = failing;
+    }
+
+    /// Block the next tombstone apply (`update_contacts` with removals)
+    /// until a permit is released. The returned semaphore is the same
+    /// one `removal_blocked` reports on.
+    pub fn hold_removals(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        self.removal_entered.store(false, Ordering::SeqCst);
+        *self.hold_removals.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Whether a tombstone apply is currently waiting in the hold.
+    pub fn removal_blocked(&self) -> bool {
+        self.removal_entered.load(Ordering::SeqCst)
     }
 
     fn contact_cache(&self) -> &dyn ContactStore {
@@ -2708,6 +2777,13 @@ impl ContactStore for FailingContactStore {
         upserts: &[ContactEntry],
         removals: &[String],
     ) -> Result<ContactCounts> {
+        if !removals.is_empty() {
+            let hold = self.hold_removals.lock().unwrap().take();
+            if let Some(hold) = hold {
+                self.removal_entered.store(true, Ordering::SeqCst);
+                let _permit = hold.acquire().await;
+            }
+        }
         if *self.fail_updates.lock().unwrap() {
             return Err(Error::Storage("the state store is busy".into()));
         }
@@ -2832,10 +2908,14 @@ impl StateStore for FailingContactStore {
 /// applies: while [`Self::set_fail_writes`] is set,
 /// `upsert_calendar_row` and `remove_calendar_row` answer the fixed
 /// storage error, so a held remote write's cache apply fails the way a
-/// locked database would.
+/// locked database would. [`Self::hold_removes`] instead blocks the
+/// delete's row removal, so a test can hold the collection's write
+/// section across it.
 pub struct FailingCalendarStore {
     inner: Arc<dyn CalendarStore>,
     fail_writes: Mutex<bool>,
+    hold_removes: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    remove_entered: AtomicBool,
 }
 
 impl FailingCalendarStore {
@@ -2843,6 +2923,8 @@ impl FailingCalendarStore {
         Self {
             inner,
             fail_writes: Mutex::new(false),
+            hold_removes: Mutex::new(None),
+            remove_entered: AtomicBool::new(false),
         }
     }
 
@@ -2850,6 +2932,20 @@ impl FailingCalendarStore {
     /// storage error, or succeed again.
     pub fn set_fail_writes(&self, failing: bool) {
         *self.fail_writes.lock().unwrap() = failing;
+    }
+
+    /// Block the next row removal (the delete's cache apply) until a
+    /// permit is released.
+    pub fn hold_removes(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        self.remove_entered.store(false, Ordering::SeqCst);
+        *self.hold_removes.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Whether a row removal is currently waiting in the hold.
+    pub fn remove_blocked(&self) -> bool {
+        self.remove_entered.load(Ordering::SeqCst)
     }
 
     fn blocked(&self) -> Result<()> {
@@ -2892,6 +2988,11 @@ impl CalendarStore for FailingCalendarStore {
         list_id: &str,
         element_id: &str,
     ) -> Result<bool> {
+        let hold = self.hold_removes.lock().unwrap().take();
+        if let Some(hold) = hold {
+            self.remove_entered.store(true, Ordering::SeqCst);
+            let _permit = hold.acquire().await;
+        }
         self.blocked()?;
         self.inner
             .remove_calendar_row(account_id, list_id, element_id)

@@ -953,6 +953,60 @@ async fn a_put_and_a_delete_never_overlap() {
     assert_eq!(writer.max_in_flight(), 1);
 }
 
+/// The same section holds across the delete's cache apply: a blocked
+/// tombstone write keeps the book's write section, so a subsequent
+/// `PUT` cannot enter its writer until the delete's apply is released.
+/// Timeouts prove neither request deadlocks.
+#[tokio::test]
+async fn a_delete_holds_the_book_lock_across_the_tombstone_apply() {
+    let state = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    let failing = Arc::new(FailingContactStore::new(Arc::clone(&state)));
+    let (book, _) = book_over(three_cards(), Arc::clone(&failing) as Arc<dyn StateStore>).await;
+    let writer = Arc::new(FakeContactWriter::new());
+    let handler = handler_of(Arc::clone(&book), Arc::clone(&writer));
+    let mut delete_wire = spawn_handler(Arc::clone(&handler));
+    let etag = c1_etag(&mut delete_wire).await;
+
+    // The delete reaches the writer, then blocks in its tombstone
+    // apply while still holding the book's write section.
+    let hold = failing.hold_removals();
+    let failing_apply = Arc::clone(&failing);
+    let delete = tokio::spawn(async move { delete_wire.request("DELETE", C1, &[], "").await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !failing_apply.removal_blocked() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the tombstone apply is held");
+
+    let body = render_vcard(&card("c1", "Ada", "Lovelace", "edit@example.invalid"));
+    let condition = format!("If-Match: {etag}");
+    let mut put_wire = spawn_handler(Arc::clone(&handler));
+    let put = tokio::spawn(async move { put_wire.request("PUT", C1, &[&condition], &body).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(writer.max_in_flight(), 1, "the writer calls never overlap");
+    assert!(
+        writer.put_calls().is_empty(),
+        "the put waits for the delete's section, not just its writer call"
+    );
+
+    hold.add_permits(1);
+    let deleted = tokio::time::timeout(Duration::from_secs(5), delete)
+        .await
+        .expect("the delete did not deadlock")
+        .unwrap();
+    let put = tokio::time::timeout(Duration::from_secs(5), put)
+        .await
+        .expect("the put did not deadlock")
+        .unwrap();
+    assert_eq!(deleted.status, 204);
+    assert_eq!(put.status, 204);
+    assert_eq!(writer.delete_calls().len(), 1);
+    assert_eq!(writer.put_calls().len(), 1);
+    assert_eq!(writer.max_in_flight(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // A failed cache apply after a held remote write
 // ---------------------------------------------------------------------------
