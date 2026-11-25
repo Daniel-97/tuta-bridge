@@ -141,7 +141,7 @@ pub enum WriteRefusal {
     /// client's `If-Match` named; the write did not happen. The
     /// handler answers `412`, so the client reloads and retries.
     StoredVersionChanged,
-    /// The remote server refused the write for good (403/400: a
+    /// The remote server refused the write for good (400/403/473: a
     /// read-only share, a rejected payload). The handler answers
     /// `403`, never the retry `503`.
     RemoteRefused,
