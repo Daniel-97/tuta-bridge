@@ -35,6 +35,26 @@ use tuta_bridge::ports::{
 };
 use tutasdk::date::calendar_facade::DAYS_SHIFTED_MS;
 
+/// Counts one in-flight writer call and the high-water mark: a write
+/// section that works keeps the mark at one.
+struct InFlight<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> InFlight<'a> {
+    fn enter(count: &'a AtomicUsize, max: &'a AtomicUsize) -> Self {
+        let current = count.fetch_add(1, Ordering::SeqCst) + 1;
+        max.fetch_max(current, Ordering::SeqCst);
+        Self { count }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FakePrompt
 // ---------------------------------------------------------------------------
@@ -1986,12 +2006,20 @@ pub struct FakeContactWriter {
     pub puts: Mutex<Vec<RecordedPut>>,
     /// Every delete in call order.
     pub deletes: Mutex<Vec<ContactRef>>,
+    /// Every delete's request condition in call order, aligned with
+    /// `deletes`. A precondition failure records neither.
+    pub delete_conditions: Mutex<Vec<Option<String>>>,
     /// While set, every call fails with the fixed network error.
     pub failing: Mutex<bool>,
     /// The strong ETag the next update's load answers, in call order;
     /// an empty list (the default) answers the caller's own
     /// precondition, so a matching `If-Match` passes.
     pub loaded_etags: Mutex<Vec<String>>,
+    /// The strong ETag each conditional delete's fresh load answers, in
+    /// call order; `None` means the contact is gone. An empty list (the
+    /// default) answers the caller's own condition, so a matching
+    /// `If-Match` passes.
+    pub loaded_delete_etags: Mutex<Vec<Option<String>>>,
     /// The error the next put answers, once.
     pub put_error: Mutex<Option<Error>>,
     /// The error the next delete answers, once.
@@ -2001,6 +2029,10 @@ pub struct FakeContactWriter {
     pub create_ref: Mutex<Option<ContactRef>>,
     /// The outcome every delete answers with (default `Deleted`).
     pub delete_outcome: Mutex<DeleteOutcome>,
+    /// Blocks the next put or delete until a permit is released.
+    pub hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
     created: AtomicUsize,
 }
 
@@ -2009,12 +2041,17 @@ impl Default for FakeContactWriter {
         Self {
             puts: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
+            delete_conditions: Mutex::new(Vec::new()),
             failing: Mutex::new(false),
             loaded_etags: Mutex::new(Vec::new()),
+            loaded_delete_etags: Mutex::new(Vec::new()),
             put_error: Mutex::new(None),
             delete_error: Mutex::new(None),
             create_ref: Mutex::new(None),
             delete_outcome: Mutex::new(DeleteOutcome::Deleted),
+            hold: Mutex::new(None),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
             created: AtomicUsize::new(0),
         }
     }
@@ -2061,6 +2098,32 @@ impl FakeContactWriter {
     pub fn delete_calls(&self) -> Vec<ContactRef> {
         self.deletes.lock().unwrap().clone()
     }
+
+    /// Every delete's request condition, in order, aligned with
+    /// `delete_calls()`.
+    pub fn delete_conditions(&self) -> Vec<Option<String>> {
+        self.delete_conditions.lock().unwrap().clone()
+    }
+
+    /// Block the next writer call (a put or a delete) until a permit is
+    /// added to the returned semaphore.
+    pub fn hold_next_write(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// The most writer calls that ever ran at once.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    async fn wait_hold(&self) {
+        let hold = self.hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _permit = hold.acquire().await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2072,6 +2135,7 @@ impl ContactWriter for FakeContactWriter {
         existing: Option<&ContactRef>,
         if_match: Option<&str>,
     ) -> Result<ContactRef> {
+        let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
         // The writer's own precondition re-check, modelled: the load
         // answers the next scripted ETag, or the caller's own
         // precondition when none is scripted. A mismatch refuses
@@ -2094,6 +2158,7 @@ impl ContactWriter for FakeContactWriter {
             existing: existing.cloned(),
             if_match: if_match.map(str::to_string),
         });
+        self.wait_hold().await;
         if let Some(error) = self.put_error.lock().unwrap().take() {
             return Err(error);
         }
@@ -2114,8 +2179,35 @@ impl ContactWriter for FakeContactWriter {
             }))
     }
 
-    async fn delete_contact(&self, id: &ContactRef) -> Result<DeleteOutcome> {
+    async fn delete_contact(
+        &self,
+        id: &ContactRef,
+        if_match: Option<&str>,
+    ) -> Result<DeleteOutcome> {
+        let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
+        // The writer's own fresh-load check, modelled: the conditional
+        // load answers the next scripted ETag, or the caller's own
+        // condition when none is scripted. A missing entity or a
+        // mismatch refuses before anything is deleted, so the delete is
+        // not recorded.
+        if let Some(condition) = if_match {
+            let mut scripted = self.loaded_delete_etags.lock().unwrap();
+            let loaded = if scripted.is_empty() {
+                Some(condition.to_string())
+            } else {
+                scripted.remove(0)
+            };
+            drop(scripted);
+            if !loaded.is_some_and(|etag| strong_etag_matches(condition, &etag)) {
+                return Err(WriteRefusal::StoredVersionChanged.error());
+            }
+        }
+        self.delete_conditions
+            .lock()
+            .unwrap()
+            .push(if_match.map(str::to_string));
         self.deletes.lock().unwrap().push(id.clone());
+        self.wait_hold().await;
         if let Some(error) = self.delete_error.lock().unwrap().take() {
             return Err(error);
         }
@@ -2325,12 +2417,20 @@ pub struct FakeCalendarWriter {
     pub puts: Mutex<Vec<RecordedEventPut>>,
     /// Every delete in call order, with the calendar it addressed.
     pub deletes: Mutex<Vec<(CalendarRef, EventRef)>>,
+    /// Every delete's request condition in call order, aligned with
+    /// `deletes`. A precondition failure records neither.
+    pub delete_conditions: Mutex<Vec<Option<String>>>,
     /// While set, every call fails with the fixed network error.
     pub failing: Mutex<bool>,
     /// The content fingerprint the next update's load answers, in
     /// call order; an empty list (the default) answers the caller's
     /// own precondition, so a matching token passes.
     pub loaded_fingerprints: Mutex<Vec<String>>,
+    /// The content fingerprint each conditional delete's fresh load
+    /// answers, in call order; `None` means the event is gone. An empty
+    /// list (the default) answers the caller's own condition, so a
+    /// matching row passes.
+    pub loaded_delete_fingerprints: Mutex<Vec<Option<String>>>,
     /// The error the next put answers, once.
     pub put_error: Mutex<Option<Error>>,
     /// The error the next delete answers, once.
@@ -2341,6 +2441,10 @@ pub struct FakeCalendarWriter {
     pub create_ref: Mutex<Option<EventRef>>,
     /// The outcome every delete answers with (default `Deleted`).
     pub delete_outcome: Mutex<DeleteOutcome>,
+    /// Blocks the next put or delete until a permit is released.
+    pub hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
     created: AtomicUsize,
 }
 
@@ -2349,12 +2453,17 @@ impl Default for FakeCalendarWriter {
         Self {
             puts: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
+            delete_conditions: Mutex::new(Vec::new()),
             failing: Mutex::new(false),
             loaded_fingerprints: Mutex::new(Vec::new()),
+            loaded_delete_fingerprints: Mutex::new(Vec::new()),
             put_error: Mutex::new(None),
             delete_error: Mutex::new(None),
             create_ref: Mutex::new(None),
             delete_outcome: Mutex::new(DeleteOutcome::Deleted),
+            hold: Mutex::new(None),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
             created: AtomicUsize::new(0),
         }
     }
@@ -2401,6 +2510,32 @@ impl FakeCalendarWriter {
     pub fn delete_calls(&self) -> Vec<(CalendarRef, EventRef)> {
         self.deletes.lock().unwrap().clone()
     }
+
+    /// Every delete's request condition, in order, aligned with
+    /// `delete_calls()`.
+    pub fn delete_conditions(&self) -> Vec<Option<String>> {
+        self.delete_conditions.lock().unwrap().clone()
+    }
+
+    /// Block the next writer call (a put or a delete) until a permit is
+    /// added to the returned semaphore.
+    pub fn hold_next_write(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// The most writer calls that ever ran at once.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    async fn wait_hold(&self) {
+        let hold = self.hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _permit = hold.acquire().await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2412,6 +2547,7 @@ impl CalendarWriter for FakeCalendarWriter {
         existing: Option<&EventRef>,
         if_match: Option<&str>,
     ) -> Result<EventRef> {
+        let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
         // The writer's own precondition re-check, modelled: the load
         // answers the next scripted fingerprint, or the caller's own
         // precondition when none is scripted. A mismatch refuses
@@ -2434,6 +2570,7 @@ impl CalendarWriter for FakeCalendarWriter {
             existing: existing.cloned(),
             if_match: if_match.map(str::to_string),
         });
+        self.wait_hold().await;
         if let Some(error) = self.put_error.lock().unwrap().take() {
             return Err(error);
         }
@@ -2464,11 +2601,44 @@ impl CalendarWriter for FakeCalendarWriter {
             }))
     }
 
-    async fn delete_event(&self, calendar: &CalendarRef, id: &EventRef) -> Result<DeleteOutcome> {
+    async fn delete_event(
+        &self,
+        calendar: &CalendarRef,
+        id: &EventRef,
+        if_match: Option<&str>,
+    ) -> Result<DeleteOutcome> {
+        let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
+        // The writer's own fresh-load check, modelled: the conditional
+        // load answers the next scripted fingerprint, or the caller's
+        // own condition when none is scripted. `*` pins existence only.
+        // A missing entity or a mismatch refuses before anything is
+        // deleted, so the delete is not recorded.
+        if let Some(condition) = if_match {
+            let mut scripted = self.loaded_delete_fingerprints.lock().unwrap();
+            let loaded = if scripted.is_empty() {
+                Some(condition.to_string())
+            } else {
+                scripted.remove(0)
+            };
+            drop(scripted);
+            let matches = match loaded {
+                None => false,
+                Some(_) if condition.trim() == "*" => true,
+                Some(fingerprint) => fingerprint == condition,
+            };
+            if !matches {
+                return Err(WriteRefusal::StoredVersionChanged.error());
+            }
+        }
+        self.delete_conditions
+            .lock()
+            .unwrap()
+            .push(if_match.map(str::to_string));
         self.deletes
             .lock()
             .unwrap()
             .push((calendar.clone(), id.clone()));
+        self.wait_hold().await;
         if let Some(error) = self.delete_error.lock().unwrap().take() {
             return Err(error);
         }

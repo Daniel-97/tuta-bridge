@@ -130,6 +130,21 @@ fn sdk_failure(error: ApiCallError) -> Error {
     }
 }
 
+/// Map one SDK failure of a write that first verifies a stored
+/// version: a `NotFound` means the entity vanished since the client
+/// read it, which is the fixed precondition refusal (`412`) — never a
+/// silent write. Everything else delegates to [`sdk_failure`]. Used by
+/// every update load and `update_instance`, and by the conditional
+/// delete's fresh load; creates keep [`sdk_failure`].
+fn update_failure(error: ApiCallError) -> Error {
+    match &error {
+        ApiCallError::ServerResponseError {
+            source: HttpError::NotFoundError,
+        } => WriteRefusal::StoredVersionChanged.error(),
+        _ => sdk_failure(error),
+    }
+}
+
 /// The strong ETag the reader derives from a loaded contact, or `None`
 /// when the card does not map (the reader would not serve it).
 fn loaded_contact_etag(
@@ -164,6 +179,22 @@ fn check_contact_precondition(
     Err(WriteRefusal::StoredVersionChanged.error())
 }
 
+/// Refuse an update of a contact the SDK could not fully decrypt: the
+/// bridge cannot render it, so merging fields would silently drop or
+/// overwrite the unreadable ones. This gate outranks the precondition,
+/// so no header and any header alike answer the dedicated `403`
+/// refusal. A raw delete keeps the existing precondition check: this
+/// gate only guards edits.
+fn check_contact_editable(
+    contact: &tutasdk::entities::generated::tutanota::Contact,
+    if_match: IfMatch<'_>,
+) -> Result<()> {
+    if !contact._errors.is_empty() {
+        return Err(WriteRefusal::ContactDecryptionFailed.error());
+    }
+    check_contact_precondition(contact, if_match)
+}
+
 /// Refuse an update whose precondition does not name the freshly
 /// loaded event's current content. The handler passes the stored
 /// master row's fingerprint (the served resource ETag embeds the
@@ -178,6 +209,24 @@ fn check_event_precondition(
     let Some(condition) = if_match else {
         return Ok(());
     };
+    if loaded_event_fingerprint(event).is_some_and(|fingerprint| fingerprint == condition) {
+        return Ok(());
+    }
+    Err(WriteRefusal::StoredVersionChanged.error())
+}
+
+/// Refuse a conditional delete whose freshly loaded event no longer
+/// names the row version the handler passed. `*` pins existence only
+/// (the load succeeded, so it exists); every other token is that row's
+/// cached fingerprint, which must equal the loaded content. An event
+/// that does not map fails closed the same way.
+fn check_event_delete_precondition(
+    event: &tutasdk::entities::generated::tutanota::CalendarEvent,
+    condition: &str,
+) -> Result<()> {
+    if condition.trim() == "*" {
+        return Ok(());
+    }
     if loaded_event_fingerprint(event).is_some_and(|fingerprint| fingerprint == condition) {
         return Ok(());
     }
@@ -698,19 +747,21 @@ pub fn entity_delete_url(
     format!("{base_url}/rest/tutanota/{type_path}/{list_id}/{element_id}")
 }
 
-/// Map a raw delete response: a 404 means the entity had already
-/// vanished remotely, a rejected session is the session error, a 403
-/// or 400 is a permanent refusal the server will answer again (a
-/// read-only share, a rejected id), and every other status is the
-/// fixed write failure.
-fn delete_outcome(status: u32) -> Result<DeleteOutcome> {
+/// Map a raw delete response: a 2xx is the delete this call made and a
+/// 404 the entity already gone, before anything is an error. Every
+/// other status goes through the SDK's own HTTP mapping and
+/// [`sdk_failure`], so the session error, the permanent remote refusal
+/// and the retryable failure can never drift from the SDK's tags.
+fn delete_outcome(status: u32, headers: &HashMap<String, String>) -> Result<DeleteOutcome> {
     match status {
-        200..=299 => Ok(DeleteOutcome::Deleted),
-        404 => Ok(DeleteOutcome::Gone),
-        401 => Err(session_invalid()),
-        403 | 400 => Err(WriteRefusal::RemoteRefused.error()),
-        _ => Err(write_failed()),
+        200..=299 => return Ok(DeleteOutcome::Deleted),
+        404 => return Ok(DeleteOutcome::Gone),
+        _ => {}
     }
+    let error = HttpError::from_http_response(status, headers).map_err(sdk_failure)?;
+    Err(sdk_failure(ApiCallError::ServerResponseError {
+        source: error,
+    }))
 }
 
 /// [`ContactWriter`] and [`CalendarWriter`] over the logged-in Tuta
@@ -791,7 +842,7 @@ impl TutaDavWriter {
             .request_binary(url, HttpMethod::DELETE, options)
             .await
             .map_err(|_| write_failed())?;
-        delete_outcome(response.status)
+        delete_outcome(response.status, &response.headers)
     }
 }
 
@@ -810,16 +861,18 @@ impl ContactWriter for TutaDavWriter {
                 GeneratedId(existing.list_id.clone()),
                 GeneratedId(existing.element_id.clone()),
             );
-            let mut contact: Contact = crypto_client.load(&id).await.map_err(sdk_failure)?;
-            // The precondition runs against the freshly loaded entity,
-            // after the load and before anything is written: the
-            // authority behind the handler's cached fast fail.
-            check_contact_precondition(&contact, if_match)?;
+            let mut contact: Contact = crypto_client.load(&id).await.map_err(update_failure)?;
+            // The update gate runs against the freshly loaded entity,
+            // after the load and before anything is written: a contact
+            // with decryption errors is refused first (the dedicated
+            // `403`), then the precondition (the authority behind the
+            // handler's cached fast fail).
+            check_contact_editable(&contact, if_match)?;
             apply_contact_fields(&mut contact, fields);
             crypto_client
                 .update_instance(contact)
                 .await
-                .map_err(sdk_failure)?;
+                .map_err(update_failure)?;
             Ok(ContactRef {
                 list_id: existing.list_id.clone(),
                 element_id: existing.element_id.clone(),
@@ -841,7 +894,25 @@ impl ContactWriter for TutaDavWriter {
         }
     }
 
-    async fn delete_contact(&self, id: &ContactRef) -> Result<DeleteOutcome> {
+    async fn delete_contact(
+        &self,
+        id: &ContactRef,
+        if_match: IfMatch<'_>,
+    ) -> Result<DeleteOutcome> {
+        // The authority behind the handler's cached fast fail: when a
+        // condition is present, load the card first and check it there.
+        // A load that finds it gone refuses with the same `412`, never
+        // a raw delete. Without a condition the raw delete stays
+        // unconditional.
+        if if_match.is_some() {
+            let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+            let tuple = IdTupleGenerated::new(
+                GeneratedId(id.list_id.clone()),
+                GeneratedId(id.element_id.clone()),
+            );
+            let contact: Contact = crypto_client.load(&tuple).await.map_err(update_failure)?;
+            check_contact_precondition(&contact, if_match)?;
+        }
         self.delete_entity(CONTACT_PATH, &id.list_id, &id.element_id)
             .await
     }
@@ -862,7 +933,7 @@ impl CalendarWriter for TutaDavWriter {
             GeneratedId(existing.list_id.clone()),
             CustomId(existing.element_id.clone()),
         );
-        let mut event: CalendarEvent = crypto_client.load(&id).await.map_err(sdk_failure)?;
+        let mut event: CalendarEvent = crypto_client.load(&id).await.map_err(update_failure)?;
         // The attendee gate outranks the precondition: an event with
         // guests is never editable, so telling the client to reload and
         // retry would only lead it into the same refusal.
@@ -874,14 +945,33 @@ impl CalendarWriter for TutaDavWriter {
         crypto_client
             .update_instance(event)
             .await
-            .map_err(sdk_failure)?;
+            .map_err(update_failure)?;
         Ok(EventRef {
             list_id: existing.list_id.clone(),
             element_id: existing.element_id.clone(),
         })
     }
 
-    async fn delete_event(&self, _calendar: &CalendarRef, id: &EventRef) -> Result<DeleteOutcome> {
+    async fn delete_event(
+        &self,
+        _calendar: &CalendarRef,
+        id: &EventRef,
+        if_match: IfMatch<'_>,
+    ) -> Result<DeleteOutcome> {
+        // The authority behind the handler's per-row fast fail: when a
+        // condition is present, load the event first and check it there.
+        // A load that finds it gone refuses with the same `412`, never
+        // a raw delete. Without a condition the raw delete stays
+        // unconditional.
+        if let Some(condition) = if_match {
+            let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
+            let tuple = IdTupleCustom::new(
+                GeneratedId(id.list_id.clone()),
+                CustomId(id.element_id.clone()),
+            );
+            let event: CalendarEvent = crypto_client.load(&tuple).await.map_err(update_failure)?;
+            check_event_delete_precondition(&event, condition)?;
+        }
         self.delete_entity(EVENT_PATH, &id.list_id, &id.element_id)
             .await
     }
@@ -901,6 +991,12 @@ mod tests {
             owner_enc_session_key: b"owner-enc".to_vec(),
             owner_key_version: 7,
         }
+    }
+
+    /// A nonempty `_errors` map, built through the public JSON shape:
+    /// `ElementValue` is not publicly nameable.
+    fn decryption_errors() -> tutasdk::entities::Errors {
+        serde_json::from_str(r#"{"body":{"String":"decryption failed"}}"#).unwrap()
     }
 
     fn membership(group_type: Option<i64>, group: &str) -> GroupMembership {
@@ -1829,26 +1925,147 @@ then edit them here"
 
     #[test]
     fn delete_responses_map_to_outcomes_and_fixed_errors() {
-        assert!(matches!(delete_outcome(200), Ok(DeleteOutcome::Deleted)));
-        assert!(matches!(delete_outcome(204), Ok(DeleteOutcome::Deleted)));
-        assert!(matches!(delete_outcome(404), Ok(DeleteOutcome::Gone)));
+        let headers = HashMap::new();
+        assert!(matches!(
+            delete_outcome(200, &headers),
+            Ok(DeleteOutcome::Deleted)
+        ));
+        assert!(matches!(
+            delete_outcome(204, &headers),
+            Ok(DeleteOutcome::Deleted)
+        ));
+        assert!(matches!(
+            delete_outcome(404, &headers),
+            Ok(DeleteOutcome::Gone)
+        ));
         assert_eq!(
-            delete_outcome(401).unwrap_err().to_string(),
+            delete_outcome(401, &headers).unwrap_err().to_string(),
             "login failed: session is no longer valid; run login again"
         );
         // A 403 (NotAuthorized, for example a read-only share) and a
         // 400 are permanent: the fixed refusal the handler answers
         // with `403`, never a session error and never the retry.
         assert_eq!(
-            delete_outcome(403).unwrap_err().to_string(),
+            delete_outcome(403, &headers).unwrap_err().to_string(),
             "unsupported: the remote server refused the write"
         );
         assert_eq!(
-            delete_outcome(400).unwrap_err().to_string(),
+            delete_outcome(400, &headers).unwrap_err().to_string(),
             "unsupported: the remote server refused the write"
         );
         assert_eq!(
-            delete_outcome(500).unwrap_err().to_string(),
+            delete_outcome(500, &headers).unwrap_err().to_string(),
+            "network error: dav write failed"
+        );
+    }
+
+    /// The raw delete statuses go through the SDK's own HTTP mapping,
+    /// the handler's refusal answer and the session's fixed answers,
+    /// so the domain mapping and what the client sees can never drift
+    /// apart.
+    #[test]
+    fn raw_delete_statuses_map_through_the_sdk_and_the_session_answer() {
+        use crate::adapters::dav::{session::error_response, writer_refusal};
+
+        let headers = HashMap::new();
+        for (status, refusal, final_status, body, retry_after) in [
+            (401, None, 500, "internal error\n", None),
+            (
+                403,
+                Some(WriteRefusal::RemoteRefused),
+                403,
+                "the remote server refused the write\n",
+                None,
+            ),
+            (
+                400,
+                Some(WriteRefusal::RemoteRefused),
+                403,
+                "the remote server refused the write\n",
+                None,
+            ),
+            (440, None, 500, "internal error\n", None),
+            (470, None, 500, "internal error\n", None),
+            (471, None, 500, "internal error\n", None),
+            (472, None, 500, "internal error\n", None),
+            (
+                473,
+                Some(WriteRefusal::RemoteRefused),
+                403,
+                "the remote server refused the write\n",
+                None,
+            ),
+            (500, None, 503, "temporarily unavailable\n", Some("30")),
+            (503, None, 503, "temporarily unavailable\n", Some("30")),
+        ] {
+            let error = delete_outcome(status, &headers).unwrap_err();
+            assert_eq!(WriteRefusal::of(&error), refusal, "status {status}");
+            // The handler answers a recognized refusal itself; only an
+            // escaped error reaches the session's fixed answer.
+            let response = match writer_refusal(error) {
+                Ok(response) => response,
+                Err(error) => error_response(error),
+            };
+            assert_eq!(response.status, final_status, "status {status}");
+            assert_eq!(
+                String::from_utf8(response.body).unwrap(),
+                body,
+                "status {status}"
+            );
+            let retry = response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, value)| value.as_str());
+            assert_eq!(retry, retry_after, "status {status}");
+        }
+    }
+
+    /// Updates load and save through the update-specific mapper: a
+    /// `NotFound` is the fixed precondition refusal (a `412`) for both
+    /// contacts and calendar events, whose call sites share this
+    /// mapping; every other failure delegates to `sdk_failure`.
+    #[test]
+    fn update_loads_and_saves_map_not_found_to_the_precondition() {
+        let not_found = update_failure(ApiCallError::ServerResponseError {
+            source: HttpError::NotFoundError,
+        });
+        assert_eq!(
+            WriteRefusal::of(&not_found),
+            Some(WriteRefusal::StoredVersionChanged)
+        );
+        assert_eq!(
+            not_found.to_string(),
+            "unsupported: the stored version changed since the client read it"
+        );
+        // Creates keep `sdk_failure`, so this mapping is only the
+        // update path's.
+        assert_eq!(
+            sdk_failure(ApiCallError::ServerResponseError {
+                source: HttpError::NotFoundError,
+            })
+            .to_string(),
+            "network error: dav write failed"
+        );
+        assert_eq!(
+            update_failure(ApiCallError::ServerResponseError {
+                source: HttpError::NotAuthorizedError,
+            })
+            .to_string(),
+            "unsupported: the remote server refused the write"
+        );
+        assert_eq!(
+            update_failure(ApiCallError::ServerResponseError {
+                source: HttpError::NotAuthenticatedError,
+            })
+            .to_string(),
+            "login failed: session is no longer valid; run login again"
+        );
+        assert_eq!(
+            update_failure(ApiCallError::ServerResponseError {
+                source: HttpError::InternalServerError,
+            })
+            .to_string(),
             "network error: dav write failed"
         );
     }
@@ -1924,5 +2141,55 @@ then edit them here"
             check_event_precondition(&broken, Some(&fingerprint)),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    /// The conditional delete's check: an exact token must name the
+    /// freshly loaded content, while `*` pins existence only.
+    #[test]
+    fn a_conditional_event_delete_matches_the_rows_fingerprint_or_star() {
+        let event = stored_event("uid-1");
+        let fingerprint = loaded_event_fingerprint(&event).unwrap();
+        assert!(check_event_delete_precondition(&event, &fingerprint).is_ok());
+        assert!(check_event_delete_precondition(&event, "*").is_ok());
+        let error = check_event_delete_precondition(&event, "stale")
+            .err()
+            .unwrap();
+        assert_eq!(
+            WriteRefusal::of(&error),
+            Some(WriteRefusal::StoredVersionChanged)
+        );
+        // Star means the load found the entity: it does not need a
+        // renderable body. An exact token still fails closed.
+        let mut broken = stored_event("uid-1");
+        broken._id = None;
+        assert!(check_event_delete_precondition(&broken, "*").is_ok());
+        assert!(matches!(
+            check_event_delete_precondition(&broken, &fingerprint),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    /// A partially decrypted contact is refused for every update,
+    /// whatever the request's `If-Match`; the gate outranks the
+    /// precondition, and a raw delete stays governed by the existing
+    /// precondition check.
+    #[test]
+    fn a_contact_with_decryption_errors_is_refused_for_every_update_condition() {
+        let mut contact = contact_entity(&fields(), "list", "group", &key());
+        contact._errors = decryption_errors();
+        for condition in [None, Some("*"), Some("\"stale\""), Some("\"matching\"")] {
+            let error = check_contact_editable(&contact, condition).unwrap_err();
+            assert_eq!(
+                WriteRefusal::of(&error),
+                Some(WriteRefusal::ContactDecryptionFailed)
+            );
+            assert_eq!(
+                error.to_string(),
+                "unsupported: contacts with decryption errors cannot be edited through the bridge"
+            );
+        }
+        // E only guards edits: no update header and the raw delete
+        // path's existing check still pass.
+        assert!(check_contact_precondition(&contact, None).is_ok());
     }
 }

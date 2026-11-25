@@ -1374,6 +1374,174 @@ async fn a_remote_event_already_gone_still_deletes() {
     assert_ne!(ctag(&mut wire, "work").await, baseline);
 }
 
+/// An unconditional delete has no fresh load to check: an already gone
+/// remote event still lands the tombstone and answers `204`.
+#[tokio::test]
+async fn an_unconditional_gone_delete_still_tombstones() {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    source.put_event(plain_event("e1", "uid-1", NOW_MS + DAY_MS));
+    source.put_event(plain_event("e2", "uid-2", NOW_MS + 2 * DAY_MS));
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    *writer.delete_outcome.lock().unwrap() = DeleteOutcome::Gone;
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    for (href, _) in listed {
+        let response = wire.request("DELETE", &href, &[], "").await;
+        assert_eq!(response.status, 204);
+    }
+    assert!(row_of(&fixture, "e1").await.is_none());
+    assert!(row_of(&fixture, "e2").await.is_none());
+    assert_eq!(writer.delete_calls().len(), 2);
+    assert_eq!(writer.delete_conditions(), [None, None]);
+}
+
+/// The same stale-cache case for `DELETE`: the cached resource ETag
+/// matches the client's `If-Match`, but the remote event moved on. The
+/// writer's fresh load is the authority, so the delete answers `412`
+/// and removes neither the remote event nor its row.
+#[tokio::test]
+async fn a_stale_cache_matching_delete_answers_412_without_deleting() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, etag) = listed[0].clone();
+    let baseline = ctag(&mut wire, "work").await;
+    let row = row_of(&fixture, "e1").await.unwrap();
+
+    // The web client edited the event; the echo has not been
+    // delivered. The writer's fresh load answers the web-edited
+    // content.
+    let mut web_edited = plain_event("e1", "uid-1", NOW_MS + DAY_MS);
+    web_edited.summary = "Web edited".into();
+    *writer.loaded_delete_fingerprints.lock().unwrap() = vec![Some(web_edited.fingerprint())];
+
+    let condition = format!("If-Match: {etag}");
+    let response = wire.request("DELETE", &href, &[&condition], "").await;
+    assert_eq!(response.status, 412);
+    assert_eq!(response.body, "precondition failed\n");
+    assert!(
+        writer.delete_calls().is_empty(),
+        "no remote delete happened"
+    );
+    assert!(writer.delete_conditions().is_empty());
+    assert_eq!(
+        row_of(&fixture, "e1").await.unwrap().fingerprint,
+        row.fingerprint
+    );
+    assert_eq!(ctag(&mut wire, "work").await, baseline);
+}
+
+/// A series delete checks every row against its own cached
+/// fingerprint, so an altered occurrence is caught too.
+#[tokio::test]
+async fn an_altered_occurrence_refuses_the_whole_series_delete() {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let mut master = plain_event("series", "series-uid", NOW_MS);
+    master.list_id = "work-long".into();
+    master.repeat = Some(weekly());
+    let mut moved = plain_event("moved", "series-uid", NOW_MS + 7 * DAY_MS + 2 * HOUR);
+    moved.list_id = "work-long".into();
+    moved.recurrence_id_ms = Some(NOW_MS + 7 * DAY_MS);
+    source.put_event(master);
+    source.put_event(moved);
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, etag) = listed[0].clone();
+    let baseline = ctag(&mut wire, "work").await;
+
+    // The first row's fresh load answers different content: the whole
+    // resource refuses before its first delete.
+    *writer.loaded_delete_fingerprints.lock().unwrap() = vec![Some("changed".to_string())];
+    let condition = format!("If-Match: {etag}");
+    let response = wire.request("DELETE", &href, &[&condition], "").await;
+    assert_eq!(response.status, 412);
+    assert!(writer.delete_calls().is_empty());
+    assert!(row_of(&fixture, "series").await.is_some());
+    assert!(row_of(&fixture, "moved").await.is_some());
+    assert_eq!(ctag(&mut wire, "work").await, baseline);
+}
+
+/// The condition of each row in a series delete is that row's own
+/// cached fingerprint, never the master's token for every row.
+#[tokio::test]
+async fn a_series_delete_conditions_each_row_with_its_own_fingerprint() {
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    let mut master = plain_event("series", "series-uid", NOW_MS);
+    master.list_id = "work-long".into();
+    master.repeat = Some(weekly());
+    let mut moved = plain_event("moved", "series-uid", NOW_MS + 7 * DAY_MS + 2 * HOUR);
+    moved.list_id = "work-long".into();
+    moved.recurrence_id_ms = Some(NOW_MS + 7 * DAY_MS);
+    source.put_event(master);
+    source.put_event(moved);
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, etag) = listed[0].clone();
+    let moved_row = row_of(&fixture, "moved").await.unwrap();
+    let series_row = row_of(&fixture, "series").await.unwrap();
+    assert_ne!(moved_row.fingerprint, series_row.fingerprint);
+
+    let condition = format!("If-Match: {etag}");
+    let response = wire.request("DELETE", &href, &[&condition], "").await;
+    assert_eq!(response.status, 204);
+    assert!(
+        writer.delete_conditions()
+            == [
+                Some(moved_row.fingerprint.clone()),
+                Some(series_row.fingerprint.clone()),
+            ]
+    );
+}
+
+/// `If-Match: *` pins existence only, per row: it passes for fresh
+/// loads that exist and refuses the whole resource when one vanished.
+#[tokio::test]
+async fn a_delete_with_if_match_star_requires_fresh_existence() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+    let response = wire.request("DELETE", &href, &["If-Match: *"], "").await;
+    assert_eq!(response.status, 204);
+    assert!(row_of(&fixture, "e1").await.is_none());
+    assert_eq!(writer.delete_conditions(), [Some("*".to_string())]);
+
+    // A second calendar whose cached row outlived the remote event:
+    // the star names existence, so the delete is refused.
+    let source = Arc::new(FakeCalendarSource::new());
+    source.add_calendar(calendar("work"));
+    source.put_event(plain_event("e1", "uid-1", NOW_MS + DAY_MS));
+    let fixture = over(source).await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    *writer.loaded_delete_fingerprints.lock().unwrap() = vec![None];
+    let mut wire = spawn_writable(&fixture, Arc::clone(&writer), vec![USER.to_string()]);
+    let listed = listing(&mut wire, "work").await;
+    let (href, _) = listed[0].clone();
+    let baseline = ctag(&mut wire, "work").await;
+
+    let response = wire.request("DELETE", &href, &["If-Match: *"], "").await;
+    assert_eq!(response.status, 412);
+    assert_eq!(response.body, "precondition failed\n");
+    assert!(writer.delete_calls().is_empty());
+    assert!(row_of(&fixture, "e1").await.is_some());
+    assert_eq!(ctag(&mut wire, "work").await, baseline);
+}
+
 // ---------------------------------------------------------------------------
 // Advertised methods, read-only answers, collections
 // ---------------------------------------------------------------------------
@@ -1527,6 +1695,72 @@ async fn concurrent_puts_with_the_same_if_match_write_once_and_refuse_the_second
     statuses.sort();
     assert_eq!(statuses, [204, 412]);
     assert_eq!(writer.put_calls().len(), 1, "exactly one remote write");
+}
+
+/// A `PUT` and a `DELETE` on the same calendar share that calendar's
+/// write section: a writer call held mid-flight blocks the other
+/// request before its own writer call, so the two never overlap and
+/// neither deadlocks.
+#[tokio::test]
+async fn a_put_and_a_delete_never_overlap() {
+    let fixture = fixture().await;
+    let writer = Arc::new(FakeCalendarWriter::new());
+    let handler: Arc<dyn DavHandler> = Arc::new(CalDavHandler::with_writer(
+        Arc::clone(&fixture.sync),
+        USER.to_string(),
+        Arc::clone(&writer) as Arc<dyn CalendarWriter>,
+        vec![USER.to_string()],
+    ));
+    let mut delete_wire = spawn_handler(Arc::clone(&handler));
+    let listed = listing(&mut delete_wire, "work").await;
+    let (href, etag) = listed[0].clone();
+
+    // Hold the first writer call: the delete reaches the writer and
+    // keeps the calendar's write section.
+    let hold = writer.hold_next_write();
+    let delete_writer = Arc::clone(&writer);
+    let deleted_href = href.clone();
+    let delete =
+        tokio::spawn(async move { delete_wire.request("DELETE", &deleted_href, &[], "").await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while delete_writer.delete_calls().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the delete reached the writer");
+
+    // The put's re-check answers different content: it refuses once it
+    // gets the section.
+    *writer.loaded_fingerprints.lock().unwrap() = vec!["changed".to_string()];
+    let mut edited = plain_event("e1", "uid-1", NOW_MS + DAY_MS);
+    edited.summary = "Edited summary".into();
+    let body = body_of(&edited);
+    let condition = format!("If-Match: {etag}");
+    let mut put_wire = spawn_handler(Arc::clone(&handler));
+    let put =
+        tokio::spawn(async move { put_wire.request("PUT", &href, &[&condition], &body).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(writer.max_in_flight(), 1, "the writer calls never overlap");
+    assert!(
+        writer.put_calls().is_empty(),
+        "the put waits for the delete's section"
+    );
+
+    hold.add_permits(1);
+    let deleted = tokio::time::timeout(Duration::from_secs(5), delete)
+        .await
+        .expect("the delete did not deadlock")
+        .unwrap();
+    let put = tokio::time::timeout(Duration::from_secs(5), put)
+        .await
+        .expect("the put did not deadlock")
+        .unwrap();
+    assert_eq!(deleted.status, 204);
+    assert_eq!(put.status, 412);
+    assert_eq!(writer.delete_calls().len(), 1);
+    assert!(writer.put_calls().is_empty());
+    assert_eq!(writer.max_in_flight(), 1);
 }
 
 // ---------------------------------------------------------------------------

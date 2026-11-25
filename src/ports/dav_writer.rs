@@ -107,17 +107,24 @@ pub struct EventFields {
     pub organizer: Option<EventPerson>,
 }
 
-/// The precondition token of one update: the version the client read,
-/// as the handler already verified it against its cached row with the
-/// request's `If-Match`. A contact writer re-checks the raw header
-/// against the strong ETag it derives from the freshly loaded card —
-/// the same ETag the reader serves, so the check needs nothing the
-/// handler knows. An event writer cannot recompute the served
-/// resource ETag (it embeds the row's first-seen stamp, which no
+/// The precondition of one write: the version the client read, as the
+/// handler already verified it against its cached row with the
+/// request's `If-Match` (the fast fail). A contact write re-checks the
+/// raw header against the strong ETag it derives from the freshly
+/// loaded card — the same ETag the reader serves, so the check needs
+/// nothing the handler knows. An event write cannot recompute the
+/// served resource ETag (it embeds the row's first-seen stamp, which no
 /// freshly loaded entity carries), so the handler passes the stored
-/// master row's content fingerprint instead: the version of the very
-/// event the write updates. `None` (no header, or `If-Match: *`) lets
-/// the write through without a check.
+/// row's content fingerprint instead: for an update, the master row's
+/// (the version of the very event the update writes); for a delete,
+/// each row's own (the resource is every row of the series). `None`
+/// (no header) lets the write through without a check.
+///
+/// `Some("*")` pins existence only: a conditional write freshly loads
+/// the entity and refuses with [`WriteRefusal::StoredVersionChanged`]
+/// when the load finds it gone, never comparing `*` to a version. An
+/// unconditional delete issues the raw delete without a load and
+/// answers [`DeleteOutcome::Gone`] for a vanished entity.
 pub type IfMatch<'a> = Option<&'a str>;
 
 /// A fixed refusal of a write, carried as an
@@ -141,6 +148,11 @@ pub enum WriteRefusal {
     /// The stored event carries attendees the bridge cannot keep in
     /// step, so it never edits such an event.
     AttendeesRefused,
+    /// The stored contact cannot be edited through the bridge: its
+    /// decryption errors leave fields the bridge cannot render and
+    /// merge safely. The handler answers `403`, never a silent
+    /// partial write.
+    ContactDecryptionFailed,
     /// Creating events is upstream-blocked: the pinned SDK cannot
     /// create Tuta's custom-id events.
     CreateRefused,
@@ -155,6 +167,9 @@ impl WriteRefusal {
             Self::StoredVersionChanged => "the stored version changed since the client read it",
             Self::RemoteRefused => "the remote server refused the write",
             Self::AttendeesRefused => "events with attendees cannot be edited through the bridge",
+            Self::ContactDecryptionFailed => {
+                "contacts with decryption errors cannot be edited through the bridge"
+            }
             Self::CreateRefused => {
                 "creating events is not supported: create them in the Tuta client, then edit them here"
             }
@@ -174,10 +189,11 @@ impl WriteRefusal {
         let crate::domain::Error::Unsupported(message) = error else {
             return None;
         };
-        const ALL: [WriteRefusal; 5] = [
+        const ALL: [WriteRefusal; 6] = [
             WriteRefusal::StoredVersionChanged,
             WriteRefusal::RemoteRefused,
             WriteRefusal::AttendeesRefused,
+            WriteRefusal::ContactDecryptionFailed,
             WriteRefusal::CreateRefused,
             WriteRefusal::NoContactGroup,
         ];
@@ -216,8 +232,14 @@ pub trait ContactWriter: Send + Sync {
     ) -> Result<ContactRef>;
 
     /// Delete one contact; [`DeleteOutcome::Gone`] when it had already
-    /// vanished remotely.
-    async fn delete_contact(&self, id: &ContactRef) -> Result<DeleteOutcome>;
+    /// vanished remotely. A condition (the request's `If-Match`, already
+    /// verified against the cached row by the handler) is re-checked
+    /// against the freshly loaded card — `*` pins existence — and a
+    /// vanished or mismatching entity refuses with
+    /// [`WriteRefusal::StoredVersionChanged`] before anything is
+    /// deleted. `None` deletes unconditionally.
+    async fn delete_contact(&self, id: &ContactRef, if_match: IfMatch<'_>)
+        -> Result<DeleteOutcome>;
 }
 
 /// The calendar write seam towards Tuta.
@@ -242,8 +264,18 @@ pub trait CalendarWriter: Send + Sync {
     ) -> Result<EventRef>;
 
     /// Delete one event; [`DeleteOutcome::Gone`] when it had already
-    /// vanished remotely.
-    async fn delete_event(&self, calendar: &CalendarRef, id: &EventRef) -> Result<DeleteOutcome>;
+    /// vanished remotely. A condition (the handler's per-row token:
+    /// that row's cached content fingerprint, or `*` for existence) is
+    /// re-checked against the freshly loaded event — a vanished or
+    /// mismatching event refuses with
+    /// [`WriteRefusal::StoredVersionChanged`] before anything is
+    /// deleted. `None` deletes unconditionally.
+    async fn delete_event(
+        &self,
+        calendar: &CalendarRef,
+        id: &EventRef,
+        if_match: IfMatch<'_>,
+    ) -> Result<DeleteOutcome>;
 }
 
 /// The DAV write seams of one session, handed to `serve` together:
@@ -267,6 +299,7 @@ mod tests {
             WriteRefusal::StoredVersionChanged,
             WriteRefusal::RemoteRefused,
             WriteRefusal::AttendeesRefused,
+            WriteRefusal::ContactDecryptionFailed,
             WriteRefusal::CreateRefused,
             WriteRefusal::NoContactGroup,
         ] {

@@ -47,8 +47,12 @@
 //! read; a client that retried a write that already happened would
 //! create a duplicate). `DELETE` tombstones a row only after the
 //! remote delete held, and a failed cache apply stays the success the
-//! same way. Without a writer both answer the fixed `403` the session
-//! answered before.
+//! same way. A conditional `DELETE` shares the same write section as
+//! the put: the writer re-checks the request's `If-Match` against the
+//! freshly loaded contact, so a cache-matching but stale delete still
+//! answers `412`, and the tombstone apply never interleaves with
+//! another connection's put. Without a writer both answer the fixed
+//! `403` the session answered before.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -615,11 +619,19 @@ impl CardDavHandler {
             list_id: stored.list_id.clone(),
             element_id: stored.element_id.clone(),
         };
+        // The request's `If-Match`, already verified above: the writer
+        // re-checks it against the freshly loaded entity, which is the
+        // authority behind that fast fail.
+        let if_match = request.header("if-match");
+        // One whole write per book at a time, the same section a put
+        // takes: the remote delete and the tombstone apply never
+        // interleave with another connection's write.
+        let _guard = self.write.lock().await;
         // Remote first. Both outcomes proceed: `Gone` has already
         // reached the end state the client asked for. A refusal
         // answers its fixed status; a session error and a transport
         // failure reach the session layer untouched.
-        match writer.delete_contact(&reference).await {
+        match writer.delete_contact(&reference, if_match).await {
             Ok(_) => {}
             Err(error) => return writer_refusal(error),
         }

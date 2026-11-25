@@ -50,8 +50,12 @@
 //! event of the series is deleted remotely first, then the rows are
 //! removed the way a delete event removes them (the calendar cache
 //! keeps no tombstones, so a href that never existed answers `404` and
-//! writes nothing). Without a writer both answer the fixed `403` the
-//! session answered before.
+//! writes nothing). It shares the calendar's write section with the
+//! put, and a conditional delete hands each row its own cached
+//! fingerprint (or `*` for existence): the writer freshly loads every
+//! event, so a cache-matching but stale resource — an altered
+//! occurrence included — answers `412` and removes nothing. Without a
+//! writer both answer the fixed `403` the session answered before.
 //!
 //! `Depth: infinity` (and a `PROPFIND` without `Depth`) is served as
 //! `Depth: 1`. Reports: `calendar-query` (the first `time-range` of
@@ -778,7 +782,8 @@ impl CalDavHandler {
         let Some(resource) = group_resources(rows).remove(&name) else {
             return Ok(DavResponse::not_found());
         };
-        if let Some(condition) = request.header("if-match") {
+        let if_match = request.header("if-match");
+        if let Some(condition) = if_match {
             if !strong_etag_matches(condition, &resource_etag(&resource.rows)) {
                 return Ok(precondition_failed());
             }
@@ -788,18 +793,37 @@ impl CalDavHandler {
             short_list_id: calendar.short_list_id.clone(),
             long_list_id: calendar.long_list_id.clone(),
         };
+        // One whole write per calendar at a time, the same section a
+        // put takes: every remote delete and every row removal below
+        // never interleave with another connection's write. No second
+        // per-calendar guard is taken.
+        let guard = self.write_guard(&calendar_id).await;
+        let _guard = guard.lock().await;
         // Remote first. Both outcomes proceed: `Gone` has already
         // reached the end state the client asked for. A refusal
         // answers its fixed status; a session error and a transport
         // failure reach the session layer untouched. A failure part
         // way leaves the cache as it was; the client retries and the
         // events already gone answer `Gone`.
+        //
+        // The condition is per row: the request's header was verified
+        // against the whole resource above, but each event is checked
+        // against its own cached fingerprint (or `*` for existence), so
+        // an altered occurrence inside the series is caught too.
         for row in &resource.rows {
             let reference = EventRef {
                 list_id: row.list_id.clone(),
                 element_id: row.element_id.clone(),
             };
-            match writer.delete_event(&calendar_ref, &reference).await {
+            let condition = match if_match {
+                None => None,
+                Some(condition) if condition.trim() == "*" => Some("*"),
+                Some(_) => Some(row.fingerprint.as_str()),
+            };
+            match writer
+                .delete_event(&calendar_ref, &reference, condition)
+                .await
+            {
                 Ok(_) => {}
                 Err(error) => return writer_refusal(error),
             }

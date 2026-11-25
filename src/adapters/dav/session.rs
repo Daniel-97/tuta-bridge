@@ -267,6 +267,20 @@ async fn authenticate(
     }
 }
 
+/// The fixed answer for a handler error: a transport failure is the
+/// retryable `503` (with the fixed `Retry-After`), every other error —
+/// a session error above all — the fixed `500`. The connection closes
+/// after either. Fixed text only: nothing the handler carries reaches
+/// the body.
+pub(crate) fn error_response(error: Error) -> DavResponse {
+    match error {
+        Error::Network(_) => {
+            DavResponse::text(503, "temporarily unavailable").with_header("Retry-After", "30")
+        }
+        _ => DavResponse::text(500, "internal error"),
+    }
+}
+
 /// Answer one authenticated request: the generic parts here, the reads
 /// and writes through the handler.
 async fn dispatch(handler: &dyn DavHandler, request: HttpRequest) -> DavResponse {
@@ -329,14 +343,14 @@ async fn dispatch(handler: &dyn DavHandler, request: HttpRequest) -> DavResponse
     };
     let response = match handler.handle(&dav_request).await {
         Ok(response) => response,
-        Err(Error::Network(_)) => {
-            tracing::warn!(protocol = handler.label(), "dav handler unavailable");
-            return DavResponse::text(503, "temporarily unavailable")
-                .with_header("Retry-After", "30");
-        }
-        Err(_) => {
-            tracing::warn!(protocol = handler.label(), "dav handler failed");
-            return DavResponse::text(500, "internal error");
+        Err(error) => {
+            match &error {
+                Error::Network(_) => {
+                    tracing::warn!(protocol = handler.label(), "dav handler unavailable")
+                }
+                _ => tracing::warn!(protocol = handler.label(), "dav handler failed"),
+            }
+            return error_response(error);
         }
     };
     if conditional && response.status == 200 {

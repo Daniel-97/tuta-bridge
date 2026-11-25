@@ -640,6 +640,19 @@ async fn a_remote_contact_already_gone_still_deletes() {
             }]
     );
     assert_ne!(ctag_of(&mut wire).await, baseline);
+
+    // Without a condition the raw delete is unconditional: an already
+    // gone entity still reaches the end state the client asked for.
+    let response = wire
+        .request("DELETE", "/addressbooks/contacts/c2.vcf", &[], "")
+        .await;
+    assert_eq!(response.status, 204);
+    assert!(book.lookup("c2").await.unwrap().is_none());
+    assert_eq!(writer.delete_calls().len(), 2);
+    assert_eq!(
+        writer.delete_conditions(),
+        [Some(stored.etag.clone()), None]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +798,74 @@ async fn a_stale_cache_matching_put_answers_412_without_writing() {
     assert_eq!(writer.put_calls().len(), 1);
 }
 
+/// The same stale-cache case for `DELETE`: the cached ETag matches the
+/// client's `If-Match`, but the remote card moved on. The fresh load is
+/// the authority, so the delete answers `412` and touches neither the
+/// remote entity nor the tombstone.
+#[tokio::test]
+async fn a_stale_cache_matching_delete_answers_412_without_deleting() {
+    let (book, _) = book_with(three_cards()).await;
+    let writer = Arc::new(FakeContactWriter::new());
+    let mut wire = spawn(Arc::clone(&book), Arc::clone(&writer));
+
+    let etag = c1_etag(&mut wire).await;
+    let stored = book.lookup("c1").await.unwrap().unwrap();
+    let baseline = ctag_of(&mut wire).await;
+
+    // The web client edited the card; the echo has not been delivered.
+    // The writer's fresh load answers the web-edited version.
+    let mut web_edited = card("c1", "Ada", "Lovelace", "web-edited@example.invalid");
+    web_edited.comment = "Edited on the web".into();
+    *writer.loaded_delete_etags.lock().unwrap() =
+        vec![Some(vcard_etag(&render_vcard(&web_edited)))];
+
+    let condition = format!("If-Match: {etag}");
+    let response = wire.request("DELETE", C1, &[&condition], "").await;
+    assert_eq!(response.status, 412);
+    assert_eq!(response.body, "precondition failed\n");
+    assert!(
+        writer.delete_calls().is_empty(),
+        "no remote delete happened"
+    );
+    assert!(writer.delete_conditions().is_empty());
+    let after = book.lookup("c1").await.unwrap().unwrap();
+    assert_eq!(after.etag, stored.etag);
+    assert_eq!(ctag_of(&mut wire).await, baseline);
+}
+
+/// `If-Match: *` pins existence only: it passes for a fresh load that
+/// exists and refuses one that vanished, whatever the old ETag was.
+#[tokio::test]
+async fn a_delete_with_if_match_star_requires_fresh_existence() {
+    let (book, _) = book_with(three_cards()).await;
+    let writer = Arc::new(FakeContactWriter::new());
+    let mut wire = spawn(Arc::clone(&book), Arc::clone(&writer));
+
+    let response = wire.request("DELETE", C1, &["If-Match: *"], "").await;
+    assert_eq!(response.status, 204);
+    assert!(book.lookup("c1").await.unwrap().is_none());
+    assert_eq!(writer.delete_calls().len(), 1);
+    assert_eq!(writer.delete_conditions(), [Some("*".to_string())]);
+
+    // The remote card is gone even though the cache still lists it:
+    // the star names existence, so the delete is refused.
+    let baseline = ctag_of(&mut wire).await;
+    *writer.loaded_delete_etags.lock().unwrap() = vec![None];
+    let response = wire
+        .request(
+            "DELETE",
+            "/addressbooks/contacts/c2.vcf",
+            &["If-Match: *"],
+            "",
+        )
+        .await;
+    assert_eq!(response.status, 412);
+    assert_eq!(response.body, "precondition failed\n");
+    assert_eq!(writer.delete_calls().len(), 1);
+    assert!(book.lookup("c2").await.unwrap().is_some());
+    assert_eq!(ctag_of(&mut wire).await, baseline);
+}
+
 /// Two concurrent `PUT`s with the same `If-Match`: the per-book write
 /// section lets exactly one through; the other's re-check sees the
 /// first write's version and answers `412`. Whichever connection wins
@@ -816,6 +897,60 @@ async fn concurrent_puts_with_the_same_if_match_write_once_and_refuse_the_second
     statuses.sort();
     assert_eq!(statuses, [204, 412]);
     assert_eq!(writer.put_calls().len(), 1, "exactly one remote write");
+}
+
+/// A `PUT` and a `DELETE` on the same book share the write section: a
+/// writer call held mid-flight blocks the other request before its own
+/// writer call, so the two never overlap and neither deadlocks.
+#[tokio::test]
+async fn a_put_and_a_delete_never_overlap() {
+    let (book, _) = book_with(three_cards()).await;
+    let writer = Arc::new(FakeContactWriter::new());
+    let handler = handler_of(Arc::clone(&book), Arc::clone(&writer));
+    let mut delete_wire = spawn_handler(Arc::clone(&handler));
+    let etag = c1_etag(&mut delete_wire).await;
+
+    // Hold the first writer call: the delete reaches the writer and
+    // keeps the book's write section.
+    let hold = writer.hold_next_write();
+    let delete_writer = Arc::clone(&writer);
+    let delete = tokio::spawn(async move { delete_wire.request("DELETE", C1, &[], "").await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while delete_writer.delete_calls().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the delete reached the writer");
+
+    // The put's load answers the delete's end state: its re-check
+    // refuses it once it gets the section.
+    *writer.loaded_etags.lock().unwrap() = vec!["\"changed\"".to_string()];
+    let body = render_vcard(&card("c1", "Ada", "Lovelace", "edit@example.invalid"));
+    let condition = format!("If-Match: {etag}");
+    let mut put_wire = spawn_handler(Arc::clone(&handler));
+    let put = tokio::spawn(async move { put_wire.request("PUT", C1, &[&condition], &body).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(writer.max_in_flight(), 1, "the writer calls never overlap");
+    assert!(
+        writer.put_calls().is_empty(),
+        "the put waits for the delete's section"
+    );
+
+    hold.add_permits(1);
+    let deleted = tokio::time::timeout(Duration::from_secs(5), delete)
+        .await
+        .expect("the delete did not deadlock")
+        .unwrap();
+    let put = tokio::time::timeout(Duration::from_secs(5), put)
+        .await
+        .expect("the put did not deadlock")
+        .unwrap();
+    assert_eq!(deleted.status, 204);
+    assert_eq!(put.status, 412);
+    assert_eq!(writer.delete_calls().len(), 1);
+    assert!(writer.put_calls().is_empty());
+    assert_eq!(writer.max_in_flight(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1088,17 @@ async fn writer_errors_map_to_fixed_statuses() {
     assert_eq!(response.status, 403);
     assert_eq!(response.body, "the remote server refused the write\n");
     assert!(book.lookup("c3").await.unwrap().is_some());
+
+    // A contact with decryption errors refuses the edit with the
+    // dedicated fixed body, never a partial write.
+    *writer.put_error.lock().unwrap() = Some(WriteRefusal::ContactDecryptionFailed.error());
+    let edit_body = render_vcard(&card("c1", "Ada", "Lovelace", "edit@example.invalid"));
+    let response = wire.request("PUT", C1, &[], &edit_body).await;
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.body,
+        "contacts with decryption errors cannot be edited through the bridge\n"
+    );
 
     // An expired session is not a refusal and not a retry: the session
     // layer's answer, and the connection ends.
