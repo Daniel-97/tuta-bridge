@@ -2034,6 +2034,8 @@ pub struct FakeContactWriter {
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
     created: AtomicUsize,
+    put_entered: AtomicBool,
+    put_entry: tokio::sync::Notify,
 }
 
 impl Default for FakeContactWriter {
@@ -2053,6 +2055,8 @@ impl Default for FakeContactWriter {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             created: AtomicUsize::new(0),
+            put_entered: AtomicBool::new(false),
+            put_entry: tokio::sync::Notify::new(),
         }
     }
 }
@@ -2118,6 +2122,19 @@ impl FakeContactWriter {
         self.max_in_flight.load(Ordering::SeqCst)
     }
 
+    /// Whether a `PUT` has entered the fake writer yet.
+    pub fn put_entered(&self) -> bool {
+        self.put_entered.load(Ordering::SeqCst)
+    }
+
+    /// Await the first `PUT` entering the fake writer.
+    pub async fn wait_for_put_entry(&self) {
+        if self.put_entered() {
+            return;
+        }
+        self.put_entry.notified().await;
+    }
+
     async fn wait_hold(&self) {
         let hold = self.hold.lock().unwrap().take();
         if let Some(hold) = hold {
@@ -2136,6 +2153,8 @@ impl ContactWriter for FakeContactWriter {
         if_match: Option<&str>,
     ) -> Result<ContactRef> {
         let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
+        self.put_entered.store(true, Ordering::SeqCst);
+        self.put_entry.notify_one();
         // The writer's own precondition re-check, modelled: the load
         // answers the next scripted ETag, or the caller's own
         // precondition when none is scripted. A mismatch refuses
@@ -2426,11 +2445,6 @@ pub struct FakeCalendarWriter {
     /// call order; an empty list (the default) answers the caller's
     /// own precondition, so a matching token passes.
     pub loaded_fingerprints: Mutex<Vec<String>>,
-    /// The content fingerprint each conditional delete's fresh load
-    /// answers, in call order; `None` means the event is gone. An empty
-    /// list (the default) answers the caller's own condition, so a
-    /// matching row passes.
-    pub loaded_delete_fingerprints: Mutex<Vec<Option<String>>>,
     /// The content fingerprint each verify's fresh load answers, in
     /// call order; `None` means the event is gone. An empty list (the
     /// default) answers the caller's own condition, so a matching row
@@ -2456,6 +2470,8 @@ pub struct FakeCalendarWriter {
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
     created: AtomicUsize,
+    put_entered: AtomicBool,
+    put_entry: tokio::sync::Notify,
 }
 
 impl Default for FakeCalendarWriter {
@@ -2466,7 +2482,6 @@ impl Default for FakeCalendarWriter {
             delete_conditions: Mutex::new(Vec::new()),
             failing: Mutex::new(false),
             loaded_fingerprints: Mutex::new(Vec::new()),
-            loaded_delete_fingerprints: Mutex::new(Vec::new()),
             loaded_verify_fingerprints: Mutex::new(Vec::new()),
             verifies: Mutex::new(Vec::new()),
             verify_conditions: Mutex::new(Vec::new()),
@@ -2478,6 +2493,8 @@ impl Default for FakeCalendarWriter {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             created: AtomicUsize::new(0),
+            put_entered: AtomicBool::new(false),
+            put_entry: tokio::sync::Notify::new(),
         }
     }
 }
@@ -2554,6 +2571,19 @@ impl FakeCalendarWriter {
         self.max_in_flight.load(Ordering::SeqCst)
     }
 
+    /// Whether a `PUT` has entered the fake writer yet.
+    pub fn put_entered(&self) -> bool {
+        self.put_entered.load(Ordering::SeqCst)
+    }
+
+    /// Await the first `PUT` entering the fake writer.
+    pub async fn wait_for_put_entry(&self) {
+        if self.put_entered() {
+            return;
+        }
+        self.put_entry.notified().await;
+    }
+
     async fn wait_hold(&self) {
         let hold = self.hold.lock().unwrap().take();
         if let Some(hold) = hold {
@@ -2572,6 +2602,8 @@ impl CalendarWriter for FakeCalendarWriter {
         if_match: Option<&str>,
     ) -> Result<EventRef> {
         let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
+        self.put_entered.store(true, Ordering::SeqCst);
+        self.put_entry.notify_one();
         // The writer's own precondition re-check, modelled: the load
         // answers the next scripted fingerprint, or the caller's own
         // precondition when none is scripted. A mismatch refuses
@@ -2625,27 +2657,11 @@ impl CalendarWriter for FakeCalendarWriter {
         if_match: Option<&str>,
     ) -> Result<DeleteOutcome> {
         let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
-        // The writer's own fresh-load check, modelled: the conditional
-        // load answers the next scripted fingerprint, or the caller's
-        // own condition when none is scripted. `*` pins existence only.
-        // A missing entity or a mismatch refuses before anything is
-        // deleted, so the delete is not recorded.
-        if let Some(condition) = if_match {
-            let mut scripted = self.loaded_delete_fingerprints.lock().unwrap();
-            let loaded = if scripted.is_empty() {
-                Some(condition.to_string())
-            } else {
-                scripted.remove(0)
-            };
-            drop(scripted);
-            let matches = match loaded {
-                None => false,
-                Some(_) if condition.trim() == "*" => true,
-                Some(fingerprint) => fingerprint == condition,
-            };
-            if !matches {
-                return Err(WriteRefusal::StoredVersionChanged.error());
-            }
+        // A condition goes through the same verify path a series
+        // preflight uses: the conditional load refuses before anything
+        // is deleted, so the delete is not recorded.
+        if if_match.is_some() {
+            self.verify_event_precondition(id, if_match).await?;
         }
         self.delete_conditions
             .lock()
@@ -2714,6 +2730,8 @@ pub struct FailingContactStore {
     fail_updates: Mutex<bool>,
     hold_removals: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     removal_entered: AtomicBool,
+    lookup_entered: AtomicBool,
+    lookup_entry: tokio::sync::Semaphore,
 }
 
 impl FailingContactStore {
@@ -2723,6 +2741,8 @@ impl FailingContactStore {
             fail_updates: Mutex::new(false),
             hold_removals: Mutex::new(None),
             removal_entered: AtomicBool::new(false),
+            lookup_entered: AtomicBool::new(false),
+            lookup_entry: tokio::sync::Semaphore::new(0),
         }
     }
 
@@ -2745,6 +2765,28 @@ impl FailingContactStore {
     /// Whether a tombstone apply is currently waiting in the hold.
     pub fn removal_blocked(&self) -> bool {
         self.removal_entered.load(Ordering::SeqCst)
+    }
+
+    /// Clear the contact-lookup signal, so a request body read before
+    /// the hold does not count.
+    pub fn reset_contact_lookup(&self) {
+        self.lookup_entered.store(false, Ordering::SeqCst);
+        while let Ok(permit) = self.lookup_entry.try_acquire() {
+            permit.forget();
+        }
+    }
+
+    /// Await the next contact cache lookup.
+    pub async fn wait_for_contact_lookup(&self) {
+        if self.lookup_entered.load(Ordering::SeqCst) {
+            return;
+        }
+        let permit = self
+            .lookup_entry
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
+        permit.forget();
     }
 
     fn contact_cache(&self) -> &dyn ContactStore {
@@ -2797,6 +2839,8 @@ impl ContactStore for FailingContactStore {
     }
 
     async fn contact(&self, account_id: i64, element_id: &str) -> Result<Option<StoredContact>> {
+        self.lookup_entered.store(true, Ordering::SeqCst);
+        self.lookup_entry.add_permits(1);
         self.contact_cache().contact(account_id, element_id).await
     }
 
@@ -2916,6 +2960,8 @@ pub struct FailingCalendarStore {
     fail_writes: Mutex<bool>,
     hold_removes: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     remove_entered: AtomicBool,
+    rows_entered: AtomicBool,
+    rows_entry: tokio::sync::Semaphore,
 }
 
 impl FailingCalendarStore {
@@ -2925,6 +2971,8 @@ impl FailingCalendarStore {
             fail_writes: Mutex::new(false),
             hold_removes: Mutex::new(None),
             remove_entered: AtomicBool::new(false),
+            rows_entered: AtomicBool::new(false),
+            rows_entry: tokio::sync::Semaphore::new(0),
         }
     }
 
@@ -2946,6 +2994,28 @@ impl FailingCalendarStore {
     /// Whether a row removal is currently waiting in the hold.
     pub fn remove_blocked(&self) -> bool {
         self.remove_entered.load(Ordering::SeqCst)
+    }
+
+    /// Clear the row-read signal, so the delete's own read before the
+    /// hold does not count.
+    pub fn reset_rows_read(&self) {
+        self.rows_entered.store(false, Ordering::SeqCst);
+        while let Ok(permit) = self.rows_entry.try_acquire() {
+            permit.forget();
+        }
+    }
+
+    /// Await the next row read.
+    pub async fn wait_for_rows_read(&self) {
+        if self.rows_entered.load(Ordering::SeqCst) {
+            return;
+        }
+        let permit = self
+            .rows_entry
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
+        permit.forget();
     }
 
     fn blocked(&self) -> Result<()> {
@@ -3000,6 +3070,8 @@ impl CalendarStore for FailingCalendarStore {
     }
 
     async fn calendar_rows(&self, account_id: i64, calendar_id: &str) -> Result<Vec<CalendarRow>> {
+        self.rows_entered.store(true, Ordering::SeqCst);
+        self.rows_entry.add_permits(1);
         self.inner.calendar_rows(account_id, calendar_id).await
     }
 }

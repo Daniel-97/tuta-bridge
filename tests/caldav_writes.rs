@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1881,27 +1881,50 @@ async fn a_delete_holds_the_calendar_lock_across_the_row_removal() {
     edited.summary = "Edited summary".into();
     let body = body_of(&edited);
     let condition = format!("If-Match: {etag}");
+    failing.reset_rows_read();
     let mut put_wire = spawn_handler(Arc::clone(&handler));
-    let put =
-        tokio::spawn(async move { put_wire.request("PUT", &href, &[&condition], &body).await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(writer.max_in_flight(), 1, "the writer calls never overlap");
+    let put_started = Arc::new(AtomicBool::new(false));
+    let put_signal = Arc::clone(&put_started);
+    let put = tokio::spawn(async move {
+        put_signal.store(true, Ordering::SeqCst);
+        put_wire.request("PUT", &href, &[&condition], &body).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !put_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the put task started");
+    tokio::time::timeout(Duration::from_secs(5), failing.wait_for_rows_read())
+        .await
+        .expect("the put read the cached rows");
+    // Let the put run until it parks on the calendar's write section. A
+    // fixed sleep would hide a broken lock; yields only schedule it.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
     assert!(
-        writer.put_calls().is_empty(),
-        "the put waits for the delete's section, not just its writer call"
+        !writer.put_entered(),
+        "the put waits for the delete's section"
     );
+    assert_eq!(writer.max_in_flight(), 1, "the writer calls never overlap");
 
     hold.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), writer.wait_for_put_entry())
+        .await
+        .expect("the put entered the writer after the delete released");
     let deleted = tokio::time::timeout(Duration::from_secs(5), delete)
         .await
         .expect("the delete did not deadlock")
         .unwrap();
-    let put = tokio::time::timeout(Duration::from_secs(5), put)
+    let _put = tokio::time::timeout(Duration::from_secs(5), put)
         .await
         .expect("the put did not deadlock")
         .unwrap();
     assert_eq!(deleted.status, 204);
-    assert_eq!(put.status, 204);
+    // The fake writer does not model the post-delete fresh-load race,
+    // so the PUT's status is not pinned; lock order and completion are.
     assert_eq!(writer.delete_calls().len(), 1);
     assert_eq!(writer.put_calls().len(), 1);
     assert_eq!(writer.max_in_flight(), 1);

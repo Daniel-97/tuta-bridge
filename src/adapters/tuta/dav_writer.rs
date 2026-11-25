@@ -50,22 +50,25 @@
 //! reader's own ETag derivation for a contact, the reader's own
 //! fingerprint for an event. A mismatch answers the fixed
 //! precondition refusal, so a write can never overwrite a remote edit
-//! the event bus has not delivered yet; a contact that cannot be
-//! rendered at all fails closed with the same refusal.
+//! the event bus has not delivered yet. A contact whose loaded
+//! `_errors` is non-empty is refused with the dedicated
+//! `ContactDecryptionFailed` fixed `403`; an otherwise unrenderable
+//! card fails the precondition check closed with the same fixed `412`.
 //!
 //! The pinned SDK's `EntityClient::update_instance` asserts a 2xx
 //! status instead of returning `Err` (`"non-ok status code {}"`), so
 //! the update futures are caught and that exact panic is mapped
-//! through the SDK's own HTTP mapping like an error. Any other panic
-//! is resumed: a programming error is never masked as a write failure.
+//! through the SDK's own HTTP mapping like an error (a raw 409 is the
+//! save's conflict and maps to the same `412`). Any other panic is
+//! resumed: a programming error is never masked as a write failure.
 //!
 //! Error mapping is honest about what the server said: an expired
 //! session is the session error (the handlers let the session layer
-//! answer it), a permanent rejection - 403, or a 400 the server will
-//! answer again - is the fixed remote refusal the handlers answer
-//! with `403`, and everything else is the retryable write failure.
-//! Errors are fixed strings: no id, name, address or title ever
-//! appears in one.
+//! answer it), a permanent rejection (400, 403, 473) is the fixed
+//! remote refusal the handlers answer with `403`, a lost update
+//! precondition (409/412) is the fixed `412`, and everything else is
+//! the retryable write failure. Errors are fixed strings: no id, name,
+//! address or title ever appears in one.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -128,9 +131,8 @@ fn session_invalid() -> Error {
 }
 
 /// Map one SDK failure of the write path: an expired session is the
-/// session error, a permanent rejection (403, or a 400 the server
-/// will answer again) is the fixed remote refusal, and everything
-/// else is the retryable write failure.
+/// session error, a permanent rejection (400, 403, 473) is the fixed
+/// remote refusal, and everything else is the retryable write failure.
 fn sdk_failure(error: ApiCallError) -> Error {
     match error {
         ApiCallError::ServerResponseError { source } => match source {
@@ -150,14 +152,16 @@ fn sdk_failure(error: ApiCallError) -> Error {
 
 /// Map one SDK failure of a write that first verifies a stored
 /// version: a `NotFound` means the entity vanished since the client
-/// read it, which is the fixed precondition refusal (`412`) — never a
-/// silent write. Everything else delegates to [`sdk_failure`]. Used by
-/// every update load and `update_instance`, and by the conditional
-/// delete's fresh load; creates keep [`sdk_failure`].
+/// read it, and a `PreconditionFailed` means the save lost a
+/// precondition race — both are the fixed precondition refusal
+/// (`412`), never a silent write or a retry. Everything else delegates
+/// to [`sdk_failure`]. Used by every update load and `update_instance`,
+/// and by the conditional delete's fresh load; creates keep
+/// [`sdk_failure`].
 fn update_failure(error: ApiCallError) -> Error {
     match &error {
         ApiCallError::ServerResponseError {
-            source: HttpError::NotFoundError,
+            source: HttpError::NotFoundError | HttpError::PreconditionFailedError(_),
         } => WriteRefusal::StoredVersionChanged.error(),
         _ => sdk_failure(error),
     }
@@ -183,14 +187,19 @@ fn panic_status(payload: &(dyn std::any::Any + Send)) -> Option<u32> {
 }
 
 /// Map the pinned SDK's non-2xx panic of `update_instance` like an SDK
-/// error: the status goes through the SDK's own HTTP mapping and
-/// [`update_failure`]. Any other panic is a programming error and is
-/// resumed, never masked as a write failure. The payload is only read
-/// for its status, so no body or entity data is exposed.
+/// error: a raw 409 is the save's conflict (the SDK would map it to a
+/// generic resource error), and every other status goes through the
+/// SDK's own HTTP mapping and [`update_failure`]. Any other panic is a
+/// programming error and is resumed, never masked as a write failure.
+/// The payload is only read for its status, so no body or entity data
+/// is exposed.
 fn update_panic_failure(payload: Box<dyn std::any::Any + Send>) -> Error {
     let Some(status) = panic_status(payload.as_ref()) else {
         std::panic::resume_unwind(payload);
     };
+    if status == 409 {
+        return WriteRefusal::StoredVersionChanged.error();
+    }
     match HttpError::from_http_response(status, &HashMap::new()) {
         Ok(error) => update_failure(ApiCallError::ServerResponseError { source: error }),
         Err(_) => std::panic::resume_unwind(payload),
@@ -1060,19 +1069,12 @@ impl CalendarWriter for TutaDavWriter {
         id: &EventRef,
         if_match: IfMatch<'_>,
     ) -> Result<DeleteOutcome> {
-        // The authority behind the handler's per-row fast fail: when a
-        // condition is present, load the event first and check it there.
-        // A load that finds it gone refuses with the same `412`, never
-        // a raw delete. Without a condition the raw delete stays
-        // unconditional.
-        if let Some(condition) = if_match {
-            let crypto_client = self.logged.mail_facade().get_crypto_entity_client();
-            let tuple = IdTupleCustom::new(
-                GeneratedId(id.list_id.clone()),
-                CustomId(id.element_id.clone()),
-            );
-            let event: CalendarEvent = crypto_client.load(&tuple).await.map_err(update_failure)?;
-            check_event_delete_precondition(&event, condition)?;
+        // The authority behind the handler's per-row fast fail: a
+        // condition loads and checks the event through the same
+        // `verify_event_precondition` path a series preflight uses.
+        // Without a condition the raw delete stays unconditional.
+        if if_match.is_some() {
+            self.verify_event_precondition(id, if_match).await?;
         }
         self.delete_entity(EVENT_PATH, &id.list_id, &id.element_id)
             .await
@@ -2447,6 +2449,36 @@ then edit them here"
         .await
         .unwrap_err();
         assert!(matches!(network, Error::Network(_)));
+    }
+
+    /// An update that loses a precondition race maps to the fixed
+    /// precondition refusal, not to the retryable failure.
+    #[test]
+    fn an_update_precondition_error_maps_to_the_fixed_precondition() {
+        let error = update_failure(ApiCallError::ServerResponseError {
+            source: HttpError::PreconditionFailedError(None),
+        });
+        assert_eq!(
+            WriteRefusal::of(&error),
+            Some(WriteRefusal::StoredVersionChanged)
+        );
+    }
+
+    /// A caught save-status panic for 409 or 412 is the same conflict.
+    #[tokio::test]
+    async fn an_update_conflict_status_panic_maps_to_the_precondition() {
+        for status in [409, 412] {
+            let conflict = update_instance_caught::<(), _>(async move {
+                panic!("non-ok status code {status}");
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(
+                WriteRefusal::of(&conflict),
+                Some(WriteRefusal::StoredVersionChanged),
+                "status {status}"
+            );
+        }
     }
 
     /// A panic that is not the pinned status assertion is a programming
