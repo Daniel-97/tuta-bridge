@@ -275,9 +275,10 @@ async fn discovery_leads_from_the_root_to_the_address_book() {
         .contains("<d:href>/addressbooks/contacts/</d:href>"));
     assert!(home.body.contains("<card:addressbook/>"));
     assert!(home.body.contains("Tuta contacts"));
-    // Read only: no write privilege is advertised.
+    // The book is writable; the collections above it are not.
     assert!(home.body.contains("<d:read/>"));
-    assert!(!home.body.contains("<d:write"));
+    assert!(home.body.contains("<d:write/>"));
+    assert!(!root.body.contains("<d:write"));
 
     let missing = wire
         .request("PROPFIND", "/nowhere/", &["Depth: 0"], "")
@@ -481,11 +482,18 @@ async fn writes_are_refused() {
     let (book, source) = book_with(three_cards()).await;
     let mut wire = spawn(book);
     let vcard = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:X\r\nEND:VCARD\r\n";
+    // PROPPATCH and MKCOL are the session's fixed refusal; PUT and DELETE
+    // are handed to a handler built without a writer, which answers the
+    // same fixed 403 (serve's interim read-only state).
     for method in ["PUT", "DELETE", "PROPPATCH", "MKCOL"] {
         let response = wire
             .request(method, "/addressbooks/contacts/c1.vcf", &[], vcard)
             .await;
         assert_eq!(response.status, 403, "{method}");
+        assert_eq!(
+            response.body, "forbidden: this server is read-only\n",
+            "{method}"
+        );
         // A refused write may close the connection: start a fresh one.
         wire = spawn(book_with(three_cards()).await.0);
     }

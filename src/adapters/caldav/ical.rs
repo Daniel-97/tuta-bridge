@@ -647,7 +647,7 @@ fn looks_like_html(text: &str) -> bool {
 /// A small HTML-to-text conversion: block ends and `<br>` become line
 /// breaks, list items get a dash, other tags are dropped and the common
 /// entities decoded.
-fn html_to_text(html: &str) -> String {
+pub(crate) fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(open) = rest.find('<') {

@@ -23,7 +23,7 @@ use tokio::time::{sleep, timeout, timeout_at, Instant};
 use zeroize::Zeroizing;
 
 use super::handler::{
-    DavHandler, DavMethod, DavRequest, DavResponse, Depth, WellKnown, TEXT_PLAIN,
+    etag_matches, DavHandler, DavMethod, DavRequest, DavResponse, Depth, WellKnown, TEXT_PLAIN,
 };
 use super::http::{read_request, write_response, HttpRequest, Incoming, RequestBounds};
 use super::xml::{parse_propfind, parse_report};
@@ -79,10 +79,10 @@ impl Default for DavLimits {
 /// The methods every handler serves through the generic layer.
 const BASE_METHODS: &str = "OPTIONS, GET, HEAD, PROPFIND, REPORT";
 
-/// Methods that would change something: always `403` in read-only v1.
+/// Methods that would change something and that no feature serves:
+/// always `403`. `PUT` and `DELETE` are handed to the handler, which
+/// answers the same fixed refusal when it does not write.
 const WRITE_METHODS: &[&str] = &[
-    "PUT",
-    "DELETE",
     "PROPPATCH",
     "MKCOL",
     "MKCALENDAR",
@@ -267,8 +267,22 @@ async fn authenticate(
     }
 }
 
+/// The fixed answer for a handler error: a transport failure is the
+/// retryable `503` (with the fixed `Retry-After`), every other error —
+/// a session error above all — the fixed `500`. The connection closes
+/// after either. Fixed text only: nothing the handler carries reaches
+/// the body.
+pub(crate) fn error_response(error: Error) -> DavResponse {
+    match error {
+        Error::Network(_) => {
+            DavResponse::text(503, "temporarily unavailable").with_header("Retry-After", "30")
+        }
+        _ => DavResponse::text(500, "internal error"),
+    }
+}
+
 /// Answer one authenticated request: the generic parts here, the reads
-/// through the handler.
+/// and writes through the handler.
 async fn dispatch(handler: &dyn DavHandler, request: HttpRequest) -> DavResponse {
     let method = request.method.as_str();
     if WRITE_METHODS.contains(&method) {
@@ -280,7 +294,10 @@ async fn dispatch(handler: &dyn DavHandler, request: HttpRequest) -> DavResponse
     if DISALLOWED_METHODS.contains(&method) {
         return DavResponse::text(405, "method not allowed").with_header("Allow", allow(handler));
     }
-    if !matches!(method, "GET" | "HEAD" | "PROPFIND" | "REPORT") {
+    if !matches!(
+        method,
+        "GET" | "HEAD" | "PROPFIND" | "REPORT" | "PUT" | "DELETE"
+    ) {
         return DavResponse::text(501, "method not implemented");
     }
     if let Some(service) = well_known(&request.path) {
@@ -303,6 +320,8 @@ async fn dispatch(handler: &dyn DavHandler, request: HttpRequest) -> DavResponse
     let parsed = match method {
         "PROPFIND" => parse_propfind(&request.body).map(DavMethod::Propfind),
         "REPORT" => parse_report(&request.body).map(|report| DavMethod::Report(Box::new(report))),
+        "PUT" => Ok(DavMethod::Put),
+        "DELETE" => Ok(DavMethod::Delete),
         _ => Ok(DavMethod::Get),
     };
     let Ok(parsed) = parsed else {
@@ -324,14 +343,14 @@ async fn dispatch(handler: &dyn DavHandler, request: HttpRequest) -> DavResponse
     };
     let response = match handler.handle(&dav_request).await {
         Ok(response) => response,
-        Err(Error::Network(_)) => {
-            tracing::warn!(protocol = handler.label(), "dav handler unavailable");
-            return DavResponse::text(503, "temporarily unavailable")
-                .with_header("Retry-After", "30");
-        }
-        Err(_) => {
-            tracing::warn!(protocol = handler.label(), "dav handler failed");
-            return DavResponse::text(500, "internal error");
+        Err(error) => {
+            match &error {
+                Error::Network(_) => {
+                    tracing::warn!(protocol = handler.label(), "dav handler unavailable")
+                }
+                _ => tracing::warn!(protocol = handler.label(), "dav handler failed"),
+            }
+            return error_response(error);
         }
     };
     if conditional && response.status == 200 {
@@ -383,16 +402,6 @@ fn parse_depth(value: &str) -> Option<Depth> {
         other if other.eq_ignore_ascii_case("infinity") => Some(Depth::Infinity),
         _ => None,
     }
-}
-
-/// Whether `If-None-Match: condition` matches `etag` (weak comparison,
-/// RFC 9110 §13.1.2).
-fn etag_matches(condition: &str, etag: &str) -> bool {
-    let opaque = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
-    let etag = opaque(etag);
-    condition
-        .split(',')
-        .any(|candidate| candidate.trim() == "*" || opaque(candidate) == etag)
 }
 
 fn rejection_text(status: u16) -> &'static str {

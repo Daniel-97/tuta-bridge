@@ -11,6 +11,7 @@ use tutasdk::{ApiCallError, CustomId, GeneratedId, IdTupleCustom, LoggedInSdk, S
 
 use super::calendar_source::TutaCalendarSource;
 use super::contact_source::TutaContactSource;
+use super::dav_writer::TutaDavWriter;
 use super::event_lookup::TutaEventLookup;
 use super::event_stream::{
     event_url, is_event_group, model_versions, TutaEventStream, TUTA_CLIENT_VERSION,
@@ -24,6 +25,7 @@ use super::pre_session::TutaPreSession;
 use crate::domain::{AccountInfo, Error, Result, StoredCredentials};
 use crate::ports::calendar::CalendarSource;
 use crate::ports::contact_source::ContactSource;
+use crate::ports::dav_writer::{CalendarWriter, ContactWriter, DavWriters};
 use crate::ports::event_stream::EventHandles;
 use crate::ports::mail_sender::MailSender;
 use crate::ports::mail_source::MailSource;
@@ -137,8 +139,7 @@ pub fn resume_error(error: &LoginError) -> Error {
 /// A resumed Tuta session.
 pub struct TutaSession {
     logged: Arc<LoggedInSdk>,
-    // Used by Task 12/13 for content and attachments.
-    #[allow(dead_code)]
+    /// The raw REST client the DAV writer's deletes go through.
     rest: Arc<dyn RestClient>,
     info: AccountInfo,
     access_token: String,
@@ -175,6 +176,18 @@ impl Session for TutaSession {
 
     fn shared_calendar(&self) -> Option<Arc<dyn CalendarSource>> {
         Some(Arc::new(TutaCalendarSource::new(Arc::clone(&self.logged))))
+    }
+
+    fn shared_dav_writer(&self) -> Option<DavWriters> {
+        let writer = Arc::new(TutaDavWriter::new(
+            Arc::clone(&self.logged),
+            Arc::clone(&self.rest),
+            self.base_url.clone(),
+            self.access_token.clone(),
+        ));
+        let contacts: Arc<dyn ContactWriter> = writer.clone();
+        let calendar: Arc<dyn CalendarWriter> = writer;
+        Some(DavWriters { contacts, calendar })
     }
 
     fn event_groups(&self) -> Vec<String> {

@@ -1,4 +1,4 @@
-//! The read-only CardDAV handler (RFC 6352) behind the shared DAV layer.
+//! The CardDAV handler (RFC 6352) behind the shared DAV layer.
 //!
 //! URL layout (fixed, documented in the README):
 //!
@@ -31,22 +31,48 @@
 //! Listings, ETags, the ctag and the sync token come from the contact
 //! cache; vCards are rendered from the SDK only when `address-data` is
 //! asked for or a card is fetched.
+//!
+//! `PUT` and `DELETE` are served when a writer is wired. `PUT` enforces
+//! the RFC preconditions against the stored ETag (`If-Match`; an
+//! `If-None-Match: *` refuses an overwrite) and hands the `If-Match`
+//! on: the writer re-checks it against the freshly loaded entity, so
+//! a cache-matching but stale write still answers `412` instead of
+//! overwriting a remote edit the event bus has not delivered yet. One
+//! whole write per book runs at a time — the put and the cache apply
+//! of its outcome never interleave. The remote write comes first, a
+//! create lands on the server-generated id (the client's href id is
+//! never stored), and the cache is updated after the remote write
+//! held — a cache apply that fails anyway still answers the success
+//! the remote write earned (the stale mark heals the row on the next
+//! read; a client that retried a write that already happened would
+//! create a duplicate). `DELETE` tombstones a row only after the
+//! remote delete held, and a failed cache apply stays the success the
+//! same way. A conditional `DELETE` shares the same write section as
+//! the put: the writer re-checks the request's `If-Match` against the
+//! freshly loaded contact, so a cache-matching but stale delete still
+//! answers `412`, and the tombstone apply never interleaves with
+//! another connection's put. Without a writer both answer the fixed
+//! `403` the session answered before.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
+use super::import::{parse_vcard, ImportError};
 use super::vcard::{formatted_name, VCARD_CONTENT_TYPE};
 use crate::adapters::dav::xml::{
     props, MultiStatusEntry, PropName, PropRequest, Report, XmlElement, XmlNode, CARDDAV_NS, DAV_NS,
 };
 use crate::adapters::dav::{
-    DavHandler, DavMethod, DavRequest, DavResponse, Depth, WellKnown, XML_CONTENT_TYPE,
+    etag_matches, strong_etag_matches, writer_refusal, DavHandler, DavMethod, DavRequest,
+    DavResponse, Depth, WellKnown, XML_CONTENT_TYPE,
 };
 use crate::app::contacts::{ContactBook, RenderedCard};
 use crate::domain::{ContactCard, Result};
-use crate::ports::contact_store::{ContactBookState, StoredContact};
+use crate::ports::contact_store::{ContactBookState, ContactEntry, StoredContact};
+use crate::ports::dav_writer::{ContactFields, ContactRef, ContactWriter};
 
 pub const ROOT_HREF: &str = "/";
 pub const PRINCIPAL_HREF: &str = "/principal/";
@@ -123,8 +149,8 @@ fn address_data() -> PropName {
     PropName::carddav("address-data")
 }
 
-/// `d:current-user-privilege-set` with read only: clients show the book
-/// read-only.
+/// `d:current-user-privilege-set` with read only: the root, the
+/// principal and the home cannot be written.
 fn read_only_privileges() -> XmlNode {
     let privilege = |name: &str| {
         XmlNode::children(
@@ -139,6 +165,64 @@ fn read_only_privileges() -> XmlNode {
             privilege("read-current-user-privilege-set"),
         ],
     )
+}
+
+/// `d:current-user-privilege-set` of the one address book: read and
+/// write, so clients stop marking the book read-only.
+fn addressbook_privileges() -> XmlNode {
+    let privilege = |name: &str| {
+        XmlNode::children(
+            PropName::dav("privilege"),
+            vec![XmlNode::empty(PropName::dav(name))],
+        )
+    };
+    XmlNode::children(
+        PropName::dav("current-user-privilege-set"),
+        vec![
+            privilege("read"),
+            privilege("read-current-user-privilege-set"),
+            privilege("write"),
+        ],
+    )
+}
+
+/// The fixed refusal of a handler without a writer: byte-identical
+/// to the one the generic session answers for the write methods no
+/// feature serves.
+fn unwired() -> DavResponse {
+    DavResponse::text(403, "forbidden: this server is read-only")
+}
+
+/// `412` with a fixed body.
+fn precondition_failed() -> DavResponse {
+    DavResponse::text(412, "precondition failed")
+}
+
+/// The canonical card of one written contact: the importer's fields on
+/// the ids the write landed on. Rendering it is what the next read of
+/// this contact does, so its ETag is the row's new one.
+fn written_card(reference: &ContactRef, fields: &ContactFields) -> ContactCard {
+    ContactCard {
+        list_id: reference.list_id.clone(),
+        element_id: reference.element_id.clone(),
+        title: fields.title.clone(),
+        first_name: fields.first_name.clone(),
+        middle_name: fields.middle_name.clone(),
+        last_name: fields.last_name.clone(),
+        name_suffix: fields.name_suffix.clone(),
+        nickname: fields.nickname.clone(),
+        company: fields.company.clone(),
+        department: fields.department.clone(),
+        role: fields.role.clone(),
+        birthday: fields.birthday.clone(),
+        anniversaries: fields.anniversaries.clone(),
+        comment: fields.comment.clone(),
+        emails: fields.emails.clone(),
+        phones: fields.phones.clone(),
+        addresses: fields.addresses.clone(),
+        websites: fields.websites.clone(),
+        relations: fields.relations.clone(),
+    }
 }
 
 fn home_set() -> XmlNode {
@@ -200,11 +284,31 @@ fn dav_error(status: u16, namespace: &str, local: &str) -> DavResponse {
 /// The CardDAV handler.
 pub struct CardDavHandler {
     book: Arc<ContactBook>,
+    /// The Tuta write seam; `None` keeps the handler read-only (the
+    /// state `serve` serves until the writer is wired in).
+    writer: Option<Arc<dyn ContactWriter>>,
+    /// Serializes one whole write per book across connections: the
+    /// remote put — which re-checks the precondition against the
+    /// freshly loaded entity — and the cache apply of its outcome
+    /// never interleave with another connection's.
+    write: Mutex<()>,
 }
 
 impl CardDavHandler {
     pub fn new(book: Arc<ContactBook>) -> Self {
-        Self { book }
+        Self {
+            book,
+            writer: None,
+            write: Mutex::new(()),
+        }
+    }
+
+    pub fn with_writer(book: Arc<ContactBook>, writer: Arc<dyn ContactWriter>) -> Self {
+        Self {
+            book,
+            writer: Some(writer),
+            write: Mutex::new(()),
+        }
     }
 
     /// The root collection's or the principal's properties.
@@ -245,7 +349,7 @@ impl CardDavHandler {
                 PropName::dav("sync-collection"),
             ]),
             props::current_user_principal(PRINCIPAL_HREF),
-            read_only_privileges(),
+            addressbook_privileges(),
             XmlNode::children(
                 PropName::carddav("supported-address-data"),
                 vec![XmlNode::empty(PropName::carddav("address-data-type"))
@@ -395,6 +499,147 @@ impl CardDavHandler {
             }
             None => Ok(DavResponse::not_found()),
         }
+    }
+
+    async fn put(&self, target: Target, request: &DavRequest) -> Result<DavResponse> {
+        // Without a writer every PUT answers the fixed read-only text,
+        // whatever the target.
+        let Some(writer) = self.writer.as_deref() else {
+            return Ok(unwired());
+        };
+        // Only a card href is a resource a PUT can address: collections
+        // are not writable.
+        let Target::Card(id) = target else {
+            return Ok(DavResponse::forbidden());
+        };
+        let book = self.book.ensure_fresh().await?;
+        let stored = self.book.lookup(&id).await?;
+        // Preconditions run against the stored row, never the rendered
+        // body: an unchanged reload can never answer 412.
+        if let Some(condition) = request.if_none_match.as_deref() {
+            if stored
+                .as_ref()
+                .is_some_and(|row| etag_matches(condition, &row.etag))
+            {
+                return Ok(precondition_failed());
+            }
+        }
+        if let Some(condition) = request.header("if-match") {
+            if !stored
+                .as_ref()
+                .is_some_and(|row| strong_etag_matches(condition, &row.etag))
+            {
+                return Ok(precondition_failed());
+            }
+        }
+        let Ok(body) = std::str::from_utf8(&request.body) else {
+            return Ok(DavResponse::text(400, ImportError::NoVcard.message()));
+        };
+        let fields = match parse_vcard(body) {
+            Ok(fields) => fields,
+            Err(error) => return Ok(DavResponse::text(400, error.message())),
+        };
+        let existing = stored.as_ref().map(|row| ContactRef {
+            list_id: row.list_id.clone(),
+            element_id: row.element_id.clone(),
+        });
+        // An update stays in the row's own list; a create goes to the
+        // book's list, which must be known before the remote write.
+        let list_id = match &existing {
+            Some(reference) => reference.list_id.clone(),
+            None => match book.list_id {
+                Some(list_id) => list_id,
+                None => {
+                    return Ok(DavResponse::text(
+                        409,
+                        "the address book's contact list is not known yet",
+                    ))
+                }
+            },
+        };
+        // The request's `If-Match`, already verified above: the writer
+        // re-checks it against the freshly loaded entity, which is
+        // the authority behind that fast fail.
+        let if_match = request.header("if-match");
+        // One whole write per book at a time: the put and the cache
+        // apply of its outcome never interleave with another
+        // connection's write.
+        let _guard = self.write.lock().await;
+        let reference = match writer
+            .put_contact(&list_id, &fields, existing.as_ref(), if_match)
+            .await
+        {
+            Ok(reference) => reference,
+            Err(error) => return writer_refusal(error),
+        };
+        let rendered = RenderedCard::new(written_card(&reference, &fields));
+        let entry = ContactEntry {
+            list_id: reference.list_id.clone(),
+            element_id: reference.element_id.clone(),
+            etag: rendered.etag.clone(),
+        };
+        // The store skips an unchanged ETag, so the echo of this change
+        // does not advance the revision again. The remote write held:
+        // a cache apply that fails now only marks the book stale (the
+        // reload heals the row), and the answer stays the success the
+        // remote write earned — a client that retried a write that
+        // already happened would create a duplicate.
+        let _ = self.book.apply_written(&entry).await;
+        Ok(if existing.is_some() {
+            DavResponse::new(204).with_etag(&rendered.etag)
+        } else {
+            // A create lands on the server-generated id, never the
+            // href's.
+            DavResponse::new(201)
+                .with_header("Location", card_href(&reference.element_id))
+                .with_etag(&rendered.etag)
+        })
+    }
+
+    async fn delete(&self, target: Target, request: &DavRequest) -> Result<DavResponse> {
+        // Without a writer every DELETE answers the fixed read-only text,
+        // whatever the target.
+        let Some(writer) = self.writer.as_deref() else {
+            return Ok(unwired());
+        };
+        let Target::Card(id) = target else {
+            return Ok(DavResponse::forbidden());
+        };
+        self.book.ensure_fresh().await?;
+        let Some(stored) = self.book.lookup(&id).await? else {
+            // A row that never existed is not a tombstone.
+            return Ok(DavResponse::not_found());
+        };
+        if let Some(condition) = request.header("if-match") {
+            if !strong_etag_matches(condition, &stored.etag) {
+                return Ok(precondition_failed());
+            }
+        }
+        let reference = ContactRef {
+            list_id: stored.list_id.clone(),
+            element_id: stored.element_id.clone(),
+        };
+        // The request's `If-Match`, already verified above: the writer
+        // re-checks it against the freshly loaded entity, which is the
+        // authority behind that fast fail.
+        let if_match = request.header("if-match");
+        // One whole write per book at a time, the same section a put
+        // takes: the remote delete and the tombstone apply never
+        // interleave with another connection's write.
+        let _guard = self.write.lock().await;
+        // Remote first. Both outcomes proceed: `Gone` has already
+        // reached the end state the client asked for. A refusal
+        // answers its fixed status; a session error and a transport
+        // failure reach the session layer untouched.
+        match writer.delete_contact(&reference, if_match).await {
+            Ok(_) => {}
+            Err(error) => return writer_refusal(error),
+        }
+        // The remote delete held: a cache apply that fails only marks
+        // the book stale (the reload heals the row), and the answer
+        // stays the success the remote delete earned.
+        let _ = self.book.apply_deleted(&stored.element_id).await;
+        Ok(DavResponse::new(204))
     }
 
     async fn report(&self, target: Target, report: &Report) -> Result<DavResponse> {
@@ -549,6 +794,10 @@ impl DavHandler for CardDavHandler {
         &["addressbook"]
     }
 
+    fn extra_methods(&self) -> &'static [&'static str] {
+        &["PUT", "DELETE"]
+    }
+
     fn well_known(&self, service: WellKnown) -> Option<String> {
         match service {
             WellKnown::CardDav => Some(PRINCIPAL_HREF.to_string()),
@@ -568,6 +817,8 @@ impl DavHandler for CardDavHandler {
                 self.propfind(target, wanted, depth).await
             }
             DavMethod::Report(report) => self.report(target, report).await,
+            DavMethod::Put => self.put(target, request).await,
+            DavMethod::Delete => self.delete(target, request).await,
         }
     }
 }

@@ -23,6 +23,14 @@
 //! never a configurable address; Ctrl-C (or the injected stop future)
 //! ends the accept loop, which then ends the watch loop and returns its
 //! result as the command's own.
+//!
+//! The CardDAV and CalDAV listeners take their write seams from the
+//! session: one that hands none out keeps both read-only, exactly as
+//! before. An imported event may only be organized by the account's
+//! primary address — the only one the session knows without a network
+//! call (the sender check in the SMTP path resolves addresses one by
+//! one against the server) — so an alias organizer is refused with the
+//! handler's fixed body rather than guessed at.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -875,6 +883,9 @@ impl ServeUseCase {
             writer: session.shared_writer(),
         });
         let mail_sender = session.shared_sender();
+        // The DAV write seams, resolved once: a session without one
+        // keeps both listeners read-only, exactly as before.
+        let dav_writers = session.shared_dav_writer();
         // CardDAV is opt-in: the address book exists only when the
         // config names a port. Its port is validated before anything
         // is opened, like the others.
@@ -907,17 +918,25 @@ impl ServeUseCase {
                 })?;
                 let sync = Arc::new(CalendarSync::new(
                     account_id,
-                    Arc::clone(&store),
-                    Arc::clone(&source),
-                    Arc::clone(&self.clock),
-                ));
-                let handler: Arc<dyn crate::adapters::dav::DavHandler> = Arc::new(CalDavHandler {
-                    account_id,
-                    user_address: session.account().mail_address,
                     store,
                     source,
-                    clock: Arc::clone(&self.clock),
-                });
+                    Arc::clone(&self.clock),
+                ));
+                // The primary address is the only organizer an imported
+                // event may carry: no static list of the account's
+                // enabled addresses exists without a network call, so
+                // aliases are refused (the handler's fixed body) instead
+                // of accepted blindly.
+                let user_address = session.account().mail_address;
+                let handler: Arc<dyn crate::adapters::dav::DavHandler> = match &dav_writers {
+                    Some(writers) => Arc::new(CalDavHandler::with_writer(
+                        Arc::clone(&sync),
+                        user_address.clone(),
+                        Arc::clone(&writers.calendar),
+                        vec![user_address],
+                    )),
+                    None => Arc::new(CalDavHandler::new(Arc::clone(&sync), user_address)),
+                };
                 Some((caldav_port, sync, handler))
             }
             None => None,
@@ -989,12 +1008,19 @@ impl ServeUseCase {
             }
             None => None,
         };
+        // The DAV startup lines drop the read-only suffix when the
+        // session hands out writers.
+        let dav_suffix = if dav_writers.is_some() {
+            ""
+        } else {
+            " (read-only)"
+        };
         // CardDAV listens on its own port; the baseline load of the
         // address book runs in the background so IMAP is not delayed.
         let carddav_listener = match &carddav {
             Some((carddav_port, book)) => {
                 let carddav_listener = bind_loopback("carddav", *carddav_port).await?;
-                println!("serving CardDAV on 127.0.0.1:{carddav_port} (read-only)");
+                println!("serving CardDAV on 127.0.0.1:{carddav_port}{dav_suffix}");
                 Some((carddav_listener, Arc::clone(book)))
             }
             None => None,
@@ -1020,12 +1046,12 @@ impl ServeUseCase {
                 }
             })
         });
-        // CalDAV: read-only calendars over HTTPS with the same
+        // CalDAV: calendars over HTTPS with the same
         // certificate and bridge password.
         let caldav_listener = match &caldav {
             Some((caldav_port, _, handler)) => {
                 let caldav_listener = bind_loopback("caldav", *caldav_port).await?;
-                println!("serving CalDAV on https://127.0.0.1:{caldav_port}/ (read-only)");
+                println!("serving CalDAV on https://127.0.0.1:{caldav_port}/{dav_suffix}");
                 Some((caldav_listener, Arc::clone(handler)))
             }
             None => None,
@@ -1038,13 +1064,21 @@ impl ServeUseCase {
         //    error. Failures close one connection at most, a failed
         //    accept included: the accept loop itself never ends.
         let (imap_limits, pop3_limits, smtp_limits, dav_limits) = shared_listener_limits();
+        // The contact writer travels with the accept loop; the calendar
+        // half of the seam was consumed above.
+        let carddav_writer = dav_writers
+            .as_ref()
+            .map(|writers| Arc::clone(&writers.contacts));
         let carddav_auth = Arc::clone(&backend);
         let carddav_tls = tls.clone();
         let carddav_limits = dav_limits.clone();
         let mut carddav_accepting = pin!(async move {
             match carddav_listener {
                 Some((carddav_listener, book)) => {
-                    let handler: Arc<dyn DavHandler> = Arc::new(CardDavHandler::new(book));
+                    let handler: Arc<dyn DavHandler> = match carddav_writer {
+                        Some(writer) => Arc::new(CardDavHandler::with_writer(book, writer)),
+                        None => Arc::new(CardDavHandler::new(book)),
+                    };
                     serve_dav(
                         carddav_listener,
                         carddav_tls,

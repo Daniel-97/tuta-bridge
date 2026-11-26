@@ -9,10 +9,19 @@
 //! stored. Every write runs under one lock, so a slow full load and an
 //! event refresh never interleave.
 //!
+//! Every load also records the address book's contact list id,
+//! resolved structurally through the source (never learned from a
+//! rendered card), so an empty book can create its first contact too;
+//! the write path's "list not known" refusal only ever fires before
+//! the first load.
+//!
 //! A contact that exists but does not decrypt is never turned into a
 //! tombstone: a full load keeps its cached row (and counts it as
 //! skipped), an event refresh leaves the row alone. It is not served
 //! until it decrypts again (a fetch answers `404`).
+//!
+//! The DAV write path applies an accepted remote write the same way an
+//! event refresh does.
 //!
 //! Output and errors carry fixed text and counters only.
 
@@ -166,7 +175,14 @@ impl ContactBook {
                 });
             }
         }
-        let list_id = rendered.first().map(|card| card.card.list_id.as_str());
+        // The list id is resolved structurally on every load, empty
+        // book included. A failed resolution never fails the load: the
+        // legacy inference from the first rendered card stays, and
+        // the write path's 409 remains the belt under both.
+        let resolved = self.source.contact_list_id().await.ok().flatten();
+        let list_id = resolved
+            .as_deref()
+            .or_else(|| rendered.first().map(|card| card.card.list_id.as_str()));
         let counts = self
             .store()
             .replace_contacts(self.account_id, list_id, &entries)
@@ -221,6 +237,36 @@ impl ContactBook {
         self.store()
             .contact_changes_since(self.account_id, revision)
             .await
+    }
+
+    /// Apply one contact write the remote side has already accepted: the
+    /// same upsert a refresh applies, which keeps an unchanged ETag (and
+    /// the revision with it) as it is — the echo of the same change
+    /// counts once. A store failure marks the book stale so the next
+    /// request reloads and heals the row.
+    pub async fn apply_written(&self, entry: &ContactEntry) -> Result<()> {
+        let _guard = self.write.lock().await;
+        self.store()
+            .update_contacts(self.account_id, std::slice::from_ref(entry), &[])
+            .await
+            .inspect_err(|_| self.mark_stale())
+            .map(|_| ())
+    }
+
+    /// Apply one contact deletion the remote side has already confirmed:
+    /// the row becomes a tombstone the sync reports. A store failure
+    /// marks the book stale so the next request reloads and heals it.
+    pub async fn apply_deleted(&self, element_id: &str) -> Result<()> {
+        let _guard = self.write.lock().await;
+        self.store()
+            .update_contacts(
+                self.account_id,
+                &[],
+                std::slice::from_ref(&element_id.to_string()),
+            )
+            .await
+            .inspect_err(|_| self.mark_stale())
+            .map(|_| ())
     }
 
     /// Render one cached contact from the SDK. `None` when it is gone

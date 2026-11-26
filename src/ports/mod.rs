@@ -3,6 +3,7 @@ pub mod clock;
 pub mod contact_source;
 pub mod contact_store;
 pub mod credentials;
+pub mod dav_writer;
 pub mod event_lookup;
 pub mod event_stream;
 pub mod imap_backend;
@@ -19,6 +20,10 @@ pub mod state_store;
 pub use calendar::{CalendarSource, CalendarStore};
 pub use clock::Clock;
 pub use credentials::CredentialStore;
+pub use dav_writer::{
+    CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DavWriters,
+    DeleteOutcome, EventFields, EventRef, WriteRefusal,
+};
 pub use event_lookup::EventLookup;
 pub use event_stream::{EventHandles, EventStream};
 pub use imap_backend::{FetchResponse, ImapBackend, MailboxView, SelectedMailbox};

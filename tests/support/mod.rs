@@ -1,19 +1,25 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use secrecy::{ExposeSecret, SecretString};
+use tuta_bridge::adapters::dav::strong_etag_matches;
 use tuta_bridge::adapters::imap::codec::{BodySection, FetchItem, ImapArg};
 use tuta_bridge::adapters::imap::search::{parse_search, SearchKey};
+use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
+use tuta_bridge::adapters::tuta::dav_writer::choose_event_list;
 use tuta_bridge::domain::{
     AccountId, AccountInfo, BatchCounts, BatchOutcome, Error, EventFrame, Folder, MailPlacement,
     MailboxId, MessageContent, MessageHeader, MessagePage, MessageSummary, Result, StateChange,
     StoredCredentials, StoredMailbox, StoredMessage,
 };
-use tuta_bridge::domain::{CalendarEvent, CalendarInfo};
+use tuta_bridge::domain::{CalendarEvent, CalendarInfo, CalendarRow};
 use tuta_bridge::ports::calendar::{CalendarSource, CalendarStore};
+use tuta_bridge::ports::contact_store::{
+    ContactBookState, ContactCounts, ContactEntry, ContactStore, StoredContact,
+};
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::event_lookup::EventLookup;
 use tuta_bridge::ports::event_stream::{EventHandles, EventStream};
@@ -24,6 +30,30 @@ use tuta_bridge::ports::prompt::LoginPrompt;
 use tuta_bridge::ports::renderer::MessageRenderer;
 use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
 use tuta_bridge::ports::state_store::StateStore;
+use tuta_bridge::ports::{
+    CalendarRef, CalendarWriter, ContactFields, ContactRef, ContactWriter, DavWriters,
+    DeleteOutcome, EventFields, EventRef, WriteRefusal,
+};
+
+/// Counts one in-flight writer call and the high-water mark: a write
+/// section that works keeps the mark at one.
+struct InFlight<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> InFlight<'a> {
+    fn enter(count: &'a AtomicUsize, max: &'a AtomicUsize) -> Self {
+        let current = count.fetch_add(1, Ordering::SeqCst) + 1;
+        max.fetch_max(current, Ordering::SeqCst);
+        Self { count }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FakePrompt
@@ -1162,6 +1192,9 @@ pub struct FakeEventSession {
     pub contacts: Arc<FakeContactSource>,
     /// The calendar seam handed to `serve` through `shared_calendar`.
     pub calendar: Option<Arc<FakeCalendarSource>>,
+    /// The DAV write seams handed to `serve` through
+    /// `shared_dav_writer`; `None` keeps both listeners read-only.
+    pub dav_writers: Option<(Arc<FakeContactWriter>, Arc<FakeCalendarWriter>)>,
 }
 
 impl FakeEventSession {
@@ -1179,12 +1212,23 @@ impl FakeEventSession {
             writer: Arc::new(FakeMailboxWriter::new()),
             contacts: Arc::new(FakeContactSource::new(Vec::new())),
             calendar: None,
+            dav_writers: None,
         }
     }
 
     /// Hand out `calendar` through `shared_calendar`.
     pub fn with_calendar(mut self, calendar: Arc<FakeCalendarSource>) -> Self {
         self.calendar = Some(calendar);
+        self
+    }
+
+    /// Hand out both DAV write seams through `shared_dav_writer`.
+    pub fn with_dav_writers(
+        mut self,
+        contact_writer: Arc<FakeContactWriter>,
+        calendar_writer: Arc<FakeCalendarWriter>,
+    ) -> Self {
+        self.dav_writers = Some((contact_writer, calendar_writer));
         self
     }
 
@@ -1268,6 +1312,16 @@ impl Session for FakeEventSessionHandle {
             .calendar
             .as_ref()
             .map(|calendar| Arc::clone(calendar) as Arc<dyn CalendarSource>)
+    }
+
+    fn shared_dav_writer(&self) -> Option<DavWriters> {
+        self.0
+            .dav_writers
+            .as_ref()
+            .map(|(contacts, calendar)| DavWriters {
+                contacts: Arc::clone(contacts) as Arc<dyn ContactWriter>,
+                calendar: Arc::clone(calendar) as Arc<dyn CalendarWriter>,
+            })
     }
 
     async fn events(
@@ -1869,6 +1923,9 @@ pub struct FakeContactSource {
     pub single_loads: AtomicUsize,
     /// Element ids of contacts that exist but do not decrypt.
     pub undecryptable: Mutex<Vec<String>>,
+    /// The id `contact_list_id` resolves; `None` (the default) keeps
+    /// the book's legacy inference from the first card.
+    pub list_id: Mutex<Option<String>>,
 }
 
 impl FakeContactSource {
@@ -1879,7 +1936,13 @@ impl FakeContactSource {
             full_loads: AtomicUsize::new(0),
             single_loads: AtomicUsize::new(0),
             undecryptable: Mutex::new(Vec::new()),
+            list_id: Mutex::new(None),
         }
+    }
+
+    /// Make `contact_list_id` resolve to `list_id`.
+    pub fn set_list_id(&self, list_id: &str) {
+        *self.list_id.lock().unwrap() = Some(list_id.to_string());
     }
 
     /// Make the contact `element_id` fail to decrypt (or decrypt again).
@@ -1915,6 +1978,262 @@ impl FakeContactSource {
 
     pub fn single_loads(&self) -> usize {
         self.single_loads.load(Ordering::SeqCst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeContactWriter (CardDAV)
+// ---------------------------------------------------------------------------
+
+/// One recorded `put_contact`: the list it addressed, the fields it
+/// carried, the contact it updated (`None` on a create) and the
+/// precondition the handler passed. Holds personal data: no `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecordedPut {
+    pub list_id: String,
+    pub fields: ContactFields,
+    pub existing: Option<ContactRef>,
+    pub if_match: Option<String>,
+}
+
+/// A [`ContactWriter`] that records every call, scriptable to fail
+/// with the fixed error, to answer creates with a scripted ref, to
+/// answer deletes with a scripted outcome, to model the entity the
+/// next update's load answers (the writer's own precondition
+/// re-check), and to answer one call with a scripted error.
+pub struct FakeContactWriter {
+    /// Every put in call order.
+    pub puts: Mutex<Vec<RecordedPut>>,
+    /// Every delete in call order.
+    pub deletes: Mutex<Vec<ContactRef>>,
+    /// Every delete's request condition in call order, aligned with
+    /// `deletes`. A precondition failure records neither.
+    pub delete_conditions: Mutex<Vec<Option<String>>>,
+    /// While set, every call fails with the fixed network error.
+    pub failing: Mutex<bool>,
+    /// The strong ETag the next update's load answers, in call order;
+    /// an empty list (the default) answers the caller's own
+    /// precondition, so a matching `If-Match` passes.
+    pub loaded_etags: Mutex<Vec<String>>,
+    /// The strong ETag each conditional delete's fresh load answers, in
+    /// call order; `None` means the contact is gone. An empty list (the
+    /// default) answers the caller's own condition, so a matching
+    /// `If-Match` passes.
+    pub loaded_delete_etags: Mutex<Vec<Option<String>>>,
+    /// The error the next put answers, once.
+    pub put_error: Mutex<Option<Error>>,
+    /// The error the next delete answers, once.
+    pub delete_error: Mutex<Option<Error>>,
+    /// The ref every create answers with; when `None` a fresh
+    /// `generated-<n>` id is minted per create.
+    pub create_ref: Mutex<Option<ContactRef>>,
+    /// The outcome every delete answers with (default `Deleted`).
+    pub delete_outcome: Mutex<DeleteOutcome>,
+    /// Blocks the next put or delete until a permit is released.
+    pub hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    created: AtomicUsize,
+    put_entered: AtomicBool,
+    put_entry: tokio::sync::Notify,
+}
+
+impl Default for FakeContactWriter {
+    fn default() -> Self {
+        Self {
+            puts: Mutex::new(Vec::new()),
+            deletes: Mutex::new(Vec::new()),
+            delete_conditions: Mutex::new(Vec::new()),
+            failing: Mutex::new(false),
+            loaded_etags: Mutex::new(Vec::new()),
+            loaded_delete_etags: Mutex::new(Vec::new()),
+            put_error: Mutex::new(None),
+            delete_error: Mutex::new(None),
+            create_ref: Mutex::new(None),
+            delete_outcome: Mutex::new(DeleteOutcome::Deleted),
+            hold: Mutex::new(None),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            created: AtomicUsize::new(0),
+            put_entered: AtomicBool::new(false),
+            put_entry: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl FakeContactWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Answer every create with this ref.
+    pub fn answering_create(self, list_id: &str, element_id: &str) -> Self {
+        *self.create_ref.lock().unwrap() = Some(ContactRef {
+            list_id: list_id.into(),
+            element_id: element_id.into(),
+        });
+        self
+    }
+
+    pub fn set_failing(&self, failing: bool) {
+        *self.failing.lock().unwrap() = failing;
+    }
+
+    /// The `(list id, existing ref)` pairs of every put, in order.
+    pub fn put_calls(&self) -> Vec<(String, Option<ContactRef>)> {
+        self.puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|put| (put.list_id.clone(), put.existing.clone()))
+            .collect()
+    }
+
+    /// A clone of the nth put's fields.
+    pub fn fields_of_put(&self, index: usize) -> Option<ContactFields> {
+        self.puts
+            .lock()
+            .unwrap()
+            .get(index)
+            .map(|put| put.fields.clone())
+    }
+
+    /// Every delete, in order.
+    pub fn delete_calls(&self) -> Vec<ContactRef> {
+        self.deletes.lock().unwrap().clone()
+    }
+
+    /// Every delete's request condition, in order, aligned with
+    /// `delete_calls()`.
+    pub fn delete_conditions(&self) -> Vec<Option<String>> {
+        self.delete_conditions.lock().unwrap().clone()
+    }
+
+    /// Block the next writer call (a put or a delete) until a permit is
+    /// added to the returned semaphore.
+    pub fn hold_next_write(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// The most writer calls that ever ran at once.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Whether a `PUT` has entered the fake writer yet.
+    pub fn put_entered(&self) -> bool {
+        self.put_entered.load(Ordering::SeqCst)
+    }
+
+    /// Await the first `PUT` entering the fake writer.
+    pub async fn wait_for_put_entry(&self) {
+        if self.put_entered() {
+            return;
+        }
+        self.put_entry.notified().await;
+    }
+
+    async fn wait_hold(&self) {
+        let hold = self.hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _permit = hold.acquire().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ContactWriter for FakeContactWriter {
+    async fn put_contact(
+        &self,
+        list_id: &str,
+        fields: &ContactFields,
+        existing: Option<&ContactRef>,
+        if_match: Option<&str>,
+    ) -> Result<ContactRef> {
+        let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
+        self.put_entered.store(true, Ordering::SeqCst);
+        self.put_entry.notify_one();
+        // The writer's own precondition re-check, modelled: the load
+        // answers the next scripted ETag, or the caller's own
+        // precondition when none is scripted. A mismatch refuses
+        // before anything is written, so the put is not recorded.
+        if let (Some(_), Some(condition)) = (existing, if_match) {
+            let mut scripted = self.loaded_etags.lock().unwrap();
+            let loaded = if scripted.is_empty() {
+                condition.to_string()
+            } else {
+                scripted.remove(0)
+            };
+            drop(scripted);
+            if !strong_etag_matches(condition, &loaded) {
+                return Err(WriteRefusal::StoredVersionChanged.error());
+            }
+        }
+        self.puts.lock().unwrap().push(RecordedPut {
+            list_id: list_id.into(),
+            fields: fields.clone(),
+            existing: existing.cloned(),
+            if_match: if_match.map(str::to_string),
+        });
+        self.wait_hold().await;
+        if let Some(error) = self.put_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        if *self.failing.lock().unwrap() {
+            return Err(Error::Network("dav write failed".into()));
+        }
+        if let Some(existing) = existing {
+            return Ok(existing.clone());
+        }
+        Ok(self
+            .create_ref
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| ContactRef {
+                list_id: list_id.into(),
+                element_id: format!("generated-{}", self.created.fetch_add(1, Ordering::SeqCst)),
+            }))
+    }
+
+    async fn delete_contact(
+        &self,
+        id: &ContactRef,
+        if_match: Option<&str>,
+    ) -> Result<DeleteOutcome> {
+        let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
+        // The writer's own fresh-load check, modelled: the conditional
+        // load answers the next scripted ETag, or the caller's own
+        // condition when none is scripted. A missing entity or a
+        // mismatch refuses before anything is deleted, so the delete is
+        // not recorded.
+        if let Some(condition) = if_match {
+            let mut scripted = self.loaded_delete_etags.lock().unwrap();
+            let loaded = if scripted.is_empty() {
+                Some(condition.to_string())
+            } else {
+                scripted.remove(0)
+            };
+            drop(scripted);
+            if !loaded.is_some_and(|etag| strong_etag_matches(condition, &etag)) {
+                return Err(WriteRefusal::StoredVersionChanged.error());
+            }
+        }
+        self.delete_conditions
+            .lock()
+            .unwrap()
+            .push(if_match.map(str::to_string));
+        self.deletes.lock().unwrap().push(id.clone());
+        self.wait_hold().await;
+        if let Some(error) = self.delete_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        if *self.failing.lock().unwrap() {
+            return Err(Error::Network("dav write failed".into()));
+        }
+        Ok(*self.delete_outcome.lock().unwrap())
     }
 }
 
@@ -1986,6 +2305,10 @@ impl FakeCalendarSource {
 
 #[async_trait::async_trait]
 impl tuta_bridge::ports::contact_source::ContactSource for FakeContactSource {
+    async fn contact_list_id(&self) -> Result<Option<String>> {
+        Ok(self.list_id.lock().unwrap().clone())
+    }
+
     async fn contacts(&self) -> Result<tuta_bridge::ports::contact_source::ContactListing> {
         self.full_loads.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
@@ -2085,5 +2408,670 @@ impl CalendarSource for FakeCalendarSource {
             .collect();
         triggers.sort();
         Ok(triggers)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeCalendarWriter (CalDAV)
+// ---------------------------------------------------------------------------
+
+/// One recorded `put_event`: the calendar it addressed, the fields it
+/// carried, the event it updated (`None` on a create) and the
+/// precondition the handler passed. Holds personal data: no `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecordedEventPut {
+    pub calendar: CalendarRef,
+    pub fields: EventFields,
+    pub existing: Option<EventRef>,
+    pub if_match: Option<String>,
+}
+
+/// A [`CalendarWriter`] that records every call, scriptable to fail
+/// with the fixed error, to answer creates with a scripted ref, to
+/// answer deletes with a scripted outcome, to model the entity the
+/// next update's load answers (the writer's own precondition
+/// re-check), and to answer one call with a scripted error.
+pub struct FakeCalendarWriter {
+    /// Every put in call order.
+    pub puts: Mutex<Vec<RecordedEventPut>>,
+    /// Every delete in call order, with the calendar it addressed.
+    pub deletes: Mutex<Vec<(CalendarRef, EventRef)>>,
+    /// Every delete's request condition in call order, aligned with
+    /// `deletes`. A precondition failure records neither.
+    pub delete_conditions: Mutex<Vec<Option<String>>>,
+    /// While set, every call fails with the fixed network error.
+    pub failing: Mutex<bool>,
+    /// The content fingerprint the next update's load answers, in
+    /// call order; an empty list (the default) answers the caller's
+    /// own precondition, so a matching token passes.
+    pub loaded_fingerprints: Mutex<Vec<String>>,
+    /// The content fingerprint each verify's fresh load answers, in
+    /// call order; `None` means the event is gone. An empty list (the
+    /// default) answers the caller's own condition, so a matching row
+    /// passes.
+    pub loaded_verify_fingerprints: Mutex<Vec<Option<String>>>,
+    /// Every verified row in call order.
+    pub verifies: Mutex<Vec<EventRef>>,
+    /// Every verify's condition in call order, aligned with
+    /// `verifies`.
+    pub verify_conditions: Mutex<Vec<Option<String>>>,
+    /// The error the next put answers, once.
+    pub put_error: Mutex<Option<Error>>,
+    /// The error the next delete answers, once.
+    pub delete_error: Mutex<Option<Error>>,
+    /// The ref every create answers with; when `None` a fresh
+    /// `generated-<n>` id is minted per create, in the event list the
+    /// fields' repeat rule files them into.
+    pub create_ref: Mutex<Option<EventRef>>,
+    /// The outcome every delete answers with (default `Deleted`).
+    pub delete_outcome: Mutex<DeleteOutcome>,
+    /// Blocks the next put or delete until a permit is released.
+    pub hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    created: AtomicUsize,
+    put_entered: AtomicBool,
+    put_entry: tokio::sync::Notify,
+}
+
+impl Default for FakeCalendarWriter {
+    fn default() -> Self {
+        Self {
+            puts: Mutex::new(Vec::new()),
+            deletes: Mutex::new(Vec::new()),
+            delete_conditions: Mutex::new(Vec::new()),
+            failing: Mutex::new(false),
+            loaded_fingerprints: Mutex::new(Vec::new()),
+            loaded_verify_fingerprints: Mutex::new(Vec::new()),
+            verifies: Mutex::new(Vec::new()),
+            verify_conditions: Mutex::new(Vec::new()),
+            put_error: Mutex::new(None),
+            delete_error: Mutex::new(None),
+            create_ref: Mutex::new(None),
+            delete_outcome: Mutex::new(DeleteOutcome::Deleted),
+            hold: Mutex::new(None),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            created: AtomicUsize::new(0),
+            put_entered: AtomicBool::new(false),
+            put_entry: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl FakeCalendarWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Answer every create with this ref.
+    pub fn answering_create(self, list_id: &str, element_id: &str) -> Self {
+        *self.create_ref.lock().unwrap() = Some(EventRef {
+            list_id: list_id.into(),
+            element_id: element_id.into(),
+        });
+        self
+    }
+
+    pub fn set_failing(&self, failing: bool) {
+        *self.failing.lock().unwrap() = failing;
+    }
+
+    /// The `(calendar, existing ref)` pairs of every put, in order.
+    pub fn put_calls(&self) -> Vec<(CalendarRef, Option<EventRef>)> {
+        self.puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|put| (put.calendar.clone(), put.existing.clone()))
+            .collect()
+    }
+
+    /// A clone of the nth put's fields.
+    pub fn fields_of_put(&self, index: usize) -> Option<EventFields> {
+        self.puts
+            .lock()
+            .unwrap()
+            .get(index)
+            .map(|put| put.fields.clone())
+    }
+
+    /// Every delete, in order, with the calendar it addressed.
+    pub fn delete_calls(&self) -> Vec<(CalendarRef, EventRef)> {
+        self.deletes.lock().unwrap().clone()
+    }
+
+    /// Every delete's request condition, in order, aligned with
+    /// `delete_calls()`.
+    pub fn delete_conditions(&self) -> Vec<Option<String>> {
+        self.delete_conditions.lock().unwrap().clone()
+    }
+
+    /// Every verified row, in order.
+    pub fn verify_calls(&self) -> Vec<EventRef> {
+        self.verifies.lock().unwrap().clone()
+    }
+
+    /// Every verify's condition, in order, aligned with
+    /// `verify_calls()`.
+    pub fn verify_conditions(&self) -> Vec<Option<String>> {
+        self.verify_conditions.lock().unwrap().clone()
+    }
+
+    /// Block the next writer call (a put or a delete) until a permit is
+    /// added to the returned semaphore.
+    pub fn hold_next_write(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// The most writer calls that ever ran at once.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Whether a `PUT` has entered the fake writer yet.
+    pub fn put_entered(&self) -> bool {
+        self.put_entered.load(Ordering::SeqCst)
+    }
+
+    /// Await the first `PUT` entering the fake writer.
+    pub async fn wait_for_put_entry(&self) {
+        if self.put_entered() {
+            return;
+        }
+        self.put_entry.notified().await;
+    }
+
+    async fn wait_hold(&self) {
+        let hold = self.hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _permit = hold.acquire().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CalendarWriter for FakeCalendarWriter {
+    async fn put_event(
+        &self,
+        calendar: &CalendarRef,
+        fields: &EventFields,
+        existing: Option<&EventRef>,
+        if_match: Option<&str>,
+    ) -> Result<EventRef> {
+        let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
+        self.put_entered.store(true, Ordering::SeqCst);
+        self.put_entry.notify_one();
+        // The writer's own precondition re-check, modelled: the load
+        // answers the next scripted fingerprint, or the caller's own
+        // precondition when none is scripted. A mismatch refuses
+        // before anything is written, so the put is not recorded.
+        if let (Some(_), Some(condition)) = (existing, if_match) {
+            let mut scripted = self.loaded_fingerprints.lock().unwrap();
+            let loaded = if scripted.is_empty() {
+                condition.to_string()
+            } else {
+                scripted.remove(0)
+            };
+            drop(scripted);
+            if loaded != condition {
+                return Err(WriteRefusal::StoredVersionChanged.error());
+            }
+        }
+        self.puts.lock().unwrap().push(RecordedEventPut {
+            calendar: calendar.clone(),
+            fields: fields.clone(),
+            existing: existing.cloned(),
+            if_match: if_match.map(str::to_string),
+        });
+        self.wait_hold().await;
+        if let Some(error) = self.put_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        if *self.failing.lock().unwrap() {
+            return Err(Error::Network("dav write failed".into()));
+        }
+        if let Some(existing) = existing {
+            return Ok(existing.clone());
+        }
+        // The list production's `choose_event_list` files the event
+        // into (a repeating event, or one longer than the id
+        // randomization range, is a long event).
+        Ok(self
+            .create_ref
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| EventRef {
+                list_id: choose_event_list(calendar, fields).to_string(),
+                element_id: format!("generated-{}", self.created.fetch_add(1, Ordering::SeqCst)),
+            }))
+    }
+
+    async fn delete_event(
+        &self,
+        calendar: &CalendarRef,
+        id: &EventRef,
+        if_match: Option<&str>,
+    ) -> Result<DeleteOutcome> {
+        let _in_flight = InFlight::enter(&self.in_flight, &self.max_in_flight);
+        // A condition goes through the same verify path a series
+        // preflight uses: the conditional load refuses before anything
+        // is deleted, so the delete is not recorded.
+        if if_match.is_some() {
+            self.verify_event_precondition(id, if_match).await?;
+        }
+        self.delete_conditions
+            .lock()
+            .unwrap()
+            .push(if_match.map(str::to_string));
+        self.deletes
+            .lock()
+            .unwrap()
+            .push((calendar.clone(), id.clone()));
+        self.wait_hold().await;
+        if let Some(error) = self.delete_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        if *self.failing.lock().unwrap() {
+            return Err(Error::Network("dav write failed".into()));
+        }
+        Ok(*self.delete_outcome.lock().unwrap())
+    }
+
+    async fn verify_event_precondition(&self, id: &EventRef, if_match: Option<&str>) -> Result<()> {
+        self.verify_conditions
+            .lock()
+            .unwrap()
+            .push(if_match.map(str::to_string));
+        self.verifies.lock().unwrap().push(id.clone());
+        // The writer's own fresh-load check, modelled separately from
+        // the actual delete: the conditional load answers the next
+        // scripted fingerprint, or the caller's own condition when none
+        // is scripted. `*` pins existence only.
+        let Some(condition) = if_match else {
+            return Ok(());
+        };
+        let mut scripted = self.loaded_verify_fingerprints.lock().unwrap();
+        let loaded = if scripted.is_empty() {
+            Some(condition.to_string())
+        } else {
+            scripted.remove(0)
+        };
+        drop(scripted);
+        let matches = match loaded {
+            None => false,
+            Some(_) if condition.trim() == "*" => true,
+            Some(fingerprint) => fingerprint == condition,
+        };
+        if !matches {
+            return Err(WriteRefusal::StoredVersionChanged.error());
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FailingContactStore / FailingCalendarStore
+// ---------------------------------------------------------------------------
+
+/// A [`StateStore`] whose contact cache fails or blocks its applies on
+/// demand: a thin wrapper over the real in-memory SQLite store that
+/// delegates everything, except `update_contacts` (the write path's
+/// cache apply) answers the fixed storage error while
+/// [`Self::fail_updates`] is set, or waits in [`Self::hold_removals`]
+/// while a tombstone apply is held. The reloads still succeed, so a
+/// failed apply heals exactly the way the production stale mark heals
+/// it.
+pub struct FailingContactStore {
+    inner: Arc<SqliteStateStore>,
+    fail_updates: Mutex<bool>,
+    hold_removals: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    removal_entered: AtomicBool,
+    lookup_entered: AtomicBool,
+    lookup_entry: tokio::sync::Semaphore,
+}
+
+impl FailingContactStore {
+    pub fn new(inner: Arc<SqliteStateStore>) -> Self {
+        Self {
+            inner,
+            fail_updates: Mutex::new(false),
+            hold_removals: Mutex::new(None),
+            removal_entered: AtomicBool::new(false),
+            lookup_entered: AtomicBool::new(false),
+            lookup_entry: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    /// Make every `update_contacts` (the cache apply of a write) fail
+    /// with the fixed storage error, or succeed again.
+    pub fn set_fail_updates(&self, failing: bool) {
+        *self.fail_updates.lock().unwrap() = failing;
+    }
+
+    /// Block the next tombstone apply (`update_contacts` with removals)
+    /// until a permit is released. The returned semaphore is the same
+    /// one `removal_blocked` reports on.
+    pub fn hold_removals(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        self.removal_entered.store(false, Ordering::SeqCst);
+        *self.hold_removals.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Whether a tombstone apply is currently waiting in the hold.
+    pub fn removal_blocked(&self) -> bool {
+        self.removal_entered.load(Ordering::SeqCst)
+    }
+
+    /// Clear the contact-lookup signal, so a request body read before
+    /// the hold does not count.
+    pub fn reset_contact_lookup(&self) {
+        self.lookup_entered.store(false, Ordering::SeqCst);
+        while let Ok(permit) = self.lookup_entry.try_acquire() {
+            permit.forget();
+        }
+    }
+
+    /// Await the next contact cache lookup.
+    pub async fn wait_for_contact_lookup(&self) {
+        if self.lookup_entered.load(Ordering::SeqCst) {
+            return;
+        }
+        let permit = self
+            .lookup_entry
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
+        permit.forget();
+    }
+
+    fn contact_cache(&self) -> &dyn ContactStore {
+        self.inner
+            .contact_store()
+            .expect("the sqlite store has one")
+    }
+}
+
+#[async_trait::async_trait]
+impl ContactStore for FailingContactStore {
+    async fn contact_book(&self, account_id: i64) -> Result<ContactBookState> {
+        self.contact_cache().contact_book(account_id).await
+    }
+
+    async fn replace_contacts(
+        &self,
+        account_id: i64,
+        list_id: Option<&str>,
+        entries: &[ContactEntry],
+    ) -> Result<ContactCounts> {
+        self.contact_cache()
+            .replace_contacts(account_id, list_id, entries)
+            .await
+    }
+
+    async fn update_contacts(
+        &self,
+        account_id: i64,
+        upserts: &[ContactEntry],
+        removals: &[String],
+    ) -> Result<ContactCounts> {
+        if !removals.is_empty() {
+            let hold = self.hold_removals.lock().unwrap().take();
+            if let Some(hold) = hold {
+                self.removal_entered.store(true, Ordering::SeqCst);
+                let _permit = hold.acquire().await;
+            }
+        }
+        if *self.fail_updates.lock().unwrap() {
+            return Err(Error::Storage("the state store is busy".into()));
+        }
+        self.contact_cache()
+            .update_contacts(account_id, upserts, removals)
+            .await
+    }
+
+    async fn contacts(&self, account_id: i64) -> Result<Vec<StoredContact>> {
+        self.contact_cache().contacts(account_id).await
+    }
+
+    async fn contact(&self, account_id: i64, element_id: &str) -> Result<Option<StoredContact>> {
+        self.lookup_entered.store(true, Ordering::SeqCst);
+        self.lookup_entry.add_permits(1);
+        self.contact_cache().contact(account_id, element_id).await
+    }
+
+    async fn contact_changes_since(
+        &self,
+        account_id: i64,
+        revision: i64,
+    ) -> Result<(i64, Vec<StoredContact>)> {
+        self.contact_cache()
+            .contact_changes_since(account_id, revision)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl StateStore for FailingContactStore {
+    fn contact_store(&self) -> Option<&dyn ContactStore> {
+        Some(self)
+    }
+
+    async fn upsert_account(&self, mail_address: &str) -> Result<i64> {
+        self.inner.upsert_account(mail_address).await
+    }
+
+    async fn upsert_mailbox(
+        &self,
+        account_id: i64,
+        folder: &Folder,
+        uidvalidity: u32,
+    ) -> Result<MailboxId> {
+        self.inner
+            .upsert_mailbox(account_id, folder, uidvalidity)
+            .await
+    }
+
+    async fn mailboxes(&self, account_id: i64) -> Result<Vec<StoredMailbox>> {
+        self.inner.mailboxes(account_id).await
+    }
+
+    async fn assign_uid(&self, mailbox: MailboxId, header: &MessageHeader) -> Result<u32> {
+        self.inner.assign_uid(mailbox, header).await
+    }
+
+    async fn apply_batch(
+        &self,
+        account_id: i64,
+        group_id: &str,
+        batch_id: &str,
+        changes: &[StateChange],
+    ) -> Result<BatchOutcome> {
+        self.inner
+            .apply_batch(account_id, group_id, batch_id, changes)
+            .await
+    }
+
+    async fn remove_mailbox(&self, account_id: i64, mailbox: MailboxId) -> Result<()> {
+        self.inner.remove_mailbox(account_id, mailbox).await
+    }
+
+    async fn update_metadata(
+        &self,
+        mailbox: MailboxId,
+        uid: u32,
+        header: &MessageHeader,
+        rfc822_size: Option<u64>,
+    ) -> Result<()> {
+        self.inner
+            .update_metadata(mailbox, uid, header, rfc822_size)
+            .await
+    }
+
+    async fn set_mime_structure(
+        &self,
+        mailbox: MailboxId,
+        uid: u32,
+        structure: &str,
+    ) -> Result<()> {
+        self.inner.set_mime_structure(mailbox, uid, structure).await
+    }
+
+    async fn remove_message(&self, mailbox: MailboxId, uid: u32) -> Result<()> {
+        self.inner.remove_message(mailbox, uid).await
+    }
+
+    async fn messages(&self, mailbox: MailboxId) -> Result<Vec<StoredMessage>> {
+        self.inner.messages(mailbox).await
+    }
+
+    async fn message_by_uid(&self, mailbox: MailboxId, uid: u32) -> Result<Option<StoredMessage>> {
+        self.inner.message_by_uid(mailbox, uid).await
+    }
+
+    async fn last_batch(&self, account_id: i64, group_id: &str) -> Result<Option<String>> {
+        self.inner.last_batch(account_id, group_id).await
+    }
+
+    async fn set_last_batch(&self, account_id: i64, group_id: &str, batch_id: &str) -> Result<()> {
+        self.inner
+            .set_last_batch(account_id, group_id, batch_id)
+            .await
+    }
+
+    async fn reset_account(&self, account_id: i64) -> Result<()> {
+        self.inner.reset_account(account_id).await
+    }
+}
+
+/// A [`CalendarStore`] that delegates everything except the write
+/// applies: while [`Self::set_fail_writes`] is set,
+/// `upsert_calendar_row` and `remove_calendar_row` answer the fixed
+/// storage error, so a held remote write's cache apply fails the way a
+/// locked database would. [`Self::hold_removes`] instead blocks the
+/// delete's row removal, so a test can hold the collection's write
+/// section across it.
+pub struct FailingCalendarStore {
+    inner: Arc<dyn CalendarStore>,
+    fail_writes: Mutex<bool>,
+    hold_removes: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    remove_entered: AtomicBool,
+    rows_entered: AtomicBool,
+    rows_entry: tokio::sync::Semaphore,
+}
+
+impl FailingCalendarStore {
+    pub fn new(inner: Arc<dyn CalendarStore>) -> Self {
+        Self {
+            inner,
+            fail_writes: Mutex::new(false),
+            hold_removes: Mutex::new(None),
+            remove_entered: AtomicBool::new(false),
+            rows_entered: AtomicBool::new(false),
+            rows_entry: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    /// Make the two cache applies of a write fail with the fixed
+    /// storage error, or succeed again.
+    pub fn set_fail_writes(&self, failing: bool) {
+        *self.fail_writes.lock().unwrap() = failing;
+    }
+
+    /// Block the next row removal (the delete's cache apply) until a
+    /// permit is released.
+    pub fn hold_removes(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        self.remove_entered.store(false, Ordering::SeqCst);
+        *self.hold_removes.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Whether a row removal is currently waiting in the hold.
+    pub fn remove_blocked(&self) -> bool {
+        self.remove_entered.load(Ordering::SeqCst)
+    }
+
+    /// Clear the row-read signal, so the delete's own read before the
+    /// hold does not count.
+    pub fn reset_rows_read(&self) {
+        self.rows_entered.store(false, Ordering::SeqCst);
+        while let Ok(permit) = self.rows_entry.try_acquire() {
+            permit.forget();
+        }
+    }
+
+    /// Await the next row read.
+    pub async fn wait_for_rows_read(&self) {
+        if self.rows_entered.load(Ordering::SeqCst) {
+            return;
+        }
+        let permit = self
+            .rows_entry
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
+        permit.forget();
+    }
+
+    fn blocked(&self) -> Result<()> {
+        if *self.fail_writes.lock().unwrap() {
+            return Err(Error::Storage("the state store is busy".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl CalendarStore for FailingCalendarStore {
+    async fn replace_calendars(&self, account_id: i64, calendars: &[CalendarInfo]) -> Result<()> {
+        self.inner.replace_calendars(account_id, calendars).await
+    }
+
+    async fn calendars(&self, account_id: i64) -> Result<Vec<CalendarInfo>> {
+        self.inner.calendars(account_id).await
+    }
+
+    async fn replace_calendar_rows(
+        &self,
+        account_id: i64,
+        calendar_id: &str,
+        rows: &[CalendarRow],
+    ) -> Result<()> {
+        self.inner
+            .replace_calendar_rows(account_id, calendar_id, rows)
+            .await
+    }
+
+    async fn upsert_calendar_row(&self, account_id: i64, row: &CalendarRow) -> Result<CalendarRow> {
+        self.blocked()?;
+        self.inner.upsert_calendar_row(account_id, row).await
+    }
+
+    async fn remove_calendar_row(
+        &self,
+        account_id: i64,
+        list_id: &str,
+        element_id: &str,
+    ) -> Result<bool> {
+        let hold = self.hold_removes.lock().unwrap().take();
+        if let Some(hold) = hold {
+            self.remove_entered.store(true, Ordering::SeqCst);
+            let _permit = hold.acquire().await;
+        }
+        self.blocked()?;
+        self.inner
+            .remove_calendar_row(account_id, list_id, element_id)
+            .await
+    }
+
+    async fn calendar_rows(&self, account_id: i64, calendar_id: &str) -> Result<Vec<CalendarRow>> {
+        self.rows_entered.store(true, Ordering::SeqCst);
+        self.rows_entry.add_permits(1);
+        self.inner.calendar_rows(account_id, calendar_id).await
     }
 }

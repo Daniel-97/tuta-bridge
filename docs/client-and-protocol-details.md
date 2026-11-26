@@ -330,13 +330,17 @@ smtp_port = 9925
 
 ## CardDAV server (optional)
 
-`serve` can serve your Tuta address book read-only over CardDAV, for
-Thunderbird's address book and its address auto-complete. It is off
-unless the config file names a port:
+`serve` can serve your Tuta address book over CardDAV, to read and
+write it from Thunderbird's address book and its address auto-complete.
+It is off unless the config file names a port:
 
 ```toml
 carddav_port = 9932
 ```
+
+`serve` prints `serving CardDAV on 127.0.0.1:9932` — the
+`(read-only)` suffix appears only when the session hands out no DAV
+writer, and a logged-in session always hands one out.
 
 - Same listener rules as IMAP: `127.0.0.1` only (implicit TLS, the same
   self-signed certificate), HTTP Basic with the account address and the
@@ -344,9 +348,10 @@ carddav_port = 9932
   most 16 connections.
 - The address book is loaded in the background when `serve` starts and
   kept fresh by the event stream: a contact changed in the Tuta web
-  client is updated on the client's next refresh. Only metadata (ids and
-  ETags) is cached in the state database; vCards are decrypted and
-  rendered on demand.
+  client is updated on the client's next refresh. Every load also
+  records the account's contact-list id, which a create needs. Only
+  metadata (ids and ETags) is cached in the state database; vCards are
+  decrypted and rendered on demand.
 
 ### Thunderbird
 
@@ -358,7 +363,8 @@ carddav_port = 9932
    (if the dialog does not appear, open *Settings → Privacy & Security →
    Certificates → Manage Certificates → Servers → Add Exception* and
    enter `https://127.0.0.1:9932`). Then enter the bridge password.
-4. Pick *Tuta contacts*. The book is read-only in Thunderbird.
+4. Pick *Tuta contacts*. The book is writable in Thunderbird: edits,
+   new contacts and deletions go to Tuta.
 
 ### URL layout
 
@@ -392,15 +398,119 @@ carddav_port = 9932
 number when a contact has no name. "Other" and custom-labelled values
 carry no `TYPE`; the custom label text is not exported.
 
-Dropped (no clean vCard equivalent or not loaded): the photo, social
-network ids, messenger handles, pronouns, phonetic names, custom dates
-other than the first anniversary, custom type labels, and the
-preshared password.
+Dropped from the served card (no clean vCard equivalent or not
+loaded): the photo, social network ids, messenger handles, pronouns,
+phonetic names, custom dates other than the first anniversary, custom
+type labels, and the preshared password. A matched `PUT` still keeps
+a row's custom label and every non-anniversary custom date; a second
+stored anniversary does not survive, because one anniversary is
+served at most (see the residuals under "Writes").
+
+### Writes (PUT and DELETE)
+
+- `PUT` and `DELETE` are served: the session always hands the handler a
+  writer. The book's `current-user-privilege-set` advertises read and
+  write, so clients stop marking it read-only; every other write method
+  keeps the fixed `403`.
+- Preconditions run against the stored row, never the rendered body:
+  `If-Match` must match the stored ETag strongly, `If-None-Match: *` on
+  an existing card answers `412`, and so does a stale `If-Match`; an
+  unchanged reload can never answer `412`. The stored row is only the
+  fast fail: the write itself re-loads the contact and re-checks the
+  request's `If-Match` against the freshly loaded card's ETag — the
+  reader's own derivation — so a write that matches the cache but not
+  the entity (an edit made in the web client whose event has not
+  reached the bridge yet) answers `412` instead of overwriting it. If
+  that fresh load finds the card gone (`NotFound`), the write is the
+  same `412` — the version the client read no longer exists — never a
+  `404` and never a create. One whole write
+  runs per book at a time, so two concurrent `PUT`s with
+  the same `If-Match` cannot both write: one succeeds, the other's
+  re-check sees the first write's version and answers `412`.
+- Create: a `PUT` to any unused `.vcf` href writes to Tuta first and
+  answers `201` with `Location: /addressbooks/contacts/<id>.vcf` naming
+  the server-generated id, plus the new `ETag`. The id in the client's
+  made-up href is never stored — the client re-lists or follows
+  `Location`.
+- Update: `204` with the new `ETag`. The update merges into the
+  loaded entity: each rewritten aggregate row (email, phone, address,
+  website, relation) is matched against the loaded rows by trimmed
+  value and by the kind the reader maps the Tuta type to, so a match
+  keeps its id, Tuta type and custom label byte for byte; an
+  anniversary matches by trimmed date alone. The Other/Custom
+  collapse is tolerated because both render without a `TYPE`; the
+  loaded row's type still wins. A field without a match
+  becomes a new row with no id, which the SDK's encryption fills with
+  a random aggregate id, as on create; a
+  loaded row without a counterpart is removed. Custom dates that are
+  not anniversaries (a name day) are kept untouched, and the legacy
+  birthday aggregate is cleared so a removed `BDAY` stays removed.
+  Two residuals of the served card remain: it carries one anniversary
+  at most, so a second stored anniversary cannot survive an echoed
+  `PUT`, and a scheme-less stored website is rewritten because its
+  served value carries the added `https://`.
+- The remote write holds before the cache is touched: a transport or
+  `5xx` failure answers the fixed `503` (with `Retry-After`) and
+  leaves the cache and its ETag untouched, so the client retries; an
+  invalid or expired session (`401`, `440`, `470`, `471`, `472`)
+  answers the session layer's fixed `500`; a permanent remote
+  rejection (`400`, `403`, `473`: a read-only share, a rejected
+  payload) answers the fixed `403` `the remote server refused the
+  write`, which no retry can fix. A contact whose freshly loaded
+  payload carries decryption errors refuses the whole edit with the
+  fixed `403` `contacts with decryption errors cannot be edited
+  through the bridge`, even without `If-Match`: the bridge cannot
+  render it, so merging would silently drop or overwrite the
+  unreadable fields. A cache apply that fails after the remote write
+  held still answers the
+  success the write earned — the failed apply marks the book stale and
+  the next read reloads and heals the row, and a client that retried a
+  write that already happened would create a duplicate. Bodies are
+  parsed in memory only; the cache stays metadata-only.
+- The contact-list id is resolved structurally, not from the first
+  loaded card: the `RootInstance` at (user group id, `ContactList` root
+  id) → the `ContactList` entity → its `contacts` field, the same chain
+  the Tuta client walks, whatever the number of contacts
+  (`src/adapters/tuta/contact_source.rs::contact_list_id`). Every book
+  load records it, so an empty address book can create its first
+  contact; the `409` "the address book's contact list is not known yet"
+  only ever fires before a load has resolved the list id — the
+  resolution is retried on every load.
+- Import (`src/adapters/carddav/import.rs`): vCard 4.0, the first card
+  of the body, a complete `BEGIN:VCARD`…`END:VCARD` required. Folding
+  is undone and CRLF or LF is accepted; vCard 3.0 grouping (`item1.TEL`)
+  and bare or quoted `TYPE` parameters are accepted. `FN` fills the
+  first name only when the card carries no `N`. Dropped silently, like
+  Tuta's own importer: `VERSION`, `PRODID`, `REV`, `UID` (the href owns
+  the identity), `PHOTO`, `CATEGORIES`, `GEO`, `TZ`, every `X-`
+  property and every unrecognized name. A `BDAY`/`ANNIVERSARY` not in
+  the basic form the bridge serves (`19900115`, `--0412`) refuses the
+  whole card (`400`, fixed body) — it is never imported as a silently
+  changed date.
+- Other and Custom: the renderer writes no `TYPE` for either, so an
+  exported Other field re-imports as Custom, and only an explicit
+  `TYPE=other` reaches Other. The exporter serves one anniversary at
+  most; the importer accepts every `ANNIVERSARY`, and a `PUT` keeps
+  every other stored custom date.
+- `DELETE`: a card that never existed answers `404` (no tombstone for a
+  nonexistent row) and `If-Match` is enforced against the stored ETag.
+  A conditional delete then freshly loads the card and re-checks the
+  same ETag; a card that vanished since the client read it (the fresh
+  load answers `NotFound`) answers the same `412`, never a silent
+  delete. The remote delete runs
+  first (already-gone counts as success), then the row is tombstoned so
+  `sync-collection` reports it as a `404`; the answer is `204`, and a
+  tombstone apply that fails anyway still answers `204` (the stale mark
+  heals the row, exactly as on the update path).
+- Echo idempotence: the write upserts the new ETag and the store skips
+  a row whose ETag is unchanged, so the event-bus echo of the same
+  change does not count twice (`src/app/contacts.rs::apply_written`).
 
 ### Limits of v1
 
-- Read-only: `PUT`, `DELETE`, `PROPPATCH` and `MKCOL` answer `403`;
-  edit contacts in the Tuta client.
+- `PUT` and `DELETE` are served (see "Writes"); `PROPPATCH`, `MKCOL`
+  (contact groups are not creatable) and the other write methods still
+  answer the fixed `403`.
 - One address book: the user's own contacts. Shared contact lists and
   contact groups are not served.
 - `PROPFIND` serves depth 0 and 1; `Depth: infinity` (or no `Depth`) is
@@ -428,19 +538,23 @@ preshared password.
 
 ## CalDAV server (optional)
 
-`serve` can also publish your Tuta calendars, read-only, over CalDAV
-(HTTPS) so Thunderbird and other calendar clients can show them. It is
-off unless the config file names a port:
+`serve` can also publish your Tuta calendars over CalDAV (HTTPS) and
+accept edits, so Thunderbird and other calendar clients can show and
+change them. Creating events is refused (upstream-blocked): create them
+in the Tuta client, then edit them here. It is off unless the config
+file names a port:
 
 ```toml
 caldav_port = 9933
 ```
 
-`serve` then prints `serving CalDAV on https://127.0.0.1:9933/
-(read-only)`. Same listener rules as IMAP: `127.0.0.1` only, the same
-self-signed certificate, the same bridge password (HTTP Basic over
-TLS), the same failed-login delay shared with IMAP/POP3/SMTP. A port
-another process holds stops `serve` with exit code 10.
+`serve` then prints `serving CalDAV on https://127.0.0.1:9933/` — a
+session without a DAV writer would keep the `(read-only)` suffix, and a
+logged-in session always hands one out. Same listener rules as IMAP:
+`127.0.0.1` only, the same self-signed certificate, the same bridge
+password (HTTP Basic over TLS), the same failed-login delay shared with
+IMAP/POP3/SMTP. A port another process holds stops `serve` with exit
+code 10.
 
 ### Thunderbird
 
@@ -454,8 +568,9 @@ another process holds stops `serve` with exit code 10.
    location doesn't require credentials" unchecked.
 3. *Find Calendars*, enter the bridge password when asked, and
    subscribe to the calendars you want. Each Tuta calendar is its own
-   collection, with its Tuta name and colour. The server advertises
-   read access only, and every write is refused.
+   collection, with its Tuta name and colour. Each calendar advertises
+   read and write; edits and deletions go to Tuta, while creating events
+   is refused — create them in the Tuta app, then edit them here.
 
 ### URL layout
 
@@ -480,7 +595,9 @@ client from your contacts, it is not a calendar on the server.
 - `SUMMARY`, `DESCRIPTION`, `LOCATION`, `ORGANIZER`, `ATTENDEE` (with
   `PARTSTAT`: accepted, declined, tentative, needs action) and the UID
   come from the Tuta event. Tuta descriptions are HTML: `DESCRIPTION`
-  carries a plain-text version, `X-ALT-DESC` the original.
+  carries a plain-text version, `X-ALT-DESC` the original. An imported
+  event's plain-text description is served as is (no `X-ALT-DESC`),
+  and a body that echoes it back leaves the stored text untouched.
 - Reminders: your own Tuta alarms become `VALARM`s (display alarms,
   minutes to weeks before the start), so Thunderbird rings them.
   Other attendees' alarms are not visible to you and are not served.
@@ -507,6 +624,140 @@ client from your contacts, it is not a calendar on the server.
   but its repeat rule cannot be expressed in iCalendar …]"*, and it
   carries `X-TUTA-BRIDGE-RECURRENCE:UNSUPPORTED`.
 
+### Writes (PUT and DELETE)
+
+- `PUT` is an update only: the href must name a cached event row that
+  is a series' own master. An unknown calendar, an href without a row,
+  or a non-master (an altered occurrence) answers the fixed `403`
+  `creating events is not supported: create them in the Tuta client,
+  then edit them here`: creating events is upstream-blocked, since the
+  pinned SDK cannot create Tuta's custom-id events (NOTES.md records
+  why).
+- Preconditions run against the stored resource ETag: a matching
+  `If-None-Match` answers `412`, `If-Match` must match strongly, and an
+  unchanged reload never answers `412`. The stored rows are only the
+  fast fail: the write itself re-loads the event and re-checks the
+  version the client read — the stored master row's content fingerprint,
+  which the writer compares against the freshly loaded event's
+  fingerprint (the reader's own derivation; the served resource ETag
+  embeds the row's first-seen stamp, which no freshly loaded event can
+  reproduce) — so a write that matches the cache but not the entity
+  (an edit made in the web client whose event has not reached the
+  bridge yet) answers `412` instead of overwriting it. That fresh load
+  finding the event gone (`NotFound`) is the same `412`. The start and
+  event-list checks below read the cached master row: without
+  `If-Match` they rest on that cache alone (low risk — the cache is
+  the row the client just read — so only an unconditional write or
+  `If-Match: *` can act on a stale start or list); with a concrete
+  `If-Match` the freshly loaded fingerprint is authoritative, and a
+  remote change answers `412` before anything is written. One whole
+  write runs per calendar at a time, so two concurrent `PUT`s with the same
+  `If-Match` cannot both write: one succeeds, the other's re-check sees
+  the first write's content and answers `412`.
+- The body must be exactly one `VEVENT` in a `VCALENDAR` (a
+  `VTIMEZONE` is accepted and ignored). Times come in the three forms
+  the renderer writes: UTC (`…Z`), a `TZID`-qualified local time naming
+  a zone the bundled data knows on both bounds, or `VALUE=DATE` on both
+  bounds with an exclusive end. Anything else — mixed bounds, an
+  explicit UTC offset, a floating time, a missing `DTEND` — answers
+  `400` with the importer's fixed message.
+- The repeat rule must be one of the shapes the exporter emits
+  (`src/adapters/caldav/import.rs`): `FREQ`, `INTERVAL`, `COUNT`,
+  `UNTIL` (the UTC second form on a timed event, the date form on an
+  all-day one), weekly `BYDAY`, and the month-end
+  `BYMONTHDAY=28…31;BYSETPOS=-1` pattern of a start on the 29th–31st,
+  which maps back onto Tuta's clamp to each month's last day. Anything
+  else — `BYMONTH`, an ordinal `BYDAY`, a second `RRULE` — refuses the
+  whole event with `403` (a well-formed body the bridge chooses not to
+  write; only a malformed one answers `400`): a rule that cannot be
+  mapped is never accepted and then mangled. The renderer itself emits
+  two rule shapes the importer refuses with the same `403`: advanced
+  rule parts and the yearly Feb-29 clamp (it carries a `BYMONTH`). The
+  degraded
+  single-occurrence form is refused with `403` instead: it carries
+  `X-TUTA-BRIDGE-RECURRENCE` (whatever its value), which the importer
+  refuses, and a handler backstop refuses a stored repeating master
+  whose body carries no `RRULE` at all, so a degraded form can never
+  clear the repetition in Tuta. Edit such events in the Tuta client.
+- `EXDATE`, `RDATE` or `RECURRENCE-ID` refuses the event with `403`
+  (occurrence-level editing is out of scope); the refusal outranks the
+  one-event rule, so the body a client writes back after editing one
+  occurrence fails with the occurrence message. An `ATTENDEE` other
+  than the organizer (case-insensitive) refuses the whole event with
+  `403` — invitations are out of scope and are never dropped silently.
+  A stored event that carries an attendee other than its organizer is
+  refused just as firmly: such an event cannot be edited through the
+  bridge at all (see below). The organizer's own attendee row is the
+  one exception, and only while the body keeps the same organizer
+  address. A `VALARM` is accepted and ignored: reminders set by clients
+  are not carried to Tuta.
+- `ORGANIZER` maps to its address only; the `CN` parameter is
+  preserved when the same address stays the organizer (a body that
+  echoes the served one keeps the stored display name, so a title-only
+  edit cannot blank it), and an unusable value is treated as no
+  organizer, a personal event. While any attendee is stored — even
+  only the organizer itself — a body that removes `ORGANIZER`, adds
+  one where none was stored, or names a different address is refused
+  whole with the fixed `403` `events with attendees cannot be edited
+  through the bridge`; a case-only address change is not a change.
+  Without stored attendees the organizer stays freely editable. The
+  address must be one of the
+  account's, and only the primary address is known without a network
+  call, so aliases answer
+  the fixed `403` `the organizer is not an address of this account`.
+- An in-place update cannot move the event's start or flip it between
+  the short and long event lists: a short event's id derives from its
+  start, both the Tuta web client and this bridge's reader load short
+  events by id range, and the web client deletes and re-creates on a
+  start change anyway (creating is blocked here). Both answer the fixed
+  creation `403` body.
+- The update goes remote first: the writer reloads the stored event,
+  applies the parsed fields and `update_instance`s it back (uid,
+  sequence, recurrence and alarms stay as the Tuta client keeps them).
+  A stored event that carries attendees other than the organizer is
+  refused whole with the fixed `403` `events with attendees cannot be
+  edited through the bridge` — the bridge cannot keep invitation state
+  in step, so it never edits such an event (the served body carries the
+  attendees, so a client's edit of one always reaches the refusal). The
+  row is then rebuilt from the reloaded event — the
+  same row, fingerprint and all, that the reader derives — and
+  upserted, so the `204`'s `ETag` is the one the next read serves and
+  the event-bus echo of the same change counts once
+  (`src/app/calendar_sync.rs::apply_written`). A cache apply that
+  fails after the remote write held still answers the `204` the write
+  earned (the stale mark heals the row on the next read; a client that
+  retried a write that already happened would edit the event twice).
+  The two-year loading
+  window is deliberately not applied to a written row: an event moved
+  beyond the window keeps its row until the echo removes it, exactly as
+  an edit made in the Tuta client does, so the client sees the write it
+  just made.
+- Two honest degenerates: a legacy event whose missing uid a write
+  repaired moves to another href — `204` without an `ETag`; a state
+  that cannot be read back after a held write answers the fixed `503`
+  (`Retry-After`) and keeps the row as it was. Remote failures map
+  honestly: an invalid or expired session (`401`, `440`, `470`, `471`,
+  `472`) answers the session layer's fixed `500`; a permanent remote
+  rejection (`400`, `403`, `473`: a read-only shared calendar, a
+  rejected body) answers the fixed `403` `the remote server refused
+  the write`; a `5xx` or transport failure keeps the `503` retry.
+- `DELETE` removes the whole resource: every event of the series is
+  deleted remotely first (already-gone counts as done), then the rows
+  are removed the way a delete event removes them. The calendar cache
+  keeps no tombstones and there is no `sync-collection`, so a href that
+  never existed answers `404`, and `If-Match` is enforced against the
+  stored resource ETag. A conditional delete then verifies every row
+  before the first remote delete: each row's own cached fingerprint (or
+  `*` for existence) is handed to the writer, which freshly loads the
+  event and compares it, so a row that changed since the client read
+  it, or vanished (`NotFound`), answers `412` and the whole resource is
+  left alone — an altered occurrence included. Only after every row
+  verified are the deletes issued. A network failure part way through
+  them can still leave a partially deleted series, which a retry
+  finishes; a row removal that fails after the remote deletes still
+  answers `204` (the stale mark heals the rows, exactly as on the
+  update path).
+
 ### Freshness
 
 On start `serve` loads every calendar and the events from two years
@@ -519,8 +770,10 @@ Event bodies are not stored: they are decrypted and rendered on demand.
 
 ### Limits of v1
 
-- Read-only: `PUT`, `DELETE`, `PROPPATCH`, `MKCALENDAR`, … answer
-  `403`. Events are created and edited in the Tuta app.
+- `PUT` and `DELETE` are served (see "Writes"); `PROPPATCH`,
+  `MKCALENDAR` and the other write methods still answer the fixed
+  `403`, and creating events is refused — create them in the Tuta app
+  and edit them here.
 - Events starting more than two years in the past or in the future
   are not served (repeating events excepted).
 - Reports: `calendar-query` (the first `time-range` of the filter is

@@ -2,6 +2,7 @@ pub mod blob;
 pub mod calendar_source;
 pub mod contact_source;
 pub mod content;
+pub mod dav_writer;
 pub mod event_lookup;
 pub mod event_stream;
 pub mod event_wire;

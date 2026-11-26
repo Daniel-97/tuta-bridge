@@ -7,7 +7,10 @@
 //! SELECT INBOX, UID FETCH ENVELOPE, LOGOUT — and the stop channel
 //! proves serve shuts down cleanly. Two failure tests pin the fixed
 //! refusals: a missing bridge password and a reserved port, both
-//! raised before anything listens.
+//! raised before anything listens. The CardDAV and CalDAV rounds pin
+//! the session-wired write path: a PUT through the listener reaches
+//! the session's writer seam, and a session without one keeps the
+//! fixed read-only refusals.
 
 mod support;
 
@@ -18,21 +21,24 @@ use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
+use tuta_bridge::adapters::caldav::ical::{render_calendar, EventToRender};
 use tuta_bridge::adapters::tuta::generated_id::timestamp_to_generated_id;
 use tuta_bridge::app::watch::{BackoffPolicy, ServeUseCase};
 use tuta_bridge::config::Config;
 use tuta_bridge::domain::{
-    AccountInfo, Address, Error, Folder, FolderKind, MessageHeader, MessageSummary, Result,
-    StoredCredentials,
+    AccountInfo, Address, CalendarInfo, Error, EventPerson, Folder, FolderKind, MessageHeader,
+    MessageSummary, Result, StoredCredentials,
 };
 use tuta_bridge::ports::clock::Clock;
 use tuta_bridge::ports::credentials::CredentialStore;
 use tuta_bridge::ports::local_password::LocalPasswordStore;
 use tuta_bridge::ports::session::{NewSession, Session, SessionFactory, SessionRequest};
 use tuta_bridge::ports::state_store::StateStore;
+use tuta_bridge::ports::{CalendarRef, EventRef};
 
 use support::{
-    FakeEventSession, FakeEventSessionHandle, FakeMailSource, FakeStateStore, FakeStore,
+    FakeCalendarWriter, FakeContactWriter, FakeEventSession, FakeEventSessionHandle,
+    FakeMailSource, FakeStateStore, FakeStore,
 };
 
 const LOGIN: &str = "owner@example.invalid";
@@ -599,15 +605,23 @@ fn serve_with_state(
     }
 }
 
+/// One header of a response, by case-insensitive name.
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 /// Send one HTTP request with the bridge credentials and read the
-/// status and body of its response.
-async fn http<R, W>(
+/// status, every header and the body of its response.
+async fn http_full<R, W>(
     wire: &mut Wire<R, W>,
     method: &str,
     path: &str,
     headers: &[&str],
     body: &str,
-) -> (u16, String)
+) -> (u16, Vec<(String, String)>, String)
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -627,19 +641,40 @@ where
     wire.writer.flush().await.unwrap();
     let status_line = wire.line().await;
     let status: u16 = status_line.split(' ').nth(1).unwrap().parse().unwrap();
+    let mut all_headers = Vec::new();
     let mut length = 0;
     loop {
         let line = wire.line().await;
         if line.is_empty() {
             break;
         }
-        if let Some(value) = line.strip_prefix("Content-Length: ") {
-            length = value.parse().unwrap();
+        if let Some((name, value)) = line.split_once(": ") {
+            if name.eq_ignore_ascii_case("Content-Length") {
+                length = value.parse().unwrap();
+            }
+            all_headers.push((name.to_string(), value.to_string()));
         }
     }
     let mut body = vec![0; length];
     wire.reader.read_exact(&mut body).await.unwrap();
-    (status, String::from_utf8(body).unwrap())
+    (status, all_headers, String::from_utf8(body).unwrap())
+}
+
+/// Send one HTTP request with the bridge credentials and read the
+/// status and body of its response.
+async fn http<R, W>(
+    wire: &mut Wire<R, W>,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+    body: &str,
+) -> (u16, String)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (status, _, body) = http_full(wire, method, path, headers, body).await;
+    (status, body)
 }
 
 #[tokio::test]
@@ -691,6 +726,69 @@ async fn serve_answers_carddav_from_the_address_book() {
 
     let (status, _) = http(&mut wire, "PUT", "/addressbooks/contacts/c1.vcf", &[], "x").await;
     assert_eq!(status, 403);
+    drop(wire);
+
+    stop_serve.send(()).unwrap();
+    let result = serve_task.await.unwrap();
+    assert!(result.is_ok(), "serve ended with {result:?}");
+}
+
+/// The session hands out DAV writers: a CardDAV PUT through serve's
+/// own wiring reaches the session's writer. The book is empty and its
+/// list id resolves structurally (decision 10), so the PUT is a create
+/// that needs no rendered card.
+#[tokio::test]
+async fn serve_wires_the_sessions_carddav_writer_end_to_end() {
+    let port = free_port();
+    let carddav_port = free_port();
+    let (_config_dir, config_path) = carddav_config(port, carddav_port);
+    let cert_dir = tempfile::tempdir().unwrap();
+    let contact_writer =
+        Arc::new(FakeContactWriter::new().answering_create("contact-list", "srv-9"));
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()]).with_dav_writers(
+            Arc::clone(&contact_writer),
+            Arc::new(FakeCalendarWriter::new()),
+        ),
+    );
+    session.contacts.set_list_id("contact-list");
+    session.push_pending();
+
+    let uc = serve_with_state(
+        &session,
+        config_path,
+        seeded_sqlite_state().await,
+        cert_dir.path(),
+    );
+    let (stop_serve, stop_rx) = oneshot::channel::<()>();
+    let serve_task = tokio::spawn(async move {
+        uc.run_until(async move {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+
+    let mut wire = tls_client(carddav_port).await;
+    let body = "BEGIN:VCARD\r\nVERSION:4.0\r\nN:Doe;Jane;;;\r\nEND:VCARD\r\n";
+    let (status, headers, _) = http_full(
+        &mut wire,
+        "PUT",
+        "/addressbooks/contacts/client-made-up.vcf",
+        &[],
+        body,
+    )
+    .await;
+    assert_eq!(status, 201);
+    assert_eq!(
+        header_value(&headers, "Location"),
+        Some("/addressbooks/contacts/srv-9.vcf")
+    );
+    // The PUT addressed the structurally resolved list through the
+    // session's writer, not a card.
+    assert!(
+        contact_writer.put_calls() == [("contact-list".to_string(), None)],
+        "the PUT never reached the session's writer"
+    );
     drop(wire);
 
     stop_serve.send(()).unwrap();
@@ -759,6 +857,16 @@ fn caldav_config(imap_port: u16, caldav_port: u16) -> (tempfile::TempDir, PathBu
     .save(&path)
     .unwrap();
     (dir, path)
+}
+
+/// The iCalendar body the reader serves for `event`: the form the
+/// importer accepts back.
+fn ics_body(event: &tuta_bridge::domain::CalendarEvent) -> String {
+    render_calendar(&[EventToRender {
+        event,
+        modified_ms: NOW_MS,
+        alarms: &[],
+    }])
 }
 
 fn calendar_event(element: &str, start_ms: i64) -> tuta_bridge::domain::CalendarEvent {
@@ -922,6 +1030,156 @@ async fn serve_serves_caldav_and_keeps_it_fresh_from_the_event_bus() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(items, 2);
+
+    // The session hands out no DAV writer: a PUT through serve's own
+    // wiring answers the fixed read-only refusal, whatever the body.
+    let (status, _, refusal) = http_full(
+        &mut wire,
+        "PUT",
+        "/caldav/calendars/cal/first.ics",
+        &[],
+        "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(refusal, "forbidden: this server is read-only\n");
+    drop(wire);
+
+    stop_serve.send(()).unwrap();
+    let result = serve_task.await.unwrap();
+    assert!(result.is_ok(), "serve ended with {result:?}");
+}
+
+/// The session hands out DAV writers: a CalDAV PUT through serve's
+/// own wiring updates the event through the session's writer. The
+/// account's primary address is the one allowed organizer serve
+/// wires in; any other address is refused before the writer.
+#[tokio::test]
+async fn serve_wires_the_sessions_caldav_writer_end_to_end() {
+    use tuta_bridge::adapters::sqlite_state::SqliteStateStore;
+    use tuta_bridge::ports::calendar::CalendarStore;
+
+    let imap_port = free_port();
+    let caldav_port = free_port();
+    let (_config_dir, config_path) = caldav_config(imap_port, caldav_port);
+    let cert_dir = tempfile::tempdir().unwrap();
+
+    // The calendar cache lives in a real SQLite store next to the fake
+    // mail state; both know the account as id 1.
+    let state = seeded_state().await;
+    let cache = Arc::new(SqliteStateStore::open_in_memory().await.unwrap());
+    cache.upsert_account(LOGIN).await.unwrap();
+    *state.calendar_cache.lock().unwrap() = Some(cache as Arc<dyn CalendarStore>);
+
+    let calendars = Arc::new(support::FakeCalendarSource::new());
+    calendars.add_calendar(CalendarInfo {
+        calendar_id: "cal".into(),
+        name: "Private".into(),
+        color: "ff0000".into(),
+        short_list_id: "cal-short".into(),
+        long_list_id: "cal-long".into(),
+    });
+    calendars.put_event(calendar_event("first", NOW_MS + 86_400_000));
+
+    let calendar_writer = Arc::new(FakeCalendarWriter::new());
+    let session = Arc::new(
+        FakeEventSession::new(account_info(), vec!["group1".to_string()])
+            .with_calendar(Arc::clone(&calendars))
+            .with_dav_writers(
+                Arc::new(FakeContactWriter::new()),
+                Arc::clone(&calendar_writer),
+            ),
+    );
+    session.push_pending();
+
+    let uc = serve_use_case(
+        &session,
+        fake_credentials(),
+        Arc::new(FakePasswordStore::with(BRIDGE_PASSWORD)),
+        config_path,
+        Arc::clone(&state),
+        cert_dir.path(),
+    );
+    let (stop_serve, stop_rx) = oneshot::channel::<()>();
+    let serve_task = tokio::spawn(async move {
+        uc.run_until(async move {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+
+    let mut wire = tls_client(caldav_port).await;
+    // The watch task loads the baseline; poll until the event's own
+    // href shows up in the calendar listing.
+    let mut href = String::new();
+    for _ in 0..200 {
+        let (status, _, body) = http_full(
+            &mut wire,
+            "PROPFIND",
+            "/caldav/calendars/cal/",
+            &["Depth: 1"],
+            "",
+        )
+        .await;
+        if status == 207 {
+            if let Some(found) = body
+                .split("<d:href>")
+                .skip(1)
+                .filter_map(|rest| rest.split("</d:href>").next())
+                .find(|found| found.ends_with(".ics"))
+            {
+                href = found.to_string();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!href.is_empty(), "the baseline event never loaded");
+
+    let calendar_ref = CalendarRef {
+        group_id: "cal".into(),
+        short_list_id: "cal-short".into(),
+        long_list_id: "cal-long".into(),
+    };
+    let existing = EventRef {
+        list_id: "cal-short".into(),
+        element_id: "first".into(),
+    };
+
+    // One update through the real wiring: 204 with the new ETag.
+    let mut edited = calendar_event("first", NOW_MS + 86_400_000);
+    edited.summary = "Event first edited".into();
+    let (status, headers, _) = http_full(&mut wire, "PUT", &href, &[], &ics_body(&edited)).await;
+    assert_eq!(status, 204);
+    assert!(header_value(&headers, "ETag").is_some());
+    assert!(
+        calendar_writer.put_calls() == [(calendar_ref.clone(), Some(existing.clone()))],
+        "the PUT never reached the session's writer"
+    );
+
+    // The account's primary address is the one organizer serve wires
+    // in: an event organized by it is accepted, ...
+    let mut own = calendar_event("first", NOW_MS + 86_400_000);
+    own.summary = "Event first own".into();
+    own.organizer = Some(EventPerson {
+        name: "Owner".into(),
+        address: LOGIN.to_string(),
+    });
+    let (status, _, _) = http_full(&mut wire, "PUT", &href, &[], &ics_body(&own)).await;
+    assert_eq!(status, 204);
+
+    // ... and any other organizer answers the fixed refusal without
+    // reaching the writer.
+    let mut outsider = calendar_event("first", NOW_MS + 86_400_000);
+    outsider.summary = "Event first outsider".into();
+    outsider.organizer = Some(EventPerson {
+        name: "Other".into(),
+        address: "nobody@example.invalid".into(),
+    });
+    let (status, _, refusal) = http_full(&mut wire, "PUT", &href, &[], &ics_body(&outsider)).await;
+    assert_eq!(status, 403);
+    assert_eq!(refusal, "the organizer is not an address of this account\n");
+    assert_eq!(calendar_writer.put_calls().len(), 2);
     drop(wire);
 
     stop_serve.send(()).unwrap();
